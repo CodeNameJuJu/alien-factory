@@ -1,0 +1,193 @@
+# AGENTS.md — Alien Factory
+
+Context for AI agents working in this repo.
+
+**This repo is public.** Never commit secrets, API keys, `.env` files,
+internal/company material, or anything under `~/.alien-factory` — all
+runtime configuration is via environment variables (`PORT`,
+`NODE_ENV`, `ALIEN_FACTORY_PASSWORD`, `ALIEN_FACTORY_DATA_DIR`,
+`ALIEN_FACTORY_DIR`, `ALIEN_FACTORY_NO_DEVIN`, `ALIEN_FACTORY_AUTOSCAN`).
+
+## What this is
+
+A Factorio-style, top-down pixel-art factory rendered in the browser. The
+small aliens on the floor are real Devin CLI agent sessions (`devin acp`,
+Agent Client Protocol — JSON-RPC 2.0, one message per line over stdio) that
+produce 2D pixel-game assets: each asset is a code-generated PNG sprite
+sheet written by a "smith" agent, checked by the server, QA'd by an
+"inspector" agent, approved or rejected by the big "Overlord" on the dais,
+packaged by a "packer" and then sold on a MOCK market (pure code, seeded —
+no real money, no real storefront).
+
+The player is a factory manager: start/pause/stop the shift, send directives
+to the Overlord, inspect assets, browse the gallery and watch the market.
+
+## Layout
+
+npm workspaces monorepo, strict TypeScript everywhere, no build step on the
+server:
+
+```
+shared/protocol.ts    # client↔server WS message + state types (relative imports)
+server/               # tsx (dev) / tsx watch (dev:watch), node:http + ws :4790
+  src/acp.ts          # AcpClient: one `devin acp` child, lazy spawn + restart,
+                      # pending-map JSON-RPC, authenticate, sessions, permissions
+                      # ALIEN_FACTORY_NO_DEVIN=1 → refuses to spawn entirely
+  src/factory.ts      # FactoryManager: agent roster, job dispatcher, the
+                      # overlord turn loop, auto-approver, state.json persistence
+  src/market.ts       # seeded mock market: tag demand random walk, competitor
+                      # listings, sales sim, reports/market-latest.md
+  src/itch.ts         # itch.io research (READ ONLY): polite feed fetcher,
+                      # cell parser, snapshot analyser, reports/itch-latest.md
+  src/parse.ts        # pure helpers: section/fenced-json parsers, inspection
+                      # parser, permission path guard, meta.json checks
+  src/prompts.ts      # every agent prompt template (structured block at the end)
+  src/seed.ts         # creates ~/.alien-factory/factory: lib/pix.mjs, STYLE.md,
+                      # three starter assets (gen.mjs run at seed time)
+  src/config.ts       # ~/.alien-factory/config.json + paths
+  src/parse.test.ts   # node:test suite → npm test -w server
+  src/main.ts         # http + ws, /files static serving, broadcast throttle
+client/               # Vite + TS, zero runtime deps
+  src/main.ts         # loop, mouse input, selection, DOM nameplates
+  src/floor.ts        # layout, stations, belts, dais, portal, hit-testing
+  src/aliens.ts       # alien sprites usage + cosmetic movement (waypoints)
+  src/assets.ts       # /files sheet.png + meta.json cache, animated frames
+  src/sprites.ts      # procedural sprites: aliens, overlord, bubbles, crates
+  src/hud.ts          # top bar (shift controls, revenue, models) + ticker
+  src/drawers.ts      # right-side drawer: overlord/alien/asset/market/gallery
+  src/demo.ts         # ?demo — fake animated state, no server needed
+  src/pix.ts          # pixel buffer painter (mulberry32, hashString, Sprite)
+  src/md.ts           # tiny safe markdown renderer (transcript log)
+  src/net.ts          # reconnecting WebSocket
+~/.alien-factory/factory/   # the sandbox agents actually work in
+  lib/pix.mjs         # zero-dep ESM pixel canvas + PNG emitter (seeded)
+  STYLE.md            # house rules handed to every prompt
+  assets/<sku>/       # gen.mjs + sheet.png + preview.png + meta.json + listing.json
+  examples/<name>/    # 3 seeded reference generators (slime, carrot, potion)
+  reports/            # market-latest.md, trends-<n>.md (written by the scout)
+```
+
+## Modes
+
+- **`mode: 'research'` (default)** — the scout researches the REAL itch.io
+  game-assets market. Shift start (and every `itchScanMinutes` while running)
+  → polite feed scan → `reports/itch-latest.md` → scout writes
+  `reports/trends-<n>.md` + a `## Demand` block stored as `opportunities` on
+  the trend report. No candidates, no production, the mock market is idle.
+  The scout may fetch up to 5 itch.io listing pages; the permission layer
+  rejects tool calls containing non-itch.io URLs in research mode.
+- **`mode: 'full'`** — the produce-and-sell pipeline below; with
+  `marketSource: 'itch'` the scout reads `reports/itch-latest.md` instead
+  of the mock report. **Nothing is ever published**: the packer only
+  "lists" on the in-memory mock market. No code may upload to itch.io or
+  any marketplace without an explicit future decision.
+
+itch.io politeness (itch.ts): feeds are `game-assets/{top-sellers|top-rated|
+new-and-popular|newest}[/tag-x]` (validated), sequential requests ≥1.5 s
+apart, 15 s timeout, honest UA, raw JSON cached 50 min under
+`factory/market/itch/raw/`, snapshots kept 30 under `market/itch/snapshots/`.
+Full scans ≥30 min apart; `[ scan now ]` ≥5 min. robots.txt is respected —
+never touch `/search` (browse feeds only). The fetcher is `fetch` + regex;
+no publishing code exists.
+
+## The flow (full mode)
+
+1. Shift start → market report written → scout job queued (re-scouts when
+   the last trend report is >10 market ticks old AND no candidates pending).
+2. Scout reads `reports/market-latest.md`, writes `reports/trends-<n>.md`,
+   and ends with `## Demand` + a fenced json array of 3-6 proposals
+   `{title, tags, size, frames, why, demand, variantOf?}` — these become
+   `pending` **candidates** (`c1`, `c2`, …).
+3. The Overlord takes a turn when candidates are pending or a player
+   directive arrives — rate-limited to `maxOverlordTurnsPerHour`. It ends
+   with `## Decisions` + fenced json
+   `[{id, approve, reason, smith, brief}]`, one per pending candidate.
+   Approvals are capped at `maxApprovalsPerTurn` (extras → declined "over
+   capacity"); a missing/invalid `smith` falls back to the smith with the
+   shortest forge queue. Approving creates the **asset** (`queued`) and a
+   forge job **pinned** to that smith.
+4. The smith writes `assets/<sku>/gen.mjs`; the server re-runs it and
+   checks meta.json (size, frames, ≤16 colours, opaqueRatio, no
+   empty/identical frames). One in-session retry, then `failed`.
+5. Inspector looks at `preview.png`, ends with `## Inspection` /
+   `Verdict: PASS|FAIL` / `Score:` / `Notes:`. PASS → `on_conveyor` + pack
+   job. FAIL once → back to `queued` + a forge job pinned to the SAME
+   smith; FAIL twice → `scrapped`.
+6. Packer (FIFO off the conveyor) writes `listing.json` → `listed` on the
+   mock market.
+
+Asset statuses: `queued → forging → inspecting → on_conveyor → packing →
+listed` (plus `scrapped`/`failed`). The output conveyor only ever carries
+`on_conveyor`+`packing` items. `examples/` holds the three starter
+generators (style references, not catalog items); `stateVersion: 2` wipes
+pipeline data from the old design on load.
+
+## Conventions
+
+- **Pixel look**: internal canvas is 480x270, upscaled with
+  `image-rendering: pixelated`. All art is procedural and seeded — no image
+  assets except the generated `sheet.png`s from `/files/...`, no smoothing,
+  no web fonts (`Courier New` only).
+- **Mouse-only RTS**: no player character. Hover highlights + nameplates,
+  click selects (pulsing brackets) and opens the drawer, Esc closes.
+- **ACP mode rule**: agents must be able to write — never select the `ask`
+  mode config option (use `accept-edits` if the session defaults to ask).
+- **Auto-approver**: `session/request_permission` is answered automatically.
+  Paths collected from `toolCall.locations[].path` and path-shaped rawInput
+  fields must ALL resolve inside `FACTORY_DIR`, else the `reject*` option is
+  picked (else cancelled). Limit: tool calls that carry no file locations —
+  e.g. `run("rm -rf ...")` — are allowed since no path exists to check; the
+  agent's session cwd is the factory and prompts keep work inside it, but
+  the guard cannot see inside opaque shell commands. Documented risk.
+- **Worker sessions are recycled** after `workerSessionJobLimit` jobs so the
+  cheap model keeps a small context; on server restart all sessionIds are
+  dropped and active jobs requeue.
+- Server imports use `.js` extensions (NodeNext); client imports are
+  extensionless (bundler resolution). Both import shared types from
+  `../shared/protocol` (`.js` on the server).
+
+## Config
+
+`~/.alien-factory/config.json`, created on first run and merged with
+defaults:
+
+```json
+{
+  "overlordModel": "claude-opus-5-5-high",
+  "workerModel": "swe-1-7-lightning-medium",
+  "smiths": 3,
+  "maxOverlordTurnsPerHour": 6,
+  "maxApprovalsPerTurn": 4,
+  "workerSessionJobLimit": 6,
+  "usdToZar": 18.5,
+  "mode": "research",
+  "marketSource": "itch",
+  "itchScanMinutes": 60,
+  "itchFeeds": ["game-assets/top-sellers/tag-pixel-art:2", "..."]
+}
+```
+
+Model ids are ACP `model` config values; if a configured id isn't offered,
+the session default is used. Data dir `~/.alien-factory/`: `state.json`,
+`config.json`, `logs/acp.log`, `probe/`, `factory/`. `ALIEN_FACTORY_DIR`
+env var overrides the factory dir (used by tests/seeding).
+
+## Verify
+
+```bash
+npm run typecheck        # tsc --noEmit in both workspaces
+npm test -w server       # parse.test.ts (node:test via tsx)
+npm run dev              # server :4790 + vite :5173
+npm run build -w client  # vite build
+# http://localhost:5173/?demo — animated floor without the server/Devin
+```
+
+Live ACP needs a signed-in Devin CLI (`devin acp` ships with Devin Desktop);
+the server attempts `authenticate` on startup but it is non-fatal — the
+factory shows "Devin offline" and http stays up. WARNING: each `devin acp`
+spawn triggers a BROWSER sign-in when it has no credentials (the ACP host
+supplies them; `devin auth login` / env keys don't count). That's why `dev`
+is not a watch command — `dev:watch` costs a sign-in per restart. Use
+`ALIEN_FACTORY_NO_DEVIN=1 npm run dev -w server` for checks that must not
+spawn Devin at all. `POST /api/reveal {sku|dir}` opens a factory folder in
+Finder (macOS only, paths are server-side only).

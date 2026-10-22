@@ -1,0 +1,317 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { dirname, extname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import { FACTORY_DIR, loadConfig } from './config.js';
+import { seedFactory } from './seed.js';
+import { FactoryManager } from './factory.js';
+import { loginPage, passwordMatches, RateLimiter, SESSION_COOKIE, sessionToken, sessionValid } from './auth.js';
+import { DEVIN_DISABLED } from './acp.js';
+import type { ClientMessage, ServerMessage } from '../../shared/protocol.js';
+
+const PROD = process.env.NODE_ENV === 'production';
+const PORT = Number(process.env.PORT) || 4790;
+const HOST = PROD ? '0.0.0.0' : '127.0.0.1';
+const PASSWORD = process.env.ALIEN_FACTORY_PASSWORD ?? '';
+/// Built client (vite build) served in production / when present.
+const CLIENT_DIST = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/dist');
+
+if (PROD && !PASSWORD) {
+  console.error('[alien-factory] NODE_ENV=production but ALIEN_FACTORY_PASSWORD is not set — refusing to start');
+  process.exit(1);
+}
+
+const config = loadConfig();
+seedFactory();
+const factory = new FactoryManager(config);
+
+// ---- websocket ------------------------------------------------------------
+
+const clients = new Set<WebSocket>();
+let lastBroadcast = 0;
+let broadcastTimer: NodeJS.Timeout | null = null;
+
+function acpStatus() {
+  return {
+    authenticated: factory.acp.authenticated,
+    models: factory.acp.models,
+    modelGroups: factory.acp.modelGroups,
+    defaultModel: factory.acp.defaultModel,
+    modes: factory.acp.modes,
+    alive: factory.acp.alive,
+  };
+}
+
+function send(ws: WebSocket, msg: ServerMessage): void {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function broadcast(msg: ServerMessage): void {
+  const now = Date.now();
+  if (msg.type === 'state' && now - lastBroadcast < 100) {
+    if (!broadcastTimer) {
+      broadcastTimer = setTimeout(() => {
+        broadcastTimer = null;
+        broadcast(stateMsg());
+      }, 100 - (now - lastBroadcast));
+    }
+    return;
+  }
+  lastBroadcast = now;
+  const data = JSON.stringify(msg);
+  for (const c of clients) if (c.readyState === c.OPEN) c.send(data);
+}
+
+const stateMsg = (): ServerMessage => ({
+  type: 'state',
+  shift: factory.shift,
+  agents: factory.agents,
+  candidates: factory.candidates,
+  assets: factory.assets,
+  jobs: factory.jobs,
+  decisions: factory.decisions,
+  events: factory.events,
+  market: factory.market.state(factory.assets),
+  config,
+  acp: acpStatus(),
+  latestTrendReport: factory.latestTrendReport,
+  itch: factory.itch,
+  trendReports: factory.trendReports,
+  devinEnabled: !DEVIN_DISABLED,
+});
+
+factory.on('change', () => broadcast(stateMsg()));
+
+async function handleMsg(ws: WebSocket, raw: string): Promise<void> {
+  let msg: ClientMessage;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  try {
+    await factory.handle(msg);
+    broadcast(stateMsg());
+  } catch (err) {
+    send(ws, { type: 'error', message: (err as Error).message });
+  }
+}
+
+// ---- auth ------------------------------------------------------------------
+
+const loginLimiter = new RateLimiter(10, 60_000);
+
+function clientIp(req: IncomingMessage): string {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd) return fwd.split(',')[0].trim();
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
+const authed = (req: IncomingMessage): boolean => !PASSWORD || sessionValid(req.headers.cookie, PASSWORD);
+
+function setSessionCookie(res: ServerResponse): void {
+  const flags = `HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 3600}; Path=/${PROD ? '; Secure' : ''}`;
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${sessionToken(PASSWORD)}; ${flags}`);
+}
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+// ---- http -----------------------------------------------------------------
+
+function json(res: ServerResponse, body: unknown, code = 200): void {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+const MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.json': 'application/json',
+  '.md': 'text/markdown; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+};
+
+const STATIC_MIME: Record<string, string> = {
+  ...MIME,
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json',
+};
+
+function sendFile(res: ServerResponse, target: string, mime: Record<string, string>): boolean {
+  const ext = extname(target).toLowerCase();
+  if (!mime[ext] || !existsSync(target) || !statSync(target).isFile()) return false;
+  res.writeHead(200, { 'Content-Type': mime[ext], 'Cache-Control': 'no-cache' });
+  createReadStream(target).pipe(res);
+  return true;
+}
+
+/// /files/<relpath> serves generated assets out of FACTORY_DIR only.
+function serveFile(res: ServerResponse, rel: string): void {
+  const root = resolve(FACTORY_DIR);
+  const target = resolve(root, '.' + sep + decodeURIComponent(rel));
+  if ((target !== root && !target.startsWith(root + sep)) || !sendFile(res, target, MIME)) {
+    if (!res.headersSent) {
+      res.writeHead(404);
+      res.end('not found');
+    }
+  }
+}
+
+/// Serves client/dist when it exists (production). SPA fallback → index.html.
+function serveClient(res: ServerResponse, pathname: string): boolean {
+  if (!existsSync(CLIENT_DIST)) return false;
+  const root = resolve(CLIENT_DIST);
+  const target = resolve(root, '.' + sep + decodeURIComponent(pathname));
+  if (target !== root && !target.startsWith(root + sep)) {
+    res.writeHead(404);
+    res.end('not found');
+    return true;
+  }
+  if (sendFile(res, target, STATIC_MIME)) return true;
+  return sendFile(res, join(root, 'index.html'), STATIC_MIME);
+}
+
+const REVEAL_DIRS = new Set(['assets', 'examples', 'reports', 'factory']);
+
+/// POST /api/reveal { sku?: string, dir?: 'assets'|'examples'|'reports'|'factory' }
+/// opens the folder in the OS file manager. Never accepts a raw path.
+async function reveal(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (process.platform !== 'darwin') return json(res, { error: 'unsupported platform' }, 501);
+  let body: { sku?: unknown; dir?: unknown };
+  try {
+    body = JSON.parse(await readBody(req) || '{}');
+  } catch {
+    return json(res, { error: 'bad json' }, 400);
+  }
+  let target: string;
+  if (typeof body.sku === 'string' && body.sku) {
+    if (!/^[a-z0-9-]+$/.test(body.sku)) return json(res, { error: 'bad sku' }, 400);
+    target = join(FACTORY_DIR, 'assets', body.sku);
+    if (!existsSync(target)) return json(res, { error: 'no such asset' }, 404);
+  } else if (typeof body.dir === 'string' && REVEAL_DIRS.has(body.dir)) {
+    target = body.dir === 'factory' ? FACTORY_DIR : join(FACTORY_DIR, body.dir);
+    if (!existsSync(target)) return json(res, { error: 'no such dir' }, 404);
+  } else {
+    return json(res, { error: 'sku or dir required' }, 400);
+  }
+  execFile('open', [target], (err) => {
+    if (err) json(res, { error: err.message }, 500);
+    else json(res, { ok: true, path: target });
+  });
+}
+
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  const path = url.pathname;
+
+  // auth gate — everything except health + the login routes needs the cookie
+  if (PASSWORD) {
+    if (path === '/api/health') return json(res, { ok: true });
+    if (path === '/login') {
+      if (req.method === 'POST') {
+        if (!loginLimiter.allow(clientIp(req))) return json(res, { error: 'slow down' }, 429);
+        const params = new URLSearchParams(await readBody(req));
+        const attempt = params.get('password') ?? '';
+        if (!passwordMatches(attempt, PASSWORD)) {
+          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(loginPage('ACCESS DENIED'));
+          return;
+        }
+        setSessionCookie(res);
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(loginPage());
+      return;
+    }
+    if (path === '/logout' && req.method === 'POST') {
+      res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; Max-Age=0; Path=/`);
+      res.writeHead(302, { Location: '/login' });
+      res.end();
+      return;
+    }
+    if (!authed(req)) {
+      if (path === '/' || (!path.startsWith('/api') && !path.startsWith('/files') && !extname(path))) {
+        res.writeHead(302, { Location: '/login' });
+        res.end();
+      } else {
+        res.writeHead(401);
+        res.end('unauthorized');
+      }
+      return;
+    }
+  } else if (path === '/api/health') {
+    return json(res, { ok: true });
+  }
+
+  if (path === '/api/state') return json(res, stateMsg());
+  if (path === '/api/reveal' && req.method === 'POST') return reveal(req, res);
+  if (path.startsWith('/files/')) return serveFile(res, path.slice('/files/'.length));
+  if (serveClient(res, path)) return;
+  res.writeHead(404);
+  res.end('not found');
+});
+
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+  if (path !== '/ws' || !authed(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    clients.add(ws);
+    send(ws, stateMsg());
+    ws.on('message', (data) => void handleMsg(ws, data.toString()));
+    ws.on('close', () => clients.delete(ws));
+  });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`[alien-factory] server on http://${HOST}:${PORT}`);
+  console.log(`[alien-factory] factory dir: ${FACTORY_DIR}`);
+  console.log(`[alien-factory] client dist: ${existsSync(CLIENT_DIST) ? CLIENT_DIST : '(not built — API only)'}`);
+  console.log(`[alien-factory] auth: ${PASSWORD ? 'password gate on' : 'open (no ALIEN_FACTORY_PASSWORD)'}`);
+});
+
+// ---- startup ----------------------------------------------------------------
+
+// Devin sign-in is best-effort and must never block http: the factory floor
+// shows "Devin offline" until a sign-in succeeds. Each `devin acp` spawn
+// needs a BROWSER sign-in (hosts supply credentials — local `devin auth
+// login` / env keys are ignored), so ALIEN_FACTORY_NO_DEVIN=1 keeps it dead.
+if (DEVIN_DISABLED) {
+  console.log('[alien-factory] Devin disabled (ALIEN_FACTORY_NO_DEVIN)');
+} else {
+  (async () => {
+    try {
+      await factory.acp.authenticate();
+      const probe = await factory.acp.listModels();
+      console.log(`[alien-factory] Devin signed in; models=${probe.models.length}`);
+    } catch (err) {
+      console.log(`[alien-factory] Devin not authenticated: ${(err as Error).message}`);
+    }
+    broadcast(stateMsg());
+  })();
+}
+
+// Headless scanner mode (Railway): rescan on the configured cadence
+// regardless of shift state — no agents involved at all.
+if (process.env.ALIEN_FACTORY_AUTOSCAN) {
+  console.log(`[alien-factory] autoscan every ${config.itchScanMinutes} min`);
+  void factory.scanOnly();
+  setInterval(() => void factory.scanOnly(), Math.max(5, config.itchScanMinutes) * 60_000);
+}

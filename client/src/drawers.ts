@@ -1,0 +1,709 @@
+// Right-side, non-modal drawer: Overlord console, alien inspector, asset
+// detail, market report and the gallery.
+import type { Net } from './net';
+import { renderMd } from './md';
+import { drawAssetFrame, fetchMeta, metaFor } from './assets';
+import type { Agent, Asset, StateMessage } from '../../shared/protocol';
+
+export type Selection =
+  | { type: 'overlord' }
+  | { type: 'agent'; id: string }
+  | { type: 'asset'; id: string }
+  | { type: 'market' }
+  | { type: 'trends' }
+  | { type: 'gallery' };
+
+/// POST /api/reveal — server-side `open` on the factory dir (no-op errors).
+function reveal(body: { sku?: string; dir?: string }): void {
+  void fetch('/api/reveal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => undefined);
+}
+
+export class Drawers {
+  private el: HTMLDivElement;
+  private sel: Selection | null = null;
+  private state: StateMessage | null = null;
+  private animCanvases: { c: HTMLCanvasElement; asset: Asset; scale: number }[] = [];
+  private galleryFilter = '';
+  private overlordTab = 'proposals';
+  private lastKey = '';
+  private closeTimer: ReturnType<typeof setTimeout> | null = null;
+  onClose: () => void = () => {};
+
+  constructor(private net: Net) {
+    this.el = document.createElement('div');
+    this.el.id = 'drawer';
+    this.el.style.display = 'none';
+    document.body.appendChild(this.el);
+  }
+
+  get isOpen(): boolean {
+    return this.sel !== null;
+  }
+
+  get selection(): Selection | null {
+    return this.sel;
+  }
+
+  open(sel: Selection): void {
+    if (this.closeTimer) {
+      clearTimeout(this.closeTimer);
+      this.closeTimer = null;
+    }
+    this.sel = sel;
+    this.lastKey = '';
+    this.el.style.display = 'flex';
+    this.el.classList.remove('crt-out');
+    this.el.classList.add('crt-in');
+    this.render();
+  }
+
+  close(): void {
+    this.sel = null;
+    this.el.classList.remove('crt-in');
+    this.el.classList.add('crt-out');
+    this.closeTimer = setTimeout(() => {
+      this.el.style.display = 'none';
+      this.el.classList.remove('crt-out');
+    }, 170);
+    this.onClose();
+  }
+
+  setState(s: StateMessage): void {
+    this.state = s;
+    if (this.isOpen) {
+      const key = this.renderKey();
+      if (key !== this.lastKey) {
+        this.lastKey = key;
+        this.render();
+      }
+    }
+  }
+
+  /// Cheap signature of exactly what the open drawer displays — state
+  /// broadcasts ~10x/s must not re-render (and wipe the textarea) on noise.
+  private renderKey(): string {
+    const s = this.state!;
+    if (!this.sel) return '';
+    switch (this.sel.type) {
+      case 'overlord': {
+        const o = s.agents.find((a) => a.kind === 'overlord');
+        return JSON.stringify({
+          tab: this.overlordTab,
+          c: s.candidates,
+          d: s.decisions.length,
+          tl: o?.transcript.length,
+          st: `${o?.state ?? ''}${o?.statusLine ?? ''}`,
+        });
+      }
+      case 'agent': {
+        const a = s.agents.find((x) => x.id === (this.sel as { id: string }).id);
+        return a
+          ? JSON.stringify([a.state, a.statusLine, a.currentJobId, a.transcript.length, a.jobsInSession, a.lastUsage])
+          : 'gone';
+      }
+      case 'asset': {
+        const a = s.assets.find((x) => x.sku === (this.sel as { id: string }).id);
+        const c = a ? s.candidates.find((x) => x.id === a.candidateId) : undefined;
+        return JSON.stringify([a, c]);
+      }
+      case 'market':
+        return String(s.market.tick);
+      case 'trends':
+        return JSON.stringify([s.itch.lastScanAt, s.itch.scanning, s.itch.error, s.itch.analysis, s.trendReports.length]);
+      case 'gallery':
+        return this.galleryFilter + JSON.stringify(s.assets.map((a) => [a.sku, a.status]));
+    }
+  }
+
+  /// called every frame — animates asset previews in the open drawer
+  tick(t: number): void {
+    for (const { c, asset, scale } of this.animCanvases) {
+      const ctx = c.getContext('2d')!;
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, c.width, c.height);
+      drawAssetFrame(ctx, asset, 0, 0, scale, t);
+    }
+  }
+
+  private render(): void {
+    if (!this.sel || !this.state) return;
+    this.lastKey = this.renderKey();
+    // stash interactive bits the re-render would otherwise wipe
+    const directive = this.el.querySelector<HTMLTextAreaElement>('#directive');
+    const directiveVal = directive?.value ?? null;
+    const directiveFocused = document.activeElement === directive;
+    const log = this.el.querySelector('.log');
+    const logAtBottom = log ? log.scrollHeight - log.scrollTop - log.clientHeight < 20 : false;
+
+    this.animCanvases = [];
+    this.el.innerHTML = '';
+    const s = this.state;
+    switch (this.sel.type) {
+      case 'overlord':
+        this.renderOverlord(s);
+        break;
+      case 'agent': {
+        const a = s.agents.find((x) => x.id === (this.sel as { id: string }).id);
+        if (a) this.renderAgent(a, s);
+        break;
+      }
+      case 'asset': {
+        const a = s.assets.find((x) => x.sku === (this.sel as { id: string }).id);
+        if (a) this.renderAsset(a, s);
+        break;
+      }
+      case 'market':
+        this.renderMarket(s);
+        break;
+      case 'trends':
+        this.renderTrends(s);
+        break;
+      case 'gallery':
+        this.renderGallery(s);
+        break;
+    }
+    // restore
+    const ta = this.el.querySelector<HTMLTextAreaElement>('#directive');
+    if (ta && directiveVal !== null) {
+      ta.value = directiveVal;
+      if (directiveFocused) ta.focus();
+    }
+    const newLog = this.el.querySelector('.log');
+    if (newLog && logAtBottom) newLog.scrollTop = newLog.scrollHeight;
+  }
+
+  private head(title: string, sub?: string, action?: { label: string; fn: () => void }): HTMLElement {
+    const h = document.createElement('div');
+    h.className = 'drawer-head';
+    const t = document.createElement('span');
+    t.textContent = title;
+    h.appendChild(t);
+    if (sub) {
+      const s = document.createElement('span');
+      s.className = 'drawer-sub';
+      s.textContent = sub;
+      h.appendChild(s);
+    }
+    if (action) {
+      const ab = document.createElement('button');
+      ab.className = 'btn';
+      ab.textContent = action.label;
+      ab.addEventListener('click', action.fn);
+      h.appendChild(ab);
+    }
+    const x = document.createElement('button');
+    x.className = 'btn';
+    x.textContent = '✕';
+    x.addEventListener('click', () => this.close());
+    h.appendChild(x);
+    this.el.appendChild(h);
+    return h;
+  }
+
+  private body(): HTMLDivElement {
+    const b = document.createElement('div');
+    b.className = 'drawer-body';
+    this.el.appendChild(b);
+    return b;
+  }
+
+  private kv(b: HTMLElement, k: string, v: string): void {
+    const d = document.createElement('div');
+    d.className = 'kv';
+    const kEl = document.createElement('span');
+    kEl.textContent = k;
+    const vEl = document.createElement('span');
+    vEl.textContent = v;
+    d.append(kEl, vEl);
+    b.appendChild(d);
+  }
+
+  private thumb(b: HTMLElement, asset: Asset, scale = 4): void {
+    const c = document.createElement('canvas');
+    c.className = 'athumb';
+    const meta = metaFor(asset.sku);
+    const w = meta?.w ?? asset.size;
+    const h = meta?.h ?? asset.size;
+    c.width = w * scale;
+    c.height = h * scale;
+    b.appendChild(c);
+    this.animCanvases.push({ c, asset, scale });
+  }
+
+  // ---- overlord ---------------------------------------------------------------
+
+  private renderOverlord(s: StateMessage): void {
+    const o = s.agents.find((a) => a.kind === 'overlord');
+    this.head('THE OVERLORD', `${o?.modelName ?? s.config.overlordModel} · ${o?.statusLine ?? ''}`);
+    const b = this.body();
+    const tabs = document.createElement('div');
+    tabs.className = 'tabs';
+    for (const t of ['proposals', 'log'] as const) {
+      const btn = document.createElement('button');
+      btn.className = 'btn tab' + (this.overlordTab === t ? ' on' : '');
+      btn.textContent = t;
+      btn.addEventListener('click', () => {
+        this.overlordTab = t;
+        this.render();
+      });
+      tabs.appendChild(btn);
+    }
+    b.appendChild(tabs);
+
+    if (this.overlordTab === 'proposals') {
+      const pending = s.candidates.filter((c) => c.status === 'pending');
+      const decided = s.candidates.filter((c) => c.status !== 'pending');
+      if (!s.candidates.length) {
+        const p = document.createElement('p');
+        p.className = 'note';
+        p.textContent = 'No proposals yet — the scout reports after a market sweep.';
+        b.appendChild(p);
+      }
+      for (const c of pending) {
+        const row = document.createElement('div');
+        row.className = 'acard';
+        const info = document.createElement('div');
+        info.innerHTML = `<b></b> <span class="dim"></span><div class="note"></div>`;
+        info.querySelector('b')!.textContent = `${c.id} · ${c.title}`;
+        (info.querySelector('.dim') as HTMLElement).textContent =
+          ` ${c.tags.join(', ')} · ${c.size}px×${c.frames}f · demand ${c.demand}/10`;
+        (info.querySelector('.note') as HTMLElement).textContent =
+          c.why + (c.variantOf ? ` · variant of ${c.variantOf}` : '');
+        row.appendChild(info);
+        b.appendChild(row);
+      }
+      if (decided.length) {
+        const h = document.createElement('div');
+        h.className = 'md-h';
+        h.textContent = 'Decided';
+        b.appendChild(h);
+        for (const c of decided.slice(-15).reverse()) {
+          const row = document.createElement('div');
+          row.className = 'acard';
+          const a = c.sku ? s.assets.find((x) => x.sku === c.sku) : undefined;
+          if (a) this.thumb(row, a, 3);
+          const info = document.createElement('div');
+          info.innerHTML = `<span class="${c.status === 'approved' ? 'v-pass' : 'v-fail'} verdict">${c.status === 'approved' ? '✓' : '✗'}</span> <b></b><div class="note"></div>`;
+          info.querySelector('b')!.textContent = `${c.id} · ${c.title}`;
+          (info.querySelector('.note') as HTMLElement).textContent =
+            `${c.reason ?? ''}${c.smith ? ` · → ${c.smith}` : ''}${c.sku ? ` · ${c.sku}` : ''}`;
+          row.appendChild(info);
+          if (c.sku) {
+            row.style.cursor = 'pointer';
+            row.addEventListener('click', () => this.open({ type: 'asset', id: c.sku! }));
+          }
+          b.appendChild(row);
+        }
+      }
+    } else {
+      const log = document.createElement('div');
+      log.className = 'md log';
+      renderMd((o?.transcript ?? []).map((e) => e.text).join('\n\n---\n\n') || '(no transcript yet)', log);
+      b.appendChild(log);
+      requestAnimationFrame(() => (log.scrollTop = log.scrollHeight));
+    }
+
+    const cmd = document.createElement('div');
+    cmd.className = 'cmd';
+    const ta = document.createElement('textarea');
+    ta.id = 'directive';
+    ta.rows = 2;
+    ta.placeholder = s.devinEnabled
+      ? 'Command the overlord… (e.g. "more slime variants")'
+      : 'agents run on the local Mac — this node only scans';
+    ta.disabled = !s.devinEnabled;
+    const cur = document.createElement('span');
+    cur.className = 'cursor';
+    cur.textContent = '█';
+    const btn = document.createElement('button');
+    btn.className = 'btn primary';
+    btn.textContent = '[ send ]';
+    btn.disabled = !s.devinEnabled;
+    btn.addEventListener('click', () => {
+      if (ta.value.trim()) this.net.send({ type: 'directive', text: ta.value.trim() });
+      ta.value = '';
+    });
+    cmd.append(ta, cur, btn);
+    b.appendChild(cmd);
+  }
+
+  // ---- alien ------------------------------------------------------------------
+
+  private renderAgent(a: Agent, s: StateMessage): void {
+    this.head(a.name, `${a.kind} · ${a.modelName}`);
+    const b = this.body();
+    this.kv(b, 'state', a.state);
+    this.kv(b, 'status', a.statusLine);
+    this.kv(b, 'jobs in session', String(a.jobsInSession));
+    const job = s.jobs.find((j) => j.id === a.currentJobId);
+    if (job) {
+      this.kv(b, 'current job', `${job.kind} ${job.sku ?? ''}${job.pinnedTo ? ' (pinned)' : ''}`);
+      const asset = job.sku ? s.assets.find((x) => x.sku === job.sku) : undefined;
+      if (asset) this.thumb(b, asset, 5);
+    }
+    const cancel = document.createElement('button');
+    cancel.className = 'btn danger';
+    cancel.textContent = 'Cancel turn';
+    cancel.disabled = a.state !== 'working';
+    cancel.addEventListener('click', () => this.net.send({ type: 'cancelAgent', agentId: a.id }));
+    b.appendChild(cancel);
+
+    if (a.lastUsage) {
+      const det = document.createElement('details');
+      const sum = document.createElement('summary');
+      sum.textContent = 'last usage';
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(a.lastUsage, null, 2);
+      det.append(sum, pre);
+      b.appendChild(det);
+    }
+
+    const log = document.createElement('div');
+    log.className = 'log';
+    for (const e of a.transcript) {
+      const d = document.createElement('div');
+      d.className = `entry ${e.role}`;
+      d.textContent = e.text;
+      log.appendChild(d);
+    }
+    b.appendChild(log);
+    requestAnimationFrame(() => {
+      if (log.scrollHeight - log.scrollTop - log.clientHeight < 20 || !log.scrollTop) {
+        log.scrollTop = log.scrollHeight;
+      }
+    });
+  }
+
+  // ---- asset ------------------------------------------------------------------
+
+  private renderAsset(a: Asset, s: StateMessage): void {
+    this.head(a.sku, a.status, { label: '[ show in finder ]', fn: () => reveal({ sku: a.sku }) });
+    const b = this.body();
+    const big = document.createElement('canvas');
+    const meta = metaFor(a.sku);
+    const w = meta?.w ?? a.size;
+    big.width = w * 8;
+    big.height = w * 8;
+    big.className = 'abig';
+    b.appendChild(big);
+    this.animCanvases.push({ c: big, asset: a, scale: 8 });
+    const sheet = document.createElement('img');
+    sheet.src = `/files/assets/${a.sku}/sheet.png`;
+    sheet.className = 'asheet';
+    sheet.onerror = () => (sheet.style.display = 'none');
+    b.appendChild(sheet);
+
+    this.kv(b, 'title', a.title);
+    this.kv(b, 'tags', a.tags.join(', '));
+    this.kv(b, 'size', `${a.size}×${a.size} × ${a.frames}f`);
+    const cand = a.candidateId ? s.candidates.find((x) => x.id === a.candidateId) : undefined;
+    if (cand) {
+      this.kv(b, 'proposal', `${cand.id} · demand ${cand.demand}/10 — ${cand.why}`);
+      if (cand.reason) this.kv(b, 'overlord', `${cand.status === 'approved' ? '✓' : '✗'} ${cand.reason}${cand.smith ? ` → ${cand.smith}` : ''}`);
+    }
+    if (a.smith) this.kv(b, 'smith', a.smith);
+    if (a.variantOf) {
+      const row = document.createElement('div');
+      row.className = 'kv';
+      const k = document.createElement('span');
+      k.textContent = 'variant of';
+      const v = document.createElement('a');
+      v.textContent = a.variantOf;
+      v.href = '#';
+      v.addEventListener('click', (e) => {
+        e.preventDefault();
+        this.open({ type: 'asset', id: a.variantOf! });
+      });
+      row.append(k, v);
+      b.appendChild(row);
+    }
+    if (a.checks) this.kv(b, 'checks', a.checks.passed ? 'passed' : `FAILED: ${a.checks.issues.join('; ')}`);
+    if (a.inspection) this.kv(b, 'inspection', `${a.inspection.verdict} ${a.inspection.score}/10 — ${a.inspection.notes}`);
+    if (a.listing) {
+      this.kv(b, 'listing', `${a.listing.title} — $${a.listing.priceUsd.toFixed(2)}`);
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = a.listing.description;
+      b.appendChild(d);
+    }
+    this.kv(b, 'sales', `${a.sales.views} views · ${a.sales.units} units · $${a.sales.revenueUsd.toFixed(2)} · R${(a.sales.revenueUsd * s.config.usdToZar).toFixed(2)}`);
+    // fetch meta only when missing — otherwise the resolved microtask would
+    // re-render this drawer forever (the freeze bug)
+    if (!meta) {
+      void fetchMeta(a.sku).then((m) => {
+        if (m && this.sel?.type === 'asset' && this.sel.id === a.sku) this.render();
+      });
+    }
+  }
+
+  // ---- market -------------------------------------------------------------------
+
+  private renderMarket(s: StateMessage): void {
+    this.head('MOCK MARKET', `tick ${s.market.tick}`);
+    const b = this.body();
+    const h = document.createElement('div');
+    h.className = 'md-h';
+    h.textContent = 'Tag demand';
+    b.appendChild(h);
+    for (const t of s.market.tags) {
+      const row = document.createElement('div');
+      row.className = 'mtag';
+      const arrow = t.trend > 0 ? '↑' : t.trend < 0 ? '↓' : '→';
+      const color = t.trend > 0 ? '#60c060' : t.trend < 0 ? '#d06060' : '#909090';
+      row.innerHTML = `<span class="mtag-name"></span><span class="mtag-bar"></span><span style="color:${color}">${arrow}</span>`;
+      row.querySelector('.mtag-name')!.textContent = t.tag;
+      const fill = Math.round(t.demand * 10);
+      (row.querySelector('.mtag-bar') as HTMLElement).innerHTML =
+        `${'█'.repeat(fill)}<span class="off">${'░'.repeat(10 - fill)}</span>`;
+      b.appendChild(row);
+    }
+    const sc = document.createElement('canvas');
+    sc.width = 300;
+    sc.height = 40;
+    sc.className = 'spark';
+    const scx = sc.getContext('2d')!;
+    scx.fillStyle = '#0a0f16';
+    scx.fillRect(0, 0, 300, 40);
+    const hist = s.market.revenueHistory.slice(-120);
+    const max = Math.max(0.01, ...hist);
+    scx.strokeStyle = '#5cf2c8';
+    scx.beginPath();
+    hist.forEach((v, i) => {
+      const x = (i / Math.max(1, hist.length - 1)) * 298 + 1;
+      const y = 38 - (v / max) * 34;
+      if (i) scx.lineTo(x, y);
+      else scx.moveTo(x, y);
+    });
+    scx.stroke();
+    b.appendChild(sc);
+
+    const h2 = document.createElement('div');
+    h2.className = 'md-h';
+    h2.textContent = 'Our top sellers';
+    b.appendChild(h2);
+    const ours = s.assets.filter((a) => a.status === 'listed').sort((x, y) => y.sales.revenueUsd - x.sales.revenueUsd).slice(0, 8);
+    if (!ours.length) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = '(nothing listed yet)';
+      b.appendChild(d);
+    }
+    for (const a of ours) {
+      const d = document.createElement('div');
+      d.className = 'note mlink';
+      d.textContent = `${a.sku} — ${a.sales.units}u · $${a.sales.revenueUsd.toFixed(2)}`;
+      d.addEventListener('click', () => this.open({ type: 'asset', id: a.sku }));
+      b.appendChild(d);
+    }
+    const h3 = document.createElement('div');
+    h3.className = 'md-h';
+    h3.textContent = 'Competitors';
+    b.appendChild(h3);
+    for (const c of s.market.competitors.slice(0, 10)) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = `${c.title} — ${c.tag} — $${c.priceUsd.toFixed(2)} — ${c.sales} sales`;
+      b.appendChild(d);
+    }
+  }
+
+  // ---- trends (itch.io research) -------------------------------------------------
+
+  private renderTrends(s: StateMessage): void {
+    const a = s.itch.analysis;
+    const last = s.itch.lastScanAt ? new Date(s.itch.lastScanAt) : null;
+    const hh = last ? `${String(last.getHours()).padStart(2, '0')}:${String(last.getMinutes()).padStart(2, '0')}` : 'never';
+    this.head('MARKET RADAR', s.itch.scanning ? 'scanning…' : `last scan ${hh}`);
+    const b = this.body();
+
+    // status line
+    const st = document.createElement('div');
+    st.className = 'note';
+    st.textContent = s.itch.scanning
+      ? 'scanning itch.io feeds… (polite: 1 req / 1.5s)'
+      : s.itch.error
+        ? `⚠ ${s.itch.error}`
+        : a
+          ? `${a.priceStats.count} items · median ${a.priceStats.median != null ? '$' + a.priceStats.median.toFixed(2) : '—'} · ${a.priceStats.pctFree}% free · ${a.priceStats.pctOnSale}% on sale`
+          : 'no scan yet — press [ scan now ]';
+    b.appendChild(st);
+
+    if (!a) {
+      this.reportsSection(b, s);
+      return;
+    }
+
+    // themes table with block-char bars + delta arrows
+    const h = document.createElement('div');
+    h.className = 'md-h';
+    h.textContent = 'Themes';
+    b.appendChild(h);
+    const maxScore = Math.max(1, ...a.themes.slice(0, 20).map((t) => t.score));
+    for (const t of a.themes.slice(0, 20)) {
+      const row = document.createElement('div');
+      row.className = 'mtag';
+      const fill = Math.round((t.score / maxScore) * 10);
+      const arrow = t.delta == null ? ' ' : t.delta > 0.05 ? '▲' : t.delta < -0.05 ? '▼' : '→';
+      const arrowColor = t.delta == null ? '' : t.delta > 0.05 ? 'var(--phos)' : t.delta < -0.05 ? 'var(--err)' : '';
+      row.innerHTML = `<span class="mtag-name"></span><span class="mtag-bar"></span><span class="dim"></span><span style="${arrowColor ? `color:${arrowColor}` : ''}">${arrow}</span>`;
+      row.querySelector('.mtag-name')!.textContent = t.key;
+      (row.querySelector('.mtag-bar') as HTMLElement).innerHTML =
+        `${'█'.repeat(fill)}<span class="off">${'░'.repeat(10 - fill)}</span>`;
+      (row.querySelector('.dim') as HTMLElement).textContent =
+        `${t.score}${t.medianPrice != null ? ` $${t.medianPrice.toFixed(2)}` : ''} ${t.pctFree}%f`;
+      b.appendChild(row);
+    }
+
+    // movers
+    if (a.movers.length) {
+      const h2 = document.createElement('div');
+      h2.className = 'md-h';
+      h2.textContent = 'Movers';
+      b.appendChild(h2);
+      for (const m of a.movers.slice(0, 10)) {
+        const d = document.createElement('div');
+        d.className = 'note';
+        const link = document.createElement('a');
+        link.href = m.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = m.title;
+        const kind = m.kind === 'new_top_seller' ? '★ new top-seller' : m.kind === 'climbed' ? '▲ climbing' : '✦ new & popular';
+        d.append(`${kind} `, link, ` ${m.detail}`);
+        b.appendChild(d);
+      }
+    }
+
+    // top sellers / new & popular with thumbnails
+    const items = (title: string, list: typeof a.topSellers) => {
+      const hx = document.createElement('div');
+      hx.className = 'md-h';
+      hx.textContent = title;
+      b.appendChild(hx);
+      for (const it of list) {
+        const row = document.createElement('div');
+        row.className = 'acard';
+        if (it.thumb) {
+          const img = document.createElement('img');
+          img.src = it.thumb;
+          img.referrerPolicy = 'no-referrer';
+          img.className = 'athumb';
+          img.width = 63;
+          img.height = 50;
+          img.onerror = () => (img.style.display = 'none');
+          row.appendChild(img);
+        }
+        const info = document.createElement('div');
+        const link = document.createElement('a');
+        link.href = it.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = `#${it.rank} ${it.title}`;
+        const meta = document.createElement('div');
+        meta.className = 'note';
+        meta.textContent =
+          `${it.author} · ${it.free ? 'free/PWYW' : `${it.currency ?? '$'}${it.price?.toFixed(2)}`}${it.salePct ? ` (−${it.salePct}%)` : ''}`;
+        info.append(link, meta);
+        row.appendChild(info);
+        b.appendChild(row);
+      }
+    };
+    items('Top sellers (pixel art)', a.topSellers);
+    items('New & popular', a.newAndPopular);
+
+    this.reportsSection(b, s);
+  }
+
+  /// Scout trend-report history — latest expanded, opportunities as cards.
+  private reportsSection(b: HTMLElement, s: StateMessage): void {
+    const h = document.createElement('div');
+    h.className = 'md-h';
+    h.textContent = 'Scout reports';
+    b.appendChild(h);
+    if (!s.trendReports.length) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = '(none yet)';
+      b.appendChild(d);
+      return;
+    }
+    for (const r of s.trendReports.slice(0, 5)) {
+      const det = document.createElement('details');
+      if (r === s.trendReports[0]) det.open = true;
+      const sum = document.createElement('summary');
+      sum.textContent = `#${r.n} — ${new Date(r.at).toLocaleString()}`;
+      det.appendChild(sum);
+      const md = document.createElement('div');
+      md.className = 'md';
+      renderMd(r.markdown || '(empty)', md);
+      det.appendChild(md);
+      for (const o of r.opportunities) {
+        const row = document.createElement('div');
+        row.className = 'acard';
+        const info = document.createElement('div');
+        info.innerHTML = `<b></b> <span class="dim"></span><div class="note"></div>`;
+        info.querySelector('b')!.textContent = o.title;
+        (info.querySelector('.dim') as HTMLElement).textContent =
+          ` ${o.tags.join(', ')} · ${o.size}px×${o.frames}f · demand ${o.demand}/10${o.priceBand ? ` · ${o.priceBand}` : ''}`;
+        const note = info.querySelector('.note') as HTMLElement;
+        note.textContent = o.why;
+        for (const u of o.evidence ?? []) {
+          const link = document.createElement('a');
+          link.href = u;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.textContent = u.replace(/^https?:\/\//, '').slice(0, 60);
+          link.style.display = 'block';
+          link.style.fontSize = '10px';
+          note.appendChild(link);
+        }
+        row.appendChild(info);
+        det.appendChild(row);
+      }
+      b.appendChild(det);
+    }
+  }
+
+  // ---- gallery --------------------------------------------------------------------
+
+  private renderGallery(s: StateMessage): void {
+    this.head('GALLERY', `${s.assets.length} assets`, { label: '[ open folder ]', fn: () => reveal({ dir: 'assets' }) });
+    const b = this.body();
+    const sel = document.createElement('select');
+    sel.className = 'gfilter';
+    for (const f of ['', 'queued', 'forging', 'inspecting', 'on_conveyor', 'packing', 'listed', 'scrapped', 'failed']) {
+      const o = document.createElement('option');
+      o.value = f;
+      o.textContent = f || 'all statuses';
+      sel.appendChild(o);
+    }
+    sel.value = this.galleryFilter;
+    sel.addEventListener('change', () => {
+      this.galleryFilter = sel.value;
+      this.render();
+    });
+    b.appendChild(sel);
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    for (const a of s.assets) {
+      if (this.galleryFilter && a.status !== this.galleryFilter) continue;
+      const cell = document.createElement('div');
+      cell.className = 'gcell';
+      this.thumb(cell, a, 4);
+      const cap = document.createElement('div');
+      cap.className = 'gcap';
+      cap.textContent = a.sku;
+      const st = document.createElement('div');
+      st.className = `gstat st-${a.status}`;
+      st.textContent = a.status;
+      cell.append(cap, st);
+      cell.addEventListener('click', () => this.open({ type: 'asset', id: a.sku }));
+      grid.appendChild(cell);
+    }
+    b.appendChild(grid);
+  }
+}

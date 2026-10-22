@@ -1,0 +1,7 @@
+node_modules
+dist
+client/dist
+.git
+*.log
+.DS_Store
+.env*

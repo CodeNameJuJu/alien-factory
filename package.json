@@ -1,0 +1,16 @@
+{
+  "name": "alien-factory",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c yellow,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "typecheck": "npx tsc --noEmit -p server && npx tsc --noEmit -p client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  }
+}
