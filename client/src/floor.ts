@@ -400,27 +400,31 @@ export interface Hit {
   id: string;
 }
 
+/// pad multiplies every hit radius — touch taps get pad>1 when the canvas
+/// is displayed below 2x so alien/item targets stay tappable.
 export function hitTest(
   mx: number,
   my: number,
   v: FloorView,
   t: number,
   alienPos: Map<string, { x: number; y: number }>,
+  pad = 1,
 ): Hit | null {
   for (const it of conveyorItems(v.assets, 0, t)) {
-    if (Math.abs(mx - it.x) < 12 && Math.abs(my - (it.y - 12)) < 16) return { type: 'asset', id: it.sku };
+    if (Math.abs(mx - it.x) < 12 * pad && Math.abs(my - (it.y - 12)) < 16 * pad) return { type: 'asset', id: it.sku };
   }
   for (const c of workCrates(v.assets)) {
-    if (Math.abs(mx - c.x) < 10 && Math.abs(my - (c.y - 8)) < 14) return { type: 'asset', id: c.sku };
+    if (Math.abs(mx - c.x) < 10 * pad && Math.abs(my - (c.y - 8)) < 14 * pad) return { type: 'asset', id: c.sku };
   }
-  if (Math.hypot(mx - PORTAL.x, my - PORTAL.y) < 16) return { type: 'portal', id: 'portal' };
-  if (Math.hypot(mx - DAIS.x, my - DAIS.y) < DAIS.r + 8) return { type: 'overlord', id: 'overlord' };
+  if (Math.hypot(mx - PORTAL.x, my - PORTAL.y) < 16 * pad) return { type: 'portal', id: 'portal' };
+  if (Math.hypot(mx - DAIS.x, my - DAIS.y) < (DAIS.r + 8) * pad) return { type: 'overlord', id: 'overlord' };
   for (const [id, p] of alienPos) {
-    if (Math.abs(mx - p.x) < 9 && my > p.y - 16 && my < p.y + 4) {
+    if (Math.abs(mx - p.x) < 9 * pad && my > p.y - 16 * pad && my < p.y + 4 * pad) {
       return { type: id === 'overlord' ? 'overlord' : 'agent', id };
     }
   }
   // the scout's radar dish → trends drawer (aliens take precedence above)
-  if (mx > 40 && mx < 72 && my > 72 && my < 104) return { type: 'trends', id: 'trends' };
+  const rx = 16 * pad;
+  if (mx > 56 - rx && mx < 56 + rx && my > 88 - rx && my < 88 + rx) return { type: 'trends', id: 'trends' };
   return null;
 }

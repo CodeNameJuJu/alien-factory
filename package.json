@@ -8,6 +8,8 @@
   ],
   "scripts": {
     "dev": "concurrently -n server,client -c yellow,cyan \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w client",
+    "start:worker": "node scripts/run-worker.mjs",
     "typecheck": "npx tsc --noEmit -p server && npx tsc --noEmit -p client"
   },
   "devDependencies": {

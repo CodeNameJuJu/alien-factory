@@ -31,7 +31,7 @@ const empty: StateMessage = {
   },
   acp: { authenticated: false, models: [], modelGroups: [], defaultModel: null, modes: [], alive: false },
   latestTrendReport: null,
-  itch: { lastScanAt: null, scanning: false, error: null, analysis: null },
+  itch: { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null },
   trendReports: [],
   devinEnabled: true,
 };
@@ -46,6 +46,7 @@ const drawers = new Drawers(net);
 const hud = new Hud(net, {
   onSelect: (sel) => {
     if (sel.type === 'asset' && sel.id) select({ type: 'asset', id: sel.id });
+    else if (sel.type === 'agent' && sel.id) select({ type: 'agent', id: sel.id });
     else if (sel.type === 'market') select({ type: 'market' });
     else if (sel.type === 'gallery') select({ type: 'gallery' });
     else if (sel.type === 'trends') select({ type: 'trends' });
@@ -100,9 +101,14 @@ function renderLabels(pos: Map<string, { x: number; y: number }>): void {
   const sx = r.width / W;
   const sy = r.height / H;
   const seen = new Set<string>();
+  const tiny = sx < 1; // canvas under 1x — only important plates, smaller
   for (const a of state.agents) {
     const p = a.kind === 'overlord' ? { x: 240, y: 106 } : pos.get(a.id);
     if (!p) continue;
+    // at tiny scales only working/selected/offline-status plates show —
+    // idle names would just overlap and spill
+    const selId = selected && 'id' in selected ? selected.id : null;
+    if (tiny && a.state !== 'working' && selId !== a.id) continue;
     seen.add(a.id);
     let div = labelDivs.get(a.id);
     if (!div) {
@@ -112,8 +118,11 @@ function renderLabels(pos: Map<string, { x: number; y: number }>): void {
       labelsEl.appendChild(div);
       labelDivs.set(a.id, div);
     }
-    div.style.left = `${r.left + p.x * sx}px`;
-    div.style.top = `${r.top + (p.y - 18) * sy}px`;
+    // clamp inside the canvas so plates never spill past the edges
+    const lx = Math.min(Math.max(r.left + p.x * sx, r.left + 34), r.right - 34);
+    const ly = Math.min(Math.max(r.top + (p.y - 18) * sy, r.top + 2), r.bottom - 16);
+    div.style.left = `${lx}px`;
+    div.style.top = `${ly}px`;
     (div.querySelector('.np-dot') as HTMLElement).style.background = stateColor(a);
     (div.querySelector('.np-name') as HTMLElement).textContent = a.name;
     div.classList.toggle('np-hover', hoverId === a.id);
@@ -139,7 +148,10 @@ canvas.addEventListener('mousemove', (e) => {
 });
 canvas.addEventListener('click', (e) => {
   const p = toCanvas(e);
-  const hit = hitTest(p.x, p.y, floorView(), animT, lastPositions);
+  // bigger hit areas for fingers: below 2x display scale, pad the radii
+  const scale = canvas.getBoundingClientRect().width / W;
+  const pad = scale >= 2 ? 1 : Math.min(2.5, 2 / scale);
+  const hit = hitTest(p.x, p.y, floorView(), animT, lastPositions, pad);
   if (!hit) {
     select(null);
     return;
@@ -155,7 +167,10 @@ window.addEventListener('keydown', (e) => {
 });
 
 function fit(): void {
-  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  // reserve space for the compact HUD + ticker on small screens
+  const narrow = window.innerWidth < 760;
+  const reserve = narrow ? 130 : 0;
+  const s = Math.min(window.innerWidth / W, (window.innerHeight - reserve) / H);
   canvas.style.width = `${Math.floor(W * s)}px`;
   canvas.style.height = `${Math.floor(H * s)}px`;
 }
@@ -204,6 +219,7 @@ function loop(t: number): void {
   drawOverlord(ctx, state.agents.find((a) => a.kind === 'overlord'), animT, selected?.type === 'overlord' ? 'overlord' : null);
   drawAliens(ctx, state.agents, views, animT, selected?.type === 'agent' ? selected.id : null);
   drawers.tick(animT);
+  hud.tick(animT);
   renderLabels(lastPositions);
 
   requestAnimationFrame(loop);

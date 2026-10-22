@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import {
   applyApprovalCap,
   checkMeta,
@@ -18,8 +18,12 @@ import {
   section,
   urlsAllowed,
 } from './parse.js';
-import { analyseSnapshot, parseItchCells, validateFeeds, FEED_RE } from './itch.js';
+import {
+  analyseSnapshot, getBackoffUntil, nextBackoff, parseItchCells, parseRetryAfter,
+  scanAllowed, scanFeeds, setBackoffUntil, validateFeeds, FEED_RE,
+} from './itch.js';
 import { RateLimiter, passwordMatches, sessionToken, sessionValid, SESSION_COOKIE } from './auth.js';
+import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile } from './link.js';
 import type { ItchItem, ItchSnapshot } from '../../shared/protocol.js';
 
 const FACTORY = '/factory';
@@ -327,4 +331,110 @@ test('RateLimiter: N per window per key', () => {
   assert.equal(rl.allow('1.2.3.4', t0 + 3), false); // 4th blocked
   assert.equal(rl.allow('5.6.7.8', t0 + 4), true);  // per-key
   assert.equal(rl.allow('1.2.3.4', t0 + 1001), true); // window resets
+});
+
+// ---- worker ⇄ relay link ----------------------------------------------------
+
+test('bearerValid: timing-safe bearer match', () => {
+  assert.equal(bearerValid('Bearer k1', 'k1'), true);
+  assert.equal(bearerValid('Bearer k2', 'k1'), false);
+  assert.equal(bearerValid('k1', 'k1'), false);
+  assert.equal(bearerValid(undefined, 'k1'), false);
+  assert.equal(bearerValid('Bearer k1', ''), false);
+});
+
+test('parseAssetMsg: sku/name allowlist, base64, size cap', () => {
+  const b64 = Buffer.from('png!').toString('base64');
+  assert.deepEqual(
+    parseAssetMsg({ type: 'asset', sku: 'slime-1', files: { 'sheet.png': b64 } })?.sku,
+    'slime-1',
+  );
+  assert.equal(parseAssetMsg({ sku: 'BAD SKU!', files: { 'sheet.png': b64 } }), null);
+  assert.equal(parseAssetMsg({ sku: 'a', files: { 'evil.sh': b64 } }), null);
+  assert.equal(parseAssetMsg({ sku: 'a', files: { 'sheet.png': 'x'.repeat(3 * 1024 * 1024) } }), null);
+  assert.equal(parseAssetMsg({ sku: 'a', files: {} }), null);
+  assert.equal(parseAssetMsg('nope'), null);
+});
+
+const wsStub = () => ({
+  shift: 'running', agents: [{ id: 'o' }], candidates: [], assets: [{ sku: 'a1' }],
+  jobs: [], decisions: [], events: [], market: { tick: 1, tags: [], competitors: [], revenueHistory: [], totals: { views: 0, units: 0, revenueUsd: 0 } },
+  config: { mode: 'research' }, acp: { alive: true, authenticated: true }, latestTrendReport: 'r',
+  trendReports: [{ n: 1 }], devinEnabled: true,
+}) as unknown as import('../../shared/protocol.js').WorkerStatePayload;
+
+test('mergeRelayState: no worker → null; connected → live; offline → persisted', () => {
+  const itch = { lastScanAt: 5, scanning: false, error: null, analysis: null };
+  assert.equal(mergeRelayState(null, itch, { connected: false, lastSeenAt: null }), null);
+  const live = mergeRelayState(wsStub(), itch, { connected: true, lastSeenAt: 9 })!;
+  assert.equal(live.worker?.connected, true);
+  assert.equal(live.devinEnabled, true);
+  assert.equal(live.itch.lastScanAt, 5);          // relay's itch, not worker's
+  assert.equal(live.agents.length, 1);             // worker's agents
+  const off = mergeRelayState(wsStub(), itch, { connected: false, lastSeenAt: 9 })!;
+  assert.equal(off.devinEnabled, false);
+  assert.equal(off.worker?.lastSeenAt, 9);
+});
+
+test('FORWARDABLE allowlist covers the remote commands', () => {
+  for (const t of ['startShift', 'pauseShift', 'stopShift', 'setModels', 'setMode', 'setMarketSource', 'directive', 'cancelAgent']) {
+    assert.ok(FORWARDABLE.has(t as never), t);
+  }
+  assert.equal(FORWARDABLE.has('signIn' as never), false);
+  assert.equal(FORWARDABLE.has('scanNow' as never), false);
+});
+
+test('parseEnvFile: KEY=VALUE, comments, quotes, bad lines', () => {
+  const p = '/tmp/af-envtest.env';
+  writeFileSync(p, '# c\nALIEN_FACTORY_WORKER_KEY=abc\nX="q v"\nBAD-KEY=no\n =x\nLOWER_ok=v2\n');
+  const env = parseEnvFile(p);
+  assert.equal(env.ALIEN_FACTORY_WORKER_KEY, 'abc');
+  assert.equal(env.X, 'q v');
+  assert.equal(env['BAD-KEY'], undefined);
+  assert.equal(env.LOWER_ok, 'v2');
+  assert.deepEqual(parseEnvFile('/tmp/does-not-exist.env'), {});
+});
+
+// ---- itch 429/5xx backoff ------------------------------------------------------
+
+test('parseRetryAfter: seconds, HTTP dates, junk', () => {
+  const now = 1_800_000_000_000;
+  assert.equal(parseRetryAfter('120', now), 120_000);
+  assert.equal(parseRetryAfter(' 42 ', now), 42_000);
+  assert.equal(parseRetryAfter(new Date(now + 60_000).toUTCString(), now), 60_000);
+  assert.equal(parseRetryAfter('garbage', now), null);
+  assert.equal(parseRetryAfter(null, now), null);
+});
+
+test('nextBackoff: exponential ladder, Retry-After wins, 6h cap', () => {
+  const now = 1_800_000_000_000;
+  assert.deepEqual(nextBackoff(0, null, now), { until: now + 30 * 60_000, step: 1 });
+  assert.deepEqual(nextBackoff(1, null, now), { until: now + 60 * 60_000, step: 2 });
+  assert.deepEqual(nextBackoff(2, null, now), { until: now + 120 * 60_000, step: 3 });
+  assert.equal(nextBackoff(10, null, now).until, now + 6 * 60 * 60_000); // capped
+  assert.deepEqual(nextBackoff(0, 5_000, now), { until: now + 5_000, step: 1 }); // retry-after wins
+  assert.equal(nextBackoff(0, 99 * 60 * 60_000, now).until, now + 6 * 60 * 60_000); // capped too
+});
+
+test('scanFeeds: 429 aborts the whole scan and starts the backoff window', async () => {
+  const orig = globalThis.fetch;
+  let calls = 0;
+  (globalThis as { fetch: unknown }).fetch = async () => {
+    calls++;
+    return new Response('nope', { status: 429, headers: { 'retry-after': '42' } });
+  };
+  try {
+    await assert.rejects(
+      () => scanFeeds([{ feed: 'game-assets/newest', pages: 3 }]),
+      /itch 429/,
+    );
+    assert.equal(calls, 1); // aborted after the first failed request
+    assert.ok(getBackoffUntil() > Date.now());
+    const gate = scanAllowed(true);
+    assert.equal(gate.ok, false);
+    assert.match(gate.reason!, /rate-limited/);
+  } finally {
+    globalThis.fetch = orig;
+    setBackoffUntil(0, 0);
+  }
 });

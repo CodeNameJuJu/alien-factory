@@ -196,7 +196,7 @@ export class Drawers {
       h.appendChild(ab);
     }
     const x = document.createElement('button');
-    x.className = 'btn';
+    x.className = 'btn dclose';
     x.textContent = '✕';
     x.addEventListener('click', () => this.close());
     h.appendChild(x);

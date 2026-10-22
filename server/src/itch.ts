@@ -126,6 +126,19 @@ function rawPath(feed: string, page: number): string {
   return join(RAW_DIR, `${feed.replace(/\//g, '_')}-p${page}.json`);
 }
 
+/// HTTP-level failure — carries the status + parsed Retry-After so the
+/// scanner can back off politely on 429/5xx.
+export class ItchHttpError extends Error {
+  constructor(
+    public status: number,
+    public feed: string,
+    public page: number,
+    public retryAfterMs: number | null,
+  ) {
+    super(`itch ${status} for ${feed} p${page}`);
+  }
+}
+
 async function fetchPage(feed: string, page: number): Promise<Json> {
   mkdirSync(RAW_DIR, { recursive: true });
   const p = rawPath(feed, page);
@@ -142,7 +155,9 @@ async function fetchPage(feed: string, page: number): Promise<Json> {
   const timer = setTimeout(() => ctrl.abort(), REQ_TIMEOUT_MS);
   try {
     const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
-    if (!res.ok) throw new Error(`itch ${res.status} for ${feed} p${page}`);
+    if (!res.ok) {
+      throw new ItchHttpError(res.status, feed, page, parseRetryAfter(res.headers.get('retry-after')));
+    }
     const json = await res.json();
     writeFileSync(p, JSON.stringify(json));
     writeFileSync(p + '.meta', JSON.stringify({ at: Date.now(), url }));
@@ -159,8 +174,93 @@ export function setLastScanAt(at: number): void {
   lastScanAt = at;
 }
 
-/// Rate-limit check. Manual scans still need MANUAL_MIN_MS since the last.
-export function scanAllowed(manual: boolean): { ok: boolean; retryAfterMs: number } {
+// ---- 429/5xx backoff ----------------------------------------------------------
+//
+// itch.io throttles bursts. On a 429/5xx we stop the whole scan and stay
+// quiet until `backoffUntil`: Retry-After when the server gives one, else
+// exponential 30m → 1h → 2h → … capped at 6h. A successful scan resets it.
+// Persisted so restarts keep backing off.
+
+const BACKOFF_BASE_MS = 30 * 60_000;
+const BACKOFF_MAX_MS = 6 * 60 * 60_000;
+const BACKOFF_PATH = join(ITCH_DIR, 'backoff.json');
+let backoffUntil = 0;
+let backoffStep = 0;
+let backoffLoaded = false;
+
+/// `Retry-After` can be seconds ("120") or an HTTP date — returns ms or null.
+export function parseRetryAfter(header: string | null, now = Date.now()): number | null {
+  if (!header) return null;
+  const s = header.trim();
+  if (/^\d+$/.test(s)) return Number(s) * 1000;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : Math.max(0, t - now);
+}
+
+/// Pure backoff calculation — injectable `now` for tests.
+export function nextBackoff(
+  step: number,
+  retryAfterMs: number | null,
+  now = Date.now(),
+): { until: number; step: number } {
+  const exp = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** step);
+  const ms = retryAfterMs != null && retryAfterMs > 0 ? Math.min(BACKOFF_MAX_MS, retryAfterMs) : exp;
+  return { until: now + ms, step: step + 1 };
+}
+
+function loadBackoff(): void {
+  if (backoffLoaded) return;
+  backoffLoaded = true;
+  try {
+    const b = JSON.parse(readFileSync(BACKOFF_PATH, 'utf8')) as { until?: number; step?: number };
+    backoffUntil = b.until ?? 0;
+    backoffStep = b.step ?? 0;
+  } catch { /* none */ }
+}
+
+function persistBackoff(): void {
+  try {
+    mkdirSync(ITCH_DIR, { recursive: true });
+    writeFileSync(BACKOFF_PATH, JSON.stringify({ until: backoffUntil, step: backoffStep }));
+  } catch { /* best effort */ }
+}
+
+/// Restore a persisted/tested backoff (server restart, unit tests).
+export function setBackoffUntil(until: number, step = 0): void {
+  backoffUntil = until;
+  backoffStep = step;
+  backoffLoaded = true;
+  persistBackoff();
+}
+
+export function getBackoffUntil(): number {
+  loadBackoff();
+  return backoffUntil;
+}
+
+/// Human-readable backoff message, e.g. for itch.error / refusals.
+export function backoffMessage(now = Date.now()): string | null {
+  loadBackoff();
+  if (now >= backoffUntil) return null;
+  const d = new Date(backoffUntil);
+  const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `itch.io rate-limited us — backing off until ${hhmm}`;
+}
+
+function noteHttpFailure(err: ItchHttpError): void {
+  if (err.status !== 429 && err.status < 500) return;
+  const b = nextBackoff(backoffStep, err.retryAfterMs);
+  backoffUntil = b.until;
+  backoffStep = b.step;
+  persistBackoff();
+}
+
+/// Rate-limit check. Manual scans still need MANUAL_MIN_MS since the last;
+/// EVERY entry point honours the 429/5xx backoff window.
+export function scanAllowed(manual: boolean): { ok: boolean; retryAfterMs: number; reason?: string } {
+  loadBackoff();
+  const msg = backoffMessage();
+  if (msg) return { ok: false, retryAfterMs: backoffUntil - Date.now(), reason: msg };
   const floor = manual ? MANUAL_MIN_MS : SCAN_FLOOR_MS;
   const wait = floor - (Date.now() - lastScanAt);
   return { ok: wait <= 0, retryAfterMs: Math.max(0, wait) };
@@ -169,24 +269,37 @@ export function scanAllowed(manual: boolean): { ok: boolean; retryAfterMs: numbe
 /// Run a full polite scan: sequential pages, ≥1.5 s between requests.
 /// Returns the snapshot (also written to snapshots/<iso>.json).
 export async function scanFeeds(feeds: ItchFeed[]): Promise<{ snapshot: ItchSnapshot; requests: number }> {
-  if (!scanAllowed(false).ok) throw new Error('scan rate-limited');
+  const gate = scanAllowed(false);
+  if (!gate.ok) throw new Error(gate.reason ?? 'scan rate-limited');
   lastScanAt = Date.now();
   const out: Record<string, ItchItem[]> = {};
   let requests = 0;
   let first = true;
-  for (const { feed, pages } of feeds) {
-    const items: ItchItem[] = [];
-    for (let page = 1; page <= pages; page++) {
-      if (!first) await sleep(REQ_GAP_MS);
-      first = false;
-      const json = await fetchPage(feed, page);
-      requests++;
-      for (const it of parseItchCells(String(json?.content ?? ''))) {
-        it.rank = items.length + 1;
-        items.push(it);
+  try {
+    for (const { feed, pages } of feeds) {
+      const items: ItchItem[] = [];
+      for (let page = 1; page <= pages; page++) {
+        if (!first) await sleep(REQ_GAP_MS);
+        first = false;
+        const json = await fetchPage(feed, page);
+        requests++;
+        for (const it of parseItchCells(String(json?.content ?? ''))) {
+          it.rank = items.length + 1;
+          items.push(it);
+        }
       }
+      out[feed] = items;
     }
-    out[feed] = items;
+  } catch (err) {
+    // a 429/5xx ends the scan NOW — no further requests this scan
+    if (err instanceof ItchHttpError) noteHttpFailure(err);
+    throw err;
+  }
+  // clean pass → reset the backoff ladder
+  if (backoffStep || backoffUntil) {
+    backoffUntil = 0;
+    backoffStep = 0;
+    persistBackoff();
   }
   const snapshot: ItchSnapshot = { at: Date.now(), feeds: out };
   mkdirSync(SNAP_DIR, { recursive: true });

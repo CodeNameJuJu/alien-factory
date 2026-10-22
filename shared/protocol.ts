@@ -257,6 +257,8 @@ export interface ItchState {
   lastScanAt: number | null;
   scanning: boolean;
   error: string | null;
+  /// when itch.io throttled us: no scans before this timestamp
+  backoffUntil: number | null;
   analysis: ItchAnalysis | null;
 }
 
@@ -323,6 +325,8 @@ export interface StateMessage {
   /// false on deployments where `devin acp` can't run (no Desktop) — the
   /// client disables all agent controls then.
   devinEnabled: boolean;
+  /// relay deployments only: is the agent-running worker linked right now
+  worker?: WorkerStatus;
 }
 
 export interface ErrorMessage {
@@ -331,6 +335,36 @@ export interface ErrorMessage {
 }
 
 export type ServerMessage = StateMessage | ErrorMessage;
+
+/// Whether the factory worker (the Mac running `devin acp` agents) is
+/// currently linked to this relay. Present only on relay deployments.
+export interface WorkerStatus {
+  connected: boolean;
+  lastSeenAt: number | null;
+}
+
+/// The worker's own state as sent over the link — the whole browser state
+/// payload minus `type`/`worker` (the relay adds `worker` itself).
+export type WorkerStatePayload = Omit<StateMessage, 'type' | 'worker'>;
+
+// ---- worker ⇄ relay link ----------------------------------------------------
+//
+// The Mac worker opens an OUTBOUND ws to <relay>/worker with a bearer key;
+// browsers never use this endpoint. `protocol` versions the handshake.
+
+export const LINK_PROTOCOL = 1;
+
+export type WorkerToRelay =
+  | { type: 'hello'; protocol: number; version: string }
+  | { type: 'state'; state: WorkerStatePayload }
+  | { type: 'asset'; sku: string; files: Record<string, string> }
+  /// worker's UI asked for a rescan — the relay performs it
+  | { type: 'scanRequest' };
+
+export type RelayToWorker =
+  | { type: 'welcome'; assetHashes: Record<string, Record<string, string>> }
+  | { type: 'command'; msg: ClientMessage }
+  | { type: 'itch'; analysis: ItchAnalysis | null; reportMarkdown: string; lastScanAt: number };
 
 export type ClientMessage =
   | { type: 'startShift' }

@@ -142,6 +142,7 @@ export function startDemo(apply: (s: StateMessage) => void): void {
       lastScanAt: Date.now() - 600_000,
       scanning: false,
       error: null,
+      backoffUntil: null,
       analysis: {
         at: Date.now() - 600_000,
         themes: [

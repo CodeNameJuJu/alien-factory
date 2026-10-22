@@ -73,6 +73,46 @@ limits, `usdToZar` for the mock revenue display, `mode`, `marketSource`,
 `~/.alien-factory/state.json`; the factory sandbox (assets, reports, the
 `pix.mjs` lib, `STYLE.md`) in `~/.alien-factory/factory`.
 
+## Live architecture: Mac worker ⇄ Railway relay ⇄ your phone/laptop
+
+Agents can only run on the Mac (`devin acp` needs Devin Desktop + a browser
+sign-in), so the factory runs there in the background and **streams** to the
+public deployment:
+
+```
+┌─────────────┐  outbound wss (bearer)  ┌──────────────────┐  wss (cookie)
+│  Mac worker │ ──────────────────────▶ │  Railway relay   │ ◀──────────────
+│  agents run │  state + asset files    │  viewer + itch   │   phone/laptop
+│  here       │ ◀────────────────────── │  scanner         │   browsers
+└─────────────┘  commands, itch pushes  └──────────────────┘
+```
+
+- **Relay (Railway)**: password-gated dashboard, itch scanner, `/worker`
+  endpoint (bearer-auth, one worker at a time). Browsers see the worker's
+  live state merged with the relay's itch analysis; agent commands
+  (start/pause/stop/directive/models/mode/cancel) are forwarded to the
+  worker. If the worker is offline the last known state stays visible
+  (persisted in `worker-state.json` on the volume).
+- **Worker (Mac)**: the real factory — agents, asset forge, mock market.
+  Outbound connection only; its own dashboard stays on `127.0.0.1`. Asset
+  files (sheet/preview/meta/listing/gen.mjs) are pushed to the relay so
+  `/files/...` works for remote browsers.
+
+### Setup
+
+1. Deploy to Railway (below) **and** set `ALIEN_FACTORY_WORKER_KEY` there.
+2. On the Mac: `node scripts/new-worker-key.mjs --relay wss://<your-app>.up.railway.app/worker`
+   — generates the key into `~/.alien-factory/worker.env` (never printed).
+   Put the **same value** into Railway's `ALIEN_FACTORY_WORKER_KEY`.
+3. Run it: `npm run start:worker` (or install the LaunchAgent:
+   `scripts/install-launchagent.sh`, then `--load` to actually start;
+   `scripts/worker-status.sh` / `scripts/uninstall-launchagent.sh`).
+
+Caveats: agents only run while the Mac is awake (`caffeinate` blocks idle
+sleep; a closed laptop lid on battery still sleeps). Each worker start costs
+one Devin browser sign-in (usually instant — cached). KeepAlive restarts the
+worker after crashes.
+
 ## Deploy to Railway (scanner + dashboard)
 
 Railway runs the **itch.io market scanner and the CRT dashboard only** —
@@ -106,3 +146,5 @@ your own server.
 | `ALIEN_FACTORY_DIR` | `<data>/factory` | factory sandbox override |
 | `ALIEN_FACTORY_NO_DEVIN` | — | `1` → never spawn `devin acp`; agent controls disabled |
 | `ALIEN_FACTORY_AUTOSCAN` | — | `1` → itch scan at boot + every `itchScanMinutes` |
+| `ALIEN_FACTORY_WORKER_KEY` | — | relay: bearer key for `/worker`; worker: sent upstream |
+| `ALIEN_FACTORY_RELAY_URL` | — | worker: `wss://<host>/worker` to stream to (unset = standalone) |

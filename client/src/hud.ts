@@ -1,10 +1,11 @@
-// DOM HUD: top bar (shift controls, revenue, models, Devin status) and the
-// bottom-left event ticker.
+// DOM HUD: top bar (shift controls, revenue, models, Devin status), the
+// phone crew list, and the event ticker.
 import type { Net } from './net';
-import type { StateMessage } from '../../shared/protocol';
+import { drawAssetFrame } from './assets';
+import type { Agent, Asset, StateMessage } from '../../shared/protocol';
 
 export interface HudHooks {
-  onSelect: (sel: { type: 'overlord' | 'market' | 'gallery' | 'asset' | 'trends'; id?: string }) => void;
+  onSelect: (sel: { type: 'overlord' | 'agent' | 'market' | 'gallery' | 'asset' | 'trends'; id?: string }) => void;
 }
 
 export class Hud {
@@ -12,6 +13,9 @@ export class Hud {
   private ticker: HTMLDivElement;
   private modelOverlord: HTMLSelectElement;
   private modelWorker: HTMLSelectElement;
+  private crew: HTMLDivElement;
+  private crewKey = '';
+  private crewThumbs: { c: HTMLCanvasElement; asset: Asset }[] = [];
   private lastModelSig = '';
   private lastMode: 'research' | 'full' = 'research';
   private lastSource: 'itch' | 'mock' = 'itch';
@@ -20,38 +24,51 @@ export class Hud {
     this.bar = document.createElement('div');
     this.bar.id = 'hud';
     this.bar.innerHTML = `
+      <span id="hud-live" class="hud-pill" style="display:none">…</span>
       <span id="hud-shift" class="hud-pill">stopped</span>
-      <button class="btn" data-act="startShift">[ start ]</button>
-      <button class="btn" data-act="pauseShift">[ pause ]</button>
-      <button class="btn" data-act="stopShift">[ stop ]</button>
-      <span class="hud-sep"></span>
+      <button class="btn hud-x" data-act="startShift">[ start ]</button>
+      <button class="btn hud-x" data-act="pauseShift">[ pause ]</button>
+      <button class="btn hud-x" data-act="stopShift">[ stop ]</button>
+      <span class="hud-sep hud-x"></span>
       <span id="hud-rev" class="hud-pill">$0.00</span>
-      <span id="hud-zar" class="hud-pill dim">R0.00 mock</span>
-      <span id="hud-listed" class="hud-pill">0 listed</span>
-      <span id="hud-proposals" class="hud-pill">0 proposals</span>
+      <span id="hud-zar" class="hud-pill dim hud-x">R0.00 mock</span>
+      <span id="hud-listed" class="hud-pill hud-x">0 listed</span>
+      <span id="hud-proposals" class="hud-pill hud-x">0 proposals</span>
       <span id="hud-scan" class="hud-pill" style="display:none">scan —</span>
-      <span id="hud-queue" class="hud-pill dim">queue 0</span>
-      <span id="hud-turns" class="hud-pill dim">turns 0/h</span>
-      <span class="hud-sep"></span>
-      <button class="btn" id="hud-mode">[ mode: research ]</button>
-      <button class="btn" id="hud-src">[ src: itch ]</button>
-      <button class="btn" id="hud-trends">[ trends ]</button>
-      <button class="btn" id="hud-scannow">[ scan now ]</button>
-      <span class="hud-sep"></span>
-      <span id="hud-devin" class="hud-pill">Devin …</span>
-      <span id="hud-note" class="hud-pill dim" style="display:none">agents run on the local Mac</span>
-      <button class="btn" id="hud-signin" style="display:none">[ sign in ]</button>
-      <select id="hud-model-o" title="Overlord model"></select>
-      <select id="hud-model-w" title="Worker model"></select>
-      <span class="hud-sep"></span>
-      <button class="btn" id="hud-crt">[ crt: on ]</button>
-      <button class="btn" id="hud-gallery">[ gallery ]</button>
-      <button class="btn" id="hud-market">[ market ]</button>`;
+      <span id="hud-queue" class="hud-pill dim hud-x">queue 0</span>
+      <span id="hud-turns" class="hud-pill dim hud-x">turns 0/h</span>
+      <span class="hud-sep hud-x"></span>
+      <button class="btn hud-x" id="hud-mode">[ mode: research ]</button>
+      <button class="btn hud-x" id="hud-src">[ src: itch ]</button>
+      <button class="btn hud-x" id="hud-trends">[ trends ]</button>
+      <button class="btn hud-x" id="hud-scannow">[ scan now ]</button>
+      <span class="hud-sep hud-x"></span>
+      <span id="hud-devin" class="hud-pill hud-x">Devin …</span>
+      <span id="hud-note" class="hud-pill dim hud-x" style="display:none">agents run on the local Mac</span>
+      <button class="btn hud-x" id="hud-signin" style="display:none">[ sign in ]</button>
+      <select class="hud-x" id="hud-model-o" title="Overlord model"></select>
+      <select class="hud-x" id="hud-model-w" title="Worker model"></select>
+      <span class="hud-sep hud-x"></span>
+      <button class="btn hud-x" id="hud-crt">[ crt: on ]</button>
+      <button class="btn hud-x" id="hud-gallery">[ gallery ]</button>
+      <button class="btn hud-x" id="hud-market">[ market ]</button>
+      <button class="btn" id="hud-menu">[ ≡ ]</button>`;
     document.body.appendChild(this.bar);
 
     this.ticker = document.createElement('div');
     this.ticker.id = 'ticker';
     document.body.appendChild(this.ticker);
+
+    // phone crew list — sits between the canvas and the ticker in the
+    // narrow-screen column layout ("what are they busy with")
+    this.crew = document.createElement('div');
+    this.crew.id = 'crew';
+    document.body.insertBefore(this.crew, this.ticker);
+    this.crew.addEventListener('click', (e) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>('.crew-row');
+      if (!row?.dataset.agent) return;
+      this.hooks.onSelect(row.dataset.agent === 'overlord' ? { type: 'overlord' } : { type: 'agent', id: row.dataset.agent });
+    });
 
     this.modelOverlord = this.bar.querySelector('#hud-model-o')!;
     this.modelWorker = this.bar.querySelector('#hud-model-w')!;
@@ -69,6 +86,7 @@ export class Hud {
       else if ((e.target as HTMLElement).id === 'hud-scannow') this.net.send({ type: 'scanNow' });
       else if ((e.target as HTMLElement).id === 'hud-gallery') this.hooks.onSelect({ type: 'gallery' });
       else if ((e.target as HTMLElement).id === 'hud-market') this.hooks.onSelect({ type: 'market' });
+      else if ((e.target as HTMLElement).id === 'hud-menu') this.bar.classList.toggle('menu-open');
     });
     const modelChanged = () => {
       this.net.send({
@@ -120,6 +138,10 @@ export class Hud {
       if (s.itch.scanning) {
         scanEl.textContent = 'scanning…';
         scanEl.className = 'hud-pill warn';
+      } else if (s.itch.backoffUntil && s.itch.backoffUntil > Date.now()) {
+        const d = new Date(s.itch.backoffUntil);
+        scanEl.textContent = `backoff til ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        scanEl.className = 'hud-pill warn';
       } else if (s.itch.lastScanAt) {
         const d = new Date(s.itch.lastScanAt);
         scanEl.textContent = `scan ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}${s.itch.error ? ' ⚠' : ''}`;
@@ -131,7 +153,9 @@ export class Hud {
     }
     // [ scan now ] — manual floor is 5 min since the last scan
     const sn = this.bar.querySelector('#hud-scannow') as HTMLButtonElement;
-    const left = s.itch.scanning ? Infinity : Math.max(0, (s.itch.lastScanAt ?? 0) + 5 * 60_000 - Date.now());
+    const left = s.itch.scanning
+      ? Infinity
+      : Math.max(0, (s.itch.lastScanAt ?? 0) + 5 * 60_000 - Date.now(), (s.itch.backoffUntil ?? 0) - Date.now());
     sn.disabled = left > 0;
     sn.textContent = left > 0 ? `[ scan in ${Math.ceil(left / 60_000)}m ]` : '[ scan now ]';
     pill('#hud-queue', `queue ${s.jobs.filter((j) => j.status === 'queued' || j.status === 'active').length}`);
@@ -141,9 +165,27 @@ export class Hud {
     const label = !s.acp.alive ? 'Devin offline' : s.acp.authenticated ? 'Devin ✓' : 'Devin (not signed in)';
     if (dev.textContent !== label) dev.textContent = label;
     dev.className = `hud-pill ${s.acp.authenticated ? 'ok' : 'warn'}`;
-    // deployments without devin acp: all agent controls disabled
+    // relay deployments: is the agent-running worker linked right now?
+    const liveEl = this.bar.querySelector('#hud-live') as HTMLElement;
+    if (s.worker) {
+      liveEl.style.display = '';
+      if (s.worker.connected) {
+        liveEl.textContent = '● factory live';
+        liveEl.className = 'hud-pill ok';
+      } else {
+        const t = s.worker.lastSeenAt ? new Date(s.worker.lastSeenAt) : null;
+        const hhmm = t ? `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}` : 'never';
+        liveEl.textContent = `○ factory offline — last seen ${hhmm}`;
+        liveEl.className = 'hud-pill warn';
+      }
+    } else {
+      liveEl.style.display = 'none';
+    }
+    // deployments without devin acp / an offline worker: agent controls off
     (this.bar.querySelector('#hud-signin') as HTMLElement).style.display = s.devinEnabled && !s.acp.authenticated ? '' : 'none';
-    (this.bar.querySelector('#hud-note') as HTMLElement).style.display = s.devinEnabled ? 'none' : '';
+    const note = this.bar.querySelector('#hud-note') as HTMLElement;
+    note.style.display = s.devinEnabled ? 'none' : '';
+    note.textContent = s.worker && !s.worker.connected ? 'factory offline — start it on your Mac' : 'agents run on the local Mac';
     for (const sel of ['[data-act="startShift"]', '[data-act="pauseShift"]', '[data-act="stopShift"]', '#hud-mode', '#hud-model-o', '#hud-model-w']) {
       for (const el of this.bar.querySelectorAll<HTMLElement>(sel)) {
         if (el instanceof HTMLButtonElement || el instanceof HTMLSelectElement) el.disabled = !s.devinEnabled;
@@ -172,9 +214,9 @@ export class Hud {
     this.modelOverlord.value = s.config.overlordModel;
     this.modelWorker.value = s.config.workerModel;
 
-    // ticker: last 6 events, newest on top
+    // ticker: newest on top (fewer lines on small screens)
     this.ticker.innerHTML = '';
-    for (const ev of s.events.slice(-6)) {
+    for (const ev of s.events.slice(-(window.innerWidth < 760 ? 4 : 6))) {
       const d = document.createElement('div');
       d.className = 'tick';
       const time = new Date(ev.at);
@@ -186,6 +228,68 @@ export class Hud {
         d.addEventListener('click', () => this.hooks.onSelect({ type: 'asset', id: ev.sku }));
       }
       this.ticker.prepend(d);
+    }
+
+    this.renderCrew(s);
+  }
+
+  /// "What are they busy with" — one row per agent, narrow screens only.
+  private renderCrew(s: StateMessage): void {
+    const pending = s.candidates.filter((c) => c.status === 'pending').length;
+    const key = JSON.stringify([
+      pending,
+      s.agents.map((a) => [a.id, a.state, a.statusLine, a.currentJobId]),
+      s.jobs.filter((j) => j.status === 'active').map((j) => [j.id, j.sku, j.createdAt]),
+    ]);
+    if (key === this.crewKey) return;
+    this.crewKey = key;
+    this.crew.innerHTML = '';
+    this.crewThumbs = [];
+
+    const dotColor = (a: Agent) =>
+      a.state === 'working' ? '#ffb84a' : a.state === 'error' ? '#ff5f6e' : a.state === 'offline' ? '#606070' : '#5cf2c8';
+    const elapsed = (at: number) => {
+      const m = Math.floor((Date.now() - at) / 60_000);
+      return m < 1 ? '<1m' : `${m}m`;
+    };
+
+    const overlord = s.agents.find((a) => a.kind === 'overlord');
+    const rest = s.agents.filter((a) => a.kind !== 'overlord');
+    for (const a of [overlord, ...rest]) {
+      if (!a) continue;
+      const row = document.createElement('div');
+      row.className = 'crew-row';
+      row.dataset.agent = a.id;
+      const job = a.currentJobId ? s.jobs.find((j) => j.id === a.currentJobId) : null;
+      const asset = job?.sku ? s.assets.find((x) => x.sku === job.sku) : null;
+      const role = a.kind === 'overlord' ? 'overlord' : a.kind;
+      const status = a.id === overlord?.id
+        ? `${a.statusLine || 'watching'}${pending ? ` · ${pending} proposals` : ''}`
+        : a.statusLine || a.state;
+      row.innerHTML = `
+        <span class="crew-dot" style="background:${dotColor(a)}"></span>
+        <span class="crew-main"><b>${a.name}</b> <i>${role}</i><br><span class="crew-status">${status}</span></span>
+        <span class="crew-side">${job ? elapsed(job.createdAt) : ''}</span>`;
+      if (asset) {
+        const c = document.createElement('canvas');
+        c.width = 32;
+        c.height = 32;
+        c.className = 'crew-thumb';
+        row.appendChild(c);
+        this.crewThumbs.push({ c, asset });
+      }
+      this.crew.appendChild(row);
+    }
+  }
+
+  /// Animate the crew thumbnails (called from the main loop).
+  tick(t: number): void {
+    if (!this.crewThumbs.length) return;
+    for (const { c, asset } of this.crewThumbs) {
+      const ctx = c.getContext('2d')!;
+      ctx.clearRect(0, 0, c.width, c.height);
+      const scale = Math.max(1, Math.floor(32 / (asset.size || 16)));
+      drawAssetFrame(ctx, asset, (32 - asset.size * scale) / 2, (32 - asset.size * scale) / 2, scale, t);
     }
   }
 }

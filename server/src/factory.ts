@@ -22,6 +22,7 @@ import {
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
 import {
   analyseSnapshot,
+  getBackoffUntil,
   latestSnapshot,
   scanAllowed,
   scanFeeds,
@@ -38,6 +39,7 @@ import type {
   Decision,
   FactoryConfig,
   FactoryEvent,
+  ItchAnalysis,
   ItchState,
   Job,
   JobKind,
@@ -123,7 +125,7 @@ export class FactoryManager extends EventEmitter {
   turnCount = 0;
   lastScoutTick = -999;
   trendReports: TrendReport[] = [];
-  itch: ItchState = { lastScanAt: null, scanning: false, error: null, analysis: null };
+  itch: ItchState = { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null };
   market = new Market();
   acp: AcpClient;
 
@@ -875,7 +877,7 @@ export class FactoryManager extends EventEmitter {
     if (this.itch.scanning) return;
     const gate = scanAllowed(manual);
     if (!gate.ok) {
-      this.itch.error = `rate-limited — next scan in ${Math.ceil(gate.retryAfterMs / 60_000)} min`;
+      this.itch.error = gate.reason ?? `rate-limited — next scan in ${Math.ceil(gate.retryAfterMs / 60_000)} min`;
       this.event(`itch scan refused: rate-limited (${Math.ceil(gate.retryAfterMs / 60_000)} min)`);
       this.changed();
       return;
@@ -904,6 +906,57 @@ export class FactoryManager extends EventEmitter {
       this.itch.scanning = false;
       this.changed();
     }
+  }
+
+  /// The full browser-visible payload — shared by local /ws broadcasts and
+  /// the worker→relay state stream.
+  statePayload() {
+    return {
+      shift: this.shift,
+      agents: this.agents,
+      candidates: this.candidates,
+      assets: this.assets,
+      jobs: this.jobs,
+      decisions: this.decisions,
+      events: this.events,
+      market: this.market.state(this.assets),
+      config: this.config,
+      acp: {
+        authenticated: this.acp.authenticated,
+        models: this.acp.models,
+        modelGroups: this.acp.modelGroups,
+        defaultModel: this.acp.defaultModel,
+        modes: this.acp.modes,
+        alive: this.acp.alive,
+      },
+      latestTrendReport: this.latestTrendReport,
+      itch: { ...this.itch, backoffUntil: getBackoffUntil() || null },
+      trendReports: this.trendReports,
+      devinEnabled: !DEVIN_DISABLED,
+    };
+  }
+
+  /// Fresh itch research pushed down from the relay — adopt it exactly like
+  /// our own scan result (report on disk + state + scout dispatch).
+  applyRelayItch(analysis: ItchAnalysis | null, reportMarkdown: string, lastScanAt: number): void {
+    try {
+      mkdirSync(join(FACTORY_DIR, 'reports'), { recursive: true });
+      writeFileSync(join(FACTORY_DIR, 'reports', 'itch-latest.md'), reportMarkdown);
+    } catch { /* best effort */ }
+    this.itch.analysis = analysis;
+    this.itch.lastScanAt = lastScanAt;
+    this.itch.error = null;
+    this.itch.scanning = false;
+    setLastScanAt(lastScanAt);
+    this.event(`relay pushed itch research (${analysis?.priceStats.count ?? 0} items)`);
+    const shouldScout =
+      this.config.mode === 'research' && this.shift === 'running' && !DEVIN_DISABLED &&
+      !this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed');
+    if (shouldScout) {
+      this.queueJob('scout');
+      this.event('scout dispatched to read the itch report');
+    }
+    this.changed();
   }
 
   async handle(msg: ClientMessage): Promise<void> {

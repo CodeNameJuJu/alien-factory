@@ -524,3 +524,123 @@ details pre {
 .gstat.st-listed { color: var(--phos); }
 .gstat.st-failed, .gstat.st-scrapped { color: var(--err); }
 .gstat.st-on_conveyor, .gstat.st-packing { color: var(--amber); }
+
+/* ---- touch ---- */
+#screen { touch-action: manipulation; }
+#hud-menu { display: none; }
+
+/* ---- phones / narrow screens ---- */
+@media (max-width: 760px) {
+  html, body { justify-content: flex-start; align-items: stretch; }
+  body { flex-direction: column; }
+  /* slimmer bezel, canvas fills the width under the HUD */
+  #bezel {
+    margin: calc(34px + env(safe-area-inset-top)) 4px 0;
+    border-radius: 10px;
+    padding: 6px 7px 7px;
+    align-self: center;
+    max-width: calc(100vw - 8px);
+  }
+  #bezel-top { padding-bottom: 4px; }
+  #bezel-label { font-size: 8px; letter-spacing: 2px; }
+  #bezel-bottom { padding-top: 4px; }
+
+  /* compact HUD: status/live + rev|scan + [ ≡ ] stay; the rest is a menu */
+  #hud {
+    padding: calc(4px + env(safe-area-inset-top)) 6px 4px;
+    gap: 5px;
+    font-size: 11px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  #hud .hud-x { display: none; }
+  #hud-menu { display: inline-block; margin-left: auto; flex-shrink: 0; }
+  #hud.menu-open {
+    flex-wrap: wrap;
+    flex-direction: column;
+    align-items: stretch;
+    max-height: 78vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  #hud.menu-open .hud-x { display: inline-block; align-self: flex-start; }
+  #hud.menu-open select.hud-x { display: block; width: 100%; max-width: none; }
+  #hud.menu-open .hud-sep { display: none; }
+  #hud.menu-open #hud-menu { position: absolute; top: calc(4px + env(safe-area-inset-top)); right: 6px; }
+
+  /* bigger tap targets */
+  #hud .btn, #hud .hud-pill, #hud select { min-height: 34px; padding: 6px 10px; }
+  #drawer .btn, #drawer select, #drawer .gfilter, .gcell, .tick-link { min-height: 40px; }
+  #drawer .btn { padding: 10px 14px; }
+  .dclose { font-size: 16px; min-width: 44px; }
+
+  /* drawers become bottom sheets */
+  #drawer {
+    top: 28%; left: 0; right: 0; bottom: 0;
+    width: auto;
+    border-left: none;
+    border-top: 1px solid var(--phos-dim);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.7), inset 0 0 40px rgba(92, 242, 200, 0.03);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* ticker flows below the canvas */
+  #ticker { position: static; margin: 6px 8px calc(8px + env(safe-area-inset-bottom)); }
+  .tick { max-width: none; font-size: 10px; }
+  #toast { top: auto; bottom: 20%; width: 88vw; text-align: center; }
+}
+
+/* ---- crew list (phones only) ---- */
+#crew { display: none; }
+
+@media (max-width: 760px) {
+  #crew {
+    display: block;
+    margin: 4px 8px 0;
+    border: 1px solid var(--phos-dim);
+    background: var(--glass);
+    background-image: repeating-linear-gradient(
+      to bottom, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px);
+    max-height: 30vh;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--phos);
+  }
+  .crew-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(92, 242, 200, 0.12);
+    cursor: pointer;
+  }
+  .crew-row:last-child { border-bottom: none; }
+  .crew-row:active { background: rgba(92, 242, 200, 0.1); }
+  .crew-dot {
+    width: 8px; height: 8px; flex-shrink: 0;
+    box-shadow: 0 0 6px currentColor;
+  }
+  .crew-main { flex: 1; min-width: 0; line-height: 1.35; }
+  .crew-main b { font-weight: normal; letter-spacing: 1px; }
+  .crew-main i { font-style: normal; color: var(--phos-dim); font-size: 10px; text-transform: uppercase; }
+  .crew-status {
+    color: var(--phos-dim);
+    font-size: 11px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .crew-side { color: var(--amber); font-size: 10px; flex-shrink: 0; }
+  .crew-thumb {
+    width: 32px; height: 32px; flex-shrink: 0;
+    image-rendering: pixelated;
+    background: var(--ink);
+    border: 1px solid rgba(92, 242, 200, 0.3);
+  }
+
+  /* smaller, clamped nameplates */
+  .nameplate { font-size: 8px; padding: 0 3px; gap: 3px; }
+  .nameplate .np-dot { width: 4px; height: 4px; }
+}

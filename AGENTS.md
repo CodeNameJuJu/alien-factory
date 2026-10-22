@@ -171,6 +171,25 @@ Model ids are ACP `model` config values; if a configured id isn't offered,
 the session default is used. Data dir `~/.alien-factory/`: `state.json`,
 `config.json`, `logs/acp.log`, `probe/`, `factory/`. `ALIEN_FACTORY_DIR`
 env var overrides the factory dir (used by tests/seeding).
+`ALIEN_FACTORY_DATA_DIR` overrides the whole data root (Railway: `/data`).
+
+## Worker ⇄ relay deployment
+
+Two roles by env (see README for the diagram/setup):
+
+- **Relay** (`ALIEN_FACTORY_WORKER_KEY`, prod): `/worker` ws endpoint,
+  bearer-auth, single worker slot, `maxPayload` 4 MB. Browser state =
+  `mergeRelayState()` (link.ts): worker's factory + relay's itch +
+  `worker:{connected,lastSeenAt}`; persisted to `worker-state.json`.
+  Forwardable commands are allowlisted in `FORWARDABLE` (link.ts);
+  `signIn` is never forwarded, `scanNow` runs on the relay.
+- **Worker** (`ALIEN_FACTORY_RELAY_URL` + key): `worker-link.ts` — outbound
+  ws only, backoff 1s→30s+jitter, ping/25s, state push ≤2/s, asset files
+  (allowlist `ASSET_FILES`, ≤2 MB each) pushed on change/welcome-diff,
+  `remote: <cmd>` events; self-scans itch only if the relay is silent >2h.
+- `scripts/run-worker.mjs` loads `~/.alien-factory/worker.env` (never logs
+  values); `new-worker-key.mjs`, `install-launchagent.sh [--load]`,
+  `uninstall-launchagent.sh`, `worker-status.sh`.
 
 ## Verify
 
