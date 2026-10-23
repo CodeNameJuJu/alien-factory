@@ -76,11 +76,13 @@ export function listingConsistency(
       issues.push(`listing says ${s}x${s} but the frames are ${realSize}x${realSize}`);
     }
   }
-  // pack meta.frames is the TOTAL across items — per-item max is the claim ceiling
+  // pack meta.frames is the TOTAL across items; a claim is consistent when it
+  // is ≤ the per-item max OR equals that total ("54 frames at 6fps")
   const perItemMax = Math.max(0, ...(meta?.perItem ?? []).map((i) => i.frames));
   const realMaxFrames = perItemMax || (meta?.frames ?? 0);
+  const totalFrames = meta?.frames ?? 0;
   for (const [claimed, phrase] of frameClaims(text)) {
-    if (claimed > realMaxFrames) {
+    if (claimed > realMaxFrames && claimed !== totalFrames) {
       issues.push(`listing claims "${phrase.trim()}" but items have at most ${realMaxFrames || '?'} frames`);
     }
   }

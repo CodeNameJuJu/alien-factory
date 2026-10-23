@@ -817,12 +817,27 @@ test('listingConsistency: variation numbers are not item counts; frame claims ch
     ),
     [],
   );
-  // but an over-claimed frame count still fails
+  // but an over-claimed frame count still fails (12 ≠ per-item max, ≠ total)
   assert.ok(
     listingConsistency(
       { title: 'Spell FX 16x16', description: '8 items with 12 frames of animation' },
       packMeta8,
     ).some((i) => /12 frames?.*at most 4 frames/i.test(i)),
+  );
+  // the live false positive: "54 frames" is the pack TOTAL — allowed
+  const climbMeta = {
+    w: 16,
+    h: 16,
+    items: 16,
+    frames: 54,
+    perItem: [4, 2, 5, 4, 4, 2, 4, 4, 4, 3, 3, 4, 2, 2, 3, 4].map((frames, i) => ({ name: `i${i}`, frames })),
+  };
+  assert.deepEqual(
+    listingConsistency(
+      { title: '16 Player Expansion Sprites 16x16', description: '7-color palette, 54 frames at 6fps' },
+      climbMeta,
+    ),
+    [],
   );
 });
 
