@@ -2,22 +2,26 @@
 // decision loop, all driven by Devin ACP sessions sandboxed to FACTORY_DIR.
 import { execFile } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AcpClient, configOption, configValues, DEVIN_DISABLED, RpcError } from './acp.js';
-import { FACTORY_DIR, STATE_PATH, DATA_DIR, saveConfig } from './config.js';
+import { FACTORY_DIR, STATE_PATH, DATA_DIR, LOG_DIR, saveConfig } from './config.js';
 import { Market, TICK_MS } from './market.js';
 import {
   applyApprovalCap,
+  capExceeded,
   checkMeta,
   decidePermission,
   extractReport,
+  inspectingRecoverySkus,
+  JOB_AGENT_KIND,
   parseDecisions,
   parseDemand,
   parseInspection,
   pickSmith,
   opportunitiesToCandidates,
+  recordUsage,
   shouldQueueScout,
   urlsAllowed,
 } from './parse.js';
@@ -50,6 +54,7 @@ import type {
   ShiftState,
   TranscriptEntry,
   TrendReport,
+  UsageState,
 } from '../../shared/protocol.js';
 
 const TRANSCRIPT_CAP = 300;
@@ -110,6 +115,8 @@ interface PersistedState {
   market?: Record<string, Json>;
   trendReports?: TrendReport[];
   itch?: { lastScanAt?: number | null; analysis?: ItchState['analysis'] };
+  usage?: UsageState;
+  lastScoutAt?: number;
 }
 
 export class FactoryManager extends EventEmitter {
@@ -128,6 +135,11 @@ export class FactoryManager extends EventEmitter {
   lastScoutTick = -999;
   trendReports: TrendReport[] = [];
   itch: ItchState = { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null };
+  usage: UsageState = { byRole: {}, byModel: {} };
+  /// when the last scout job finished (full-mode rescout window)
+  lastScoutAt = 0;
+  /// shift auto-paused by a daily token cap
+  tokenCapHit = false;
 
   /// Set by main.ts when a relay link is configured — true while the worker
   /// is linked (or was within the last 2h). A linked worker never scans
@@ -201,6 +213,8 @@ export class FactoryManager extends EventEmitter {
         lastScoutTick: this.lastScoutTick,
         trendReports: this.trendReports,
         itch: { lastScanAt: this.itch.lastScanAt, analysis: this.itch.analysis },
+        usage: this.usage,
+        lastScoutAt: this.lastScoutAt,
         market: this.market.serialize(),
       };
       writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -242,6 +256,8 @@ export class FactoryManager extends EventEmitter {
     this.itch.lastScanAt = raw.itch?.lastScanAt ?? null;
     this.itch.analysis = raw.itch?.analysis ?? null;
     if (this.itch.lastScanAt) setLastScanAt(this.itch.lastScanAt);
+    if (raw.usage?.byRole && raw.usage?.byModel) this.usage = raw.usage;
+    this.lastScoutAt = raw.lastScoutAt ?? 0;
     this.market.restore(raw.market);
     // no session/load on restart — drop sessions, requeue active jobs
     this.shift = 'stopped';
@@ -257,6 +273,13 @@ export class FactoryManager extends EventEmitter {
         j.status = 'queued';
         j.assignee = undefined;
       }
+    }
+    // recovery for the assignable() fix: assets whose forge finished and
+    // whose inspect job is queued were stuck on 'forging' — they're
+    // actually waiting at the inspector's desk
+    for (const sku of inspectingRecoverySkus(this.assets, this.jobs)) {
+      const a = this.asset(sku);
+      if (a) a.status = 'inspecting';
     }
   }
 
@@ -275,13 +298,13 @@ export class FactoryManager extends EventEmitter {
       transcript: [],
     });
     const want: [string, AgentKind, string][] = [
-      ['overlord', 'overlord', this.config.overlordModel],
-      ['scout', 'scout', this.config.workerModel],
-      ['inspector', 'inspector', this.config.workerModel],
-      ['packer', 'packer', this.config.workerModel],
+      ['overlord', 'overlord', this.config.models.overlord],
+      ['scout', 'scout', this.config.models.scout],
+      ['inspector', 'inspector', this.config.models.inspector],
+      ['packer', 'packer', this.config.models.packer],
     ];
     for (let i = 1; i <= this.config.smiths; i++) {
-      want.push([`smith-${i}`, 'smith', this.config.workerModel]);
+      want.push([`smith-${i}`, 'smith', this.config.models.smith]);
     }
     for (const [id, kind, model] of want) {
       if (!this.agents.some((a) => a.id === id)) this.agents.push(mk(id, kind, model));
@@ -326,8 +349,7 @@ export class FactoryManager extends EventEmitter {
     if (agent.state === 'error' || agent.state === 'working') return false;
     if (agent.currentJobId) return false;
     if (job.pinnedTo) return agent.id === job.pinnedTo;
-    if (job.kind === 'forge') return agent.kind === 'smith';
-    return agent.kind === job.kind;
+    return agent.kind === JOB_AGENT_KIND[job.kind];
   }
 
   /// A scout is wanted only when there are no pending proposals and the last
@@ -385,11 +407,12 @@ export class FactoryManager extends EventEmitter {
       if (agent.state !== 'error') agent.state = 'idle';
       agent.jobsInSession++;
       // cheap models get small contexts — recycle the session regularly
-      if (agent.kind !== 'overlord' && agent.jobsInSession >= this.config.workerSessionJobLimit) {
+      if (agent.kind !== 'overlord' && agent.jobsInSession >= this.config.sessionJobLimit[agent.kind]) {
         agent.sessionId = null;
         agent.jobsInSession = 0;
       }
     }
+    if (job.kind === 'scout') this.lastScoutAt = job.finishedAt;
     this.changed();
   }
 
@@ -472,7 +495,7 @@ export class FactoryManager extends EventEmitter {
   /// Sets the agent's model if offered, and never leaves the mode on `ask`.
   private async configureSession(agent: Agent, configOptions: Json): Promise<void> {
     const sessionId = agent.sessionId!;
-    const wantModel = agent.kind === 'overlord' ? this.config.overlordModel : this.config.workerModel;
+    const wantModel = this.config.models[agent.kind];
     const modelOpt = configOption(configOptions, 'model');
     if (modelOpt) {
       const offered = configValues(modelOpt);
@@ -669,6 +692,9 @@ export class FactoryManager extends EventEmitter {
         return;
       }
     }
+    // checks passed — the asset is waiting at the inspector's desk NOW,
+    // not still "forging" until an inspector picks the job up
+    this.setAssetStatus(asset.sku, 'inspecting');
     this.queueJob('inspect', asset.sku);
     this.event(`${agent.name} hands ${asset.sku} to the inspector`, agent.id, asset.sku);
     this.finishJob(job, true);
@@ -929,6 +955,8 @@ export class FactoryManager extends EventEmitter {
         hasPendingCandidates: this.candidates.some((c) => c.status === 'pending'),
         hasScoutJob: this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed'),
         reportScanAts: this.trendReports.map((t) => t.scanAt),
+        lastScoutAt: this.lastScoutAt,
+        rescoutMs: this.config.rescoutHours * HOUR_MS,
       })
     ) {
       this.queueJob('scout');
@@ -979,6 +1007,8 @@ export class FactoryManager extends EventEmitter {
       itch: { ...this.itch, backoffUntil: getBackoffUntil() || null },
       trendReports: this.trendReports,
       devinEnabled: !DEVIN_DISABLED,
+      usage: this.usage,
+      tokenCapHit: this.tokenCapHit,
     };
   }
 
@@ -1010,7 +1040,10 @@ export class FactoryManager extends EventEmitter {
         this.stopShift();
         return;
       case 'setModels':
-        this.setModels(msg.overlordModel, msg.workerModel);
+        this.setModels(msg.role, msg.model);
+        return;
+      case 'setCaps':
+        this.setCaps(msg.caps);
         return;
       case 'directive':
         this.directive(msg.text);
@@ -1036,6 +1069,13 @@ export class FactoryManager extends EventEmitter {
 
   private startShift(): void {
     if (this.shift === 'running') return;
+    if (capExceeded(this.usage, this.config.dailyTokenCaps)) {
+      this.tokenCapHit = true;
+      this.event('daily token cap hit — paused until midnight or raise the cap');
+      this.changed();
+      return;
+    }
+    this.tokenCapHit = false;
     this.shift = 'running';
     this.event('shift started — the factory hums to life');
     for (const a of this.agents) {
@@ -1104,21 +1144,39 @@ export class FactoryManager extends EventEmitter {
     this.changed();
   }
 
-  private setModels(overlordModel?: string, workerModel?: string): void {
-    if (overlordModel) this.config.overlordModel = overlordModel;
-    if (workerModel) this.config.workerModel = workerModel;
+  private setModels(role: AgentKind, model: string): void {
+    if (!(role in this.config.models) || !model) return;
+    this.config.models[role] = model;
     saveConfig(this.config);
     for (const a of this.agents) {
-      const want = a.kind === 'overlord' ? this.config.overlordModel : this.config.workerModel;
-      a.model = want;
-      a.modelName = want;
+      if (a.kind !== role) continue;
+      a.model = model;
+      a.modelName = model;
       // applies to new sessions: reset idle ones so their next job reconfigures
       if (a.state === 'idle' || a.state === 'offline') {
         a.sessionId = null;
         a.jobsInSession = 0;
       }
     }
-    this.event('models updated');
+    this.event(`${role} model: ${model}`);
+    this.changed();
+  }
+
+  private setCaps(caps: { overlord?: number | null; workers?: number | null }): void {
+    const next: NonNullable<FactoryConfig['dailyTokenCaps']> = { ...(this.config.dailyTokenCaps ?? {}) };
+    for (const k of ['overlord', 'workers'] as const) {
+      const v = caps?.[k];
+      if (v === null) delete next[k];
+      else if (typeof v === 'number' && Number.isFinite(v) && v > 0) next[k] = Math.floor(v);
+    }
+    this.config.dailyTokenCaps = Object.keys(next).length ? next : null;
+    saveConfig(this.config);
+    this.tokenCapHit = capExceeded(this.usage, this.config.dailyTokenCaps);
+    this.event(
+      this.config.dailyTokenCaps
+        ? `token caps: overlord ${next.overlord ?? '—'} · workers ${next.workers ?? '—'} /day`
+        : 'token caps off',
+    );
     this.changed();
   }
 
@@ -1169,8 +1227,38 @@ export class FactoryManager extends EventEmitter {
       if (update?.title) agent.statusLine = update.title;
     } else if (kind === 'usage_update') {
       agent.lastUsage = update;
+      this.onUsage(agent, update);
     }
     this.changed();
+  }
+
+  // ---- token usage ------------------------------------------------------------
+
+  /// raw event → logs/usage.jsonl (rotated at 20 MB) + accumulated buckets.
+  /// One usage_update = one model request — APPROX, the log lets us check.
+  private onUsage(agent: Agent, update: Json): void {
+    const entry = { at: Date.now(), agentId: agent.id, role: agent.kind, model: agent.model, update };
+    try {
+      mkdirSync(LOG_DIR, { recursive: true });
+      const p = join(LOG_DIR, 'usage.jsonl');
+      if (existsSync(p) && statSync(p).size > 20 * 1024 * 1024) {
+        renameSync(p, join(LOG_DIR, 'usage.jsonl.1'));
+      }
+      appendFileSync(p, JSON.stringify(entry) + '\n');
+    } catch {
+      /* metering must never break a job */
+    }
+    recordUsage(this.usage, agent.kind, agent.model, update, Date.now());
+    if (capExceeded(this.usage, this.config.dailyTokenCaps)) {
+      this.tokenCapHit = true;
+      if (this.shift === 'running') {
+        this.shift = 'paused';
+        this.event('daily token cap hit — paused until midnight or raise the cap');
+      }
+    } else if (this.tokenCapHit) {
+      // midnight rolled (buckets reset) or caps were raised
+      this.tokenCapHit = false;
+    }
   }
 
   private onPermission(sessionId: string, requestId: Json, params: Json): void {

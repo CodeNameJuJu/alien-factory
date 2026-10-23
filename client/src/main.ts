@@ -25,8 +25,11 @@ const empty: StateMessage = {
   events: [],
   market: { tick: 0, tags: [], competitors: [], revenueHistory: [], totals: { views: 0, units: 0, revenueUsd: 0 } },
   config: {
-    overlordModel: '', workerModel: '', smiths: 3, maxOverlordTurnsPerHour: 6,
-    maxApprovalsPerTurn: 4, workerSessionJobLimit: 6, usdToZar: 18.5,
+    models: { overlord: '', scout: '', smith: '', inspector: '', packer: '' },
+    smiths: 3, maxOverlordTurnsPerHour: 6,
+    maxApprovalsPerTurn: 4,
+    sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6 },
+    rescoutHours: 6, usdToZar: 18.5, prices: {}, dailyTokenCaps: null,
     mode: 'research', marketSource: 'itch', itchScanMinutes: 60, itchFeeds: [],
   },
   acp: { authenticated: false, models: [], modelGroups: [], defaultModel: null, modes: [], alive: false },
@@ -34,6 +37,8 @@ const empty: StateMessage = {
   itch: { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null },
   trendReports: [],
   devinEnabled: true,
+  usage: { byRole: {}, byModel: {} },
+  tokenCapHit: false,
 };
 
 let state = empty;
@@ -50,6 +55,7 @@ const hud = new Hud(net, {
     else if (sel.type === 'market') select({ type: 'market' });
     else if (sel.type === 'gallery') select({ type: 'gallery' });
     else if (sel.type === 'trends') select({ type: 'trends' });
+    else if (sel.type === 'models') select({ type: 'models' });
     else select({ type: 'overlord' });
   },
 });

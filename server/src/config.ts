@@ -15,13 +15,21 @@ export const PROBE_DIR = join(DATA_DIR, 'probe');
 export const FACTORY_DIR = process.env.ALIEN_FACTORY_DIR ?? join(DATA_DIR, 'factory');
 
 export const DEFAULT_CONFIG: FactoryConfig = {
-  overlordModel: 'claude-opus-5-5-high',
-  workerModel: 'swe-1-7-lightning-medium',
+  models: {
+    overlord: 'claude-sonnet-5-5-medium',
+    scout: 'claude-haiku-5-5-medium',
+    smith: 'swe-1-7-lightning-medium',
+    inspector: 'claude-haiku-5-5-low',
+    packer: 'swe-1-6-fast',
+  },
   smiths: 3,
   maxOverlordTurnsPerHour: 6,
   maxApprovalsPerTurn: 4,
-  workerSessionJobLimit: 6,
+  sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6 },
+  rescoutHours: 6,
   usdToZar: 18.5,
+  prices: {},
+  dailyTokenCaps: null,
   mode: 'research',
   marketSource: 'itch',
   itchScanMinutes: 60,
@@ -37,19 +45,44 @@ export const DEFAULT_CONFIG: FactoryConfig = {
   ],
 };
 
+/// Merge a raw config.json onto the defaults. One-time migration: the old
+/// overlordModel/workerModel/workerSessionJobLimit keys are dropped
+/// (per-role models + session limits replace them); nested maps merge.
+export function migrateConfig(raw: Record<string, unknown>): FactoryConfig {
+  const {
+    overlordModel: _o,
+    workerModel: _w,
+    workerSessionJobLimit: _s,
+    ...rest
+  } = raw as Record<string, unknown> & {
+    overlordModel?: unknown;
+    workerModel?: unknown;
+    workerSessionJobLimit?: unknown;
+  };
+  const merged = { ...DEFAULT_CONFIG, ...(rest as Partial<FactoryConfig>) };
+  merged.models = { ...DEFAULT_CONFIG.models, ...(rest.models as Partial<FactoryConfig['models']> | undefined) };
+  merged.sessionJobLimit = {
+    ...DEFAULT_CONFIG.sessionJobLimit,
+    ...(rest.sessionJobLimit as Partial<FactoryConfig['sessionJobLimit']> | undefined),
+  };
+  merged.prices = { ...((rest.prices as FactoryConfig['prices']) ?? {}) };
+  merged.dailyTokenCaps = (rest.dailyTokenCaps as FactoryConfig['dailyTokenCaps']) ?? null;
+  return merged;
+}
+
 export function loadConfig(): FactoryConfig {
   mkdirSync(DATA_DIR, { recursive: true });
   mkdirSync(LOG_DIR, { recursive: true });
   mkdirSync(FACTORY_DIR, { recursive: true });
   if (!existsSync(CONFIG_PATH)) {
     writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models }, sessionJobLimit: { ...DEFAULT_CONFIG.sessionJobLimit } };
   }
   try {
-    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) as Partial<FactoryConfig>;
-    return { ...DEFAULT_CONFIG, ...raw };
+    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) as Record<string, unknown>;
+    return migrateConfig(raw);
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models }, sessionJobLimit: { ...DEFAULT_CONFIG.sessionJobLimit } };
   }
 }
 

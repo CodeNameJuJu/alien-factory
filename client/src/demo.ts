@@ -87,13 +87,13 @@ export function startDemo(apply: (s: StateMessage) => void): void {
     type: 'state',
     shift: 'running',
     agents: [
-      mkAgent('overlord', 'overlord', 'Zorblat', 'claude-opus-5-5-high'),
-      mkAgent('scout', 'scout', 'Blix', 'swe-1-7-lightning-medium'),
+      mkAgent('overlord', 'overlord', 'Zorblat', 'claude-sonnet-5-5-medium'),
+      mkAgent('scout', 'scout', 'Blix', 'claude-haiku-5-5-medium'),
       mkAgent('smith-1', 'smith', 'Krell', 'swe-1-7-lightning-medium'),
       mkAgent('smith-2', 'smith', 'Vexa', 'swe-1-7-lightning-medium'),
       mkAgent('smith-3', 'smith', 'Ooma', 'swe-1-7-lightning-medium'),
-      mkAgent('inspector', 'inspector', 'Nurgg', 'swe-1-7-lightning-medium'),
-      mkAgent('packer', 'packer', 'Spliq', 'swe-1-7-lightning-medium'),
+      mkAgent('inspector', 'inspector', 'Nurgg', 'claude-haiku-5-5-low'),
+      mkAgent('packer', 'packer', 'Spliq', 'swe-1-6-fast'),
     ],
     candidates: [],
     assets: [],
@@ -123,13 +123,21 @@ export function startDemo(apply: (s: StateMessage) => void): void {
       totals: { views: 0, units: 0, revenueUsd: 0 },
     },
     config: {
-      overlordModel: 'claude-opus-5-5-high',
-      workerModel: 'swe-1-7-lightning-medium',
+      models: {
+        overlord: 'claude-sonnet-5-5-medium',
+        scout: 'claude-haiku-5-5-medium',
+        smith: 'swe-1-7-lightning-medium',
+        inspector: 'claude-haiku-5-5-low',
+        packer: 'swe-1-6-fast',
+      },
       smiths: 3,
       maxOverlordTurnsPerHour: 6,
       maxApprovalsPerTurn: 4,
-      workerSessionJobLimit: 6,
+      sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6 },
+      rescoutHours: 6,
       usdToZar: 18.5,
+      prices: {},
+      dailyTokenCaps: null,
       mode: 'full',
       marketSource: 'itch',
       itchScanMinutes: 60,
@@ -174,6 +182,22 @@ export function startDemo(apply: (s: StateMessage) => void): void {
         scanAt: Date.now() - 600_000,
       },
     ],
+    usage: {
+      byRole: {
+        overlord: {
+          day: { date: 'demo', input: 82000, cachedRead: 140000, cachedWrite: 3000, output: 4100, requests: 3 },
+          hour: { hour: 'demo 12', input: 40000, cachedRead: 70000, cachedWrite: 1500, output: 2000, requests: 2 },
+          total: { input: 310000, cachedRead: 520000, cachedWrite: 12000, output: 15000, requests: 11 },
+        },
+        smith: {
+          day: { date: 'demo', input: 240000, cachedRead: 880000, cachedWrite: 22000, output: 31000, requests: 9 },
+          hour: { hour: 'demo 12', input: 90000, cachedRead: 300000, cachedWrite: 8000, output: 12000, requests: 4 },
+          total: { input: 1200000, cachedRead: 4100000, cachedWrite: 90000, output: 180000, requests: 42 },
+        },
+      },
+      byModel: {},
+    },
+    tokenCapHit: false,
   };
 
   apply(state);

@@ -5,18 +5,22 @@ import { drawAssetFrame } from './assets';
 import type { Agent, Asset, StateMessage } from '../../shared/protocol';
 
 export interface HudHooks {
-  onSelect: (sel: { type: 'overlord' | 'agent' | 'market' | 'gallery' | 'asset' | 'trends'; id?: string }) => void;
+  onSelect: (sel: { type: 'overlord' | 'agent' | 'market' | 'gallery' | 'asset' | 'trends' | 'models'; id?: string }) => void;
+}
+
+/// ~12.3k / ~4.5M compact token counts
+export function fmtTokens(n: number): string {
+  if (n >= 1e6) return `~${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `~${(n / 1e3).toFixed(1)}k`;
+  return `~${n}`;
 }
 
 export class Hud {
   private bar: HTMLDivElement;
   private ticker: HTMLDivElement;
-  private modelOverlord: HTMLSelectElement;
-  private modelWorker: HTMLSelectElement;
   private crew: HTMLDivElement;
   private crewKey = '';
   private crewThumbs: { c: HTMLCanvasElement; asset: Asset }[] = [];
-  private lastModelSig = '';
   private lastMode: 'research' | 'full' = 'research';
   private lastSource: 'itch' | 'mock' = 'itch';
 
@@ -37,6 +41,8 @@ export class Hud {
       <span id="hud-listed" class="hud-pill hud-x">0 listed</span>
       <span id="hud-proposals" class="hud-pill hud-x">0 proposals</span>
       <span id="hud-scan" class="hud-pill" style="display:none">scan —</span>
+      <span id="hud-cap" class="hud-pill warn" style="display:none">token cap hit</span>
+      <button class="btn hud-x" id="hud-tok" title="token usage (approx)">tokens ~0</button>
       <span id="hud-queue" class="hud-pill dim hud-x">queue 0</span>
       <span id="hud-turns" class="hud-pill dim hud-x">turns 0/h</span>
       <span class="hud-sep hud-x"></span>
@@ -48,8 +54,7 @@ export class Hud {
       <span id="hud-devin" class="hud-pill hud-x">Devin …</span>
       <span id="hud-note" class="hud-pill dim hud-x" style="display:none">agents run on the local Mac</span>
       <button class="btn hud-x" id="hud-signin" style="display:none">[ sign in ]</button>
-      <select class="hud-x" id="hud-model-o" title="Overlord model"></select>
-      <select class="hud-x" id="hud-model-w" title="Worker model"></select>
+      <button class="btn hud-x" id="hud-models">[ models ]</button>
       <span class="hud-sep hud-x"></span>
       <button class="btn hud-x" id="hud-crt">[ crt: on ]</button>
       <button class="btn hud-x" id="hud-gallery">[ gallery ]</button>
@@ -76,9 +81,6 @@ export class Hud {
       this.hooks.onSelect(row.dataset.agent === 'overlord' ? { type: 'overlord' } : { type: 'agent', id: row.dataset.agent });
     });
 
-    this.modelOverlord = this.bar.querySelector('#hud-model-o')!;
-    this.modelWorker = this.bar.querySelector('#hud-model-w')!;
-
     this.bar.addEventListener('click', (e) => {
       const act = (e.target as HTMLElement).dataset?.act;
       if (act === 'startShift') this.net.send({ type: 'startShift' });
@@ -94,16 +96,10 @@ export class Hud {
       else if ((e.target as HTMLElement).id === 'hud-market') this.hooks.onSelect({ type: 'market' });
       else if ((e.target as HTMLElement).id === 'hud-menu') this.bar.classList.toggle('menu-open');
       else if ((e.target as HTMLElement).id === 'hud-gofull') this.net.send({ type: 'setMode', mode: 'full' });
+      else if ((e.target as HTMLElement).id === 'hud-models' || (e.target as HTMLElement).id === 'hud-tok') {
+        this.hooks.onSelect({ type: 'models' });
+      }
     });
-    const modelChanged = () => {
-      this.net.send({
-        type: 'setModels',
-        overlordModel: this.modelOverlord.value || undefined,
-        workerModel: this.modelWorker.value || undefined,
-      });
-    };
-    this.modelOverlord.addEventListener('change', modelChanged);
-    this.modelWorker.addEventListener('change', modelChanged);
 
     if (localStorage.getItem('af-crt') === 'off') {
       document.body.classList.add('no-crt');
@@ -204,33 +200,17 @@ export class Hud {
     const note = this.bar.querySelector('#hud-note') as HTMLElement;
     note.style.display = s.devinEnabled ? 'none' : '';
     note.textContent = s.worker && !s.worker.connected ? 'factory offline — start it on your Mac' : 'agents run on the local Mac';
-    for (const sel of ['[data-act="startShift"]', '[data-act="pauseShift"]', '[data-act="stopShift"]', '#hud-mode', '#hud-model-o', '#hud-model-w']) {
+    for (const sel of ['[data-act="startShift"]', '[data-act="pauseShift"]', '[data-act="stopShift"]', '#hud-mode']) {
       for (const el of this.bar.querySelectorAll<HTMLElement>(sel)) {
         if (el instanceof HTMLButtonElement || el instanceof HTMLSelectElement) el.disabled = !s.devinEnabled;
       }
     }
 
-    // model selects — rebuild only when the option set changes
-    const sig = JSON.stringify(s.acp.modelGroups.map((g) => g.values.map((v) => v.id)));
-    if (sig !== this.lastModelSig && s.acp.modelGroups.length) {
-      this.lastModelSig = sig;
-      for (const sel of [this.modelOverlord, this.modelWorker]) {
-        sel.innerHTML = '';
-        for (const g of s.acp.modelGroups) {
-          const og = document.createElement('optgroup');
-          og.label = g.name || 'models';
-          for (const v of g.values) {
-            const o = document.createElement('option');
-            o.value = v.id;
-            o.textContent = v.name;
-            og.appendChild(o);
-          }
-          sel.appendChild(og);
-        }
-      }
-    }
-    this.modelOverlord.value = s.config.overlordModel;
-    this.modelWorker.value = s.config.workerModel;
+    // token meter (approx) + cap-hit banner
+    let today = 0;
+    for (const t of Object.values(s.usage?.byRole ?? {})) today += t.day.input + t.day.cachedRead + t.day.cachedWrite + t.day.output;
+    pill('#hud-tok', `tokens ${fmtTokens(today)}`);
+    (this.bar.querySelector('#hud-cap') as HTMLElement).style.display = s.tokenCapHit ? '' : 'none';
 
     // ticker: newest on top (fewer lines on small screens)
     this.ticker.innerHTML = '';
@@ -261,6 +241,7 @@ export class Hud {
       researchIdle,
       s.agents.map((a) => [a.id, a.state, a.statusLine, a.currentJobId]),
       s.jobs.filter((j) => j.status === 'active').map((j) => [j.id, j.sku, j.createdAt]),
+      Object.values(s.usage?.byRole ?? {}).map((t) => t.day.input + t.day.cachedRead + t.day.cachedWrite + t.day.output),
     ]);
     if (key === this.crewKey) return;
     this.crewKey = key;
@@ -293,12 +274,15 @@ export class Hud {
       const job = a.currentJobId ? s.jobs.find((j) => j.id === a.currentJobId) : null;
       const asset = job?.sku ? s.assets.find((x) => x.sku === job.sku) : null;
       const role = a.kind === 'overlord' ? 'overlord' : a.kind;
+      const ru = s.usage?.byRole?.[a.kind]?.day;
+      const toks = ru ? ru.input + ru.cachedRead + ru.cachedWrite + ru.output : 0;
+      const roleLabel = toks ? `${role} ${fmtTokens(toks)}` : role;
       const status = a.id === overlord?.id
         ? `${a.statusLine || 'watching'}${pending ? ` · ${pending} proposals` : ''}`
         : a.statusLine || a.state;
       row.innerHTML = `
         <span class="crew-dot" style="background:${dotColor(a)}"></span>
-        <span class="crew-main"><b>${a.name}</b> <i>${role}</i><br><span class="crew-status">${status}</span></span>
+        <span class="crew-main"><b>${a.name}</b> <i>${roleLabel}</i><br><span class="crew-status">${status}</span></span>
         <span class="crew-side">${job ? elapsed(job.createdAt) : ''}</span>`;
       if (asset) {
         const c = document.createElement('canvas');

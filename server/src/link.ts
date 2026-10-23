@@ -13,7 +13,7 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 /// Commands browsers may send through the relay to the worker.
 export const FORWARDABLE = new Set<ClientMessage['type']>([
-  'startShift', 'pauseShift', 'stopShift', 'setModels', 'setMode',
+  'startShift', 'pauseShift', 'stopShift', 'setModels', 'setCaps', 'setMode',
   'setMarketSource', 'directive', 'cancelAgent',
 ]);
 
@@ -71,6 +71,8 @@ export function mergeRelayState(
     trendReports: worker.trendReports,
     devinEnabled: status.connected && worker.devinEnabled,
     worker: status,
+    usage: worker.usage,
+    tokenCapHit: worker.tokenCapHit,
   };
 }
 

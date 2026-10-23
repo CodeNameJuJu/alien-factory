@@ -3,7 +3,8 @@
 import type { Net } from './net';
 import { renderMd } from './md';
 import { drawAssetFrame, fetchMeta, metaFor } from './assets';
-import type { Agent, Asset, StateMessage } from '../../shared/protocol';
+import { fmtTokens } from './hud';
+import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
 
 export type Selection =
   | { type: 'overlord' }
@@ -11,7 +12,8 @@ export type Selection =
   | { type: 'asset'; id: string }
   | { type: 'market' }
   | { type: 'trends' }
-  | { type: 'gallery' };
+  | { type: 'gallery' }
+  | { type: 'models' };
 
 /// POST /api/reveal — server-side `open` on the factory dir (no-op errors).
 function reveal(body: { sku?: string; dir?: string }): void {
@@ -114,6 +116,8 @@ export class Drawers {
         return String(s.market.tick);
       case 'trends':
         return JSON.stringify([s.itch.lastScanAt, s.itch.scanning, s.itch.error, s.itch.analysis, s.trendReports.length]);
+      case 'models':
+        return JSON.stringify([s.config.models, s.config.dailyTokenCaps, s.usage, s.acp.modelGroups.length, s.devinEnabled]);
       case 'gallery':
         return this.galleryFilter + JSON.stringify(s.assets.map((a) => [a.sku, a.status]));
     }
@@ -161,6 +165,9 @@ export class Drawers {
         break;
       case 'trends':
         this.renderTrends(s);
+        break;
+      case 'models':
+        this.renderModels(s);
         break;
       case 'gallery':
         this.renderGallery(s);
@@ -238,7 +245,7 @@ export class Drawers {
 
   private renderOverlord(s: StateMessage): void {
     const o = s.agents.find((a) => a.kind === 'overlord');
-    this.head('THE OVERLORD', `${o?.modelName ?? s.config.overlordModel} · ${o?.statusLine ?? ''}`);
+    this.head('THE OVERLORD', `${o?.modelName ?? s.config.models.overlord} · ${o?.statusLine ?? ''}`);
     const b = this.body();
     const tabs = document.createElement('div');
     tabs.className = 'tabs';
@@ -336,6 +343,7 @@ export class Drawers {
   private renderAgent(a: Agent, s: StateMessage): void {
     this.head(a.name, `${a.kind} · ${a.modelName}`);
     const b = this.body();
+    this.kv(b, 'model', a.model);
     this.kv(b, 'state', a.state);
     this.kv(b, 'status', a.statusLine);
     this.kv(b, 'jobs in session', String(a.jobsInSession));
@@ -437,6 +445,135 @@ export class Drawers {
       void fetchMeta(a.sku).then((m) => {
         if (m && this.sel?.type === 'asset' && this.sel.id === a.sku) this.render();
       });
+    }
+  }
+
+  // ---- models & usage --------------------------------------------------------------
+
+  private costLine(c: UsageCounts, priced: number | null, usdToZar: number): string {
+    const toks = c.input + c.cachedRead + c.cachedWrite + c.output;
+    const base = `${fmtTokens(toks)} tok · ${c.requests} req`;
+    if (priced == null) return base;
+    return `${base} · ≈$${priced.toFixed(4)} / R${(priced * usdToZar).toFixed(2)}`;
+  }
+
+  private pricedCost(c: UsageCounts, s: StateMessage, model: string): number | null {
+    const p = s.config.prices?.[model];
+    if (!p) return null;
+    return (c.input * p.inPerM + c.cachedRead * p.cachedReadPerM + c.cachedWrite * p.cachedWritePerM + c.output * p.outPerM) / 1e6;
+  }
+
+  private renderModels(s: StateMessage): void {
+    this.head('MODELS & USAGE', 'approx — see logs/usage.jsonl');
+    const b = this.body();
+    const roles: AgentKind[] = ['overlord', 'scout', 'smith', 'inspector', 'packer'];
+
+    for (const role of roles) {
+      const card = document.createElement('div');
+      card.className = 'acard';
+      const names = s.agents.filter((a) => a.kind === role).map((a) => a.name).join(', ');
+      const title = document.createElement('div');
+      title.innerHTML = `<b>${role}</b> <span class="dim"></span>`;
+      (title.querySelector('.dim') as HTMLElement).textContent = names ? ` ${names}` : '';
+      card.appendChild(title);
+      const sel = document.createElement('select');
+      sel.disabled = !s.devinEnabled;
+      for (const g of s.acp.modelGroups) {
+        const og = document.createElement('optgroup');
+        og.label = g.name || 'models';
+        for (const v of g.values) {
+          const o = document.createElement('option');
+          o.value = v.id;
+          o.textContent = v.name;
+          og.appendChild(o);
+        }
+        sel.appendChild(og);
+      }
+      const cur = s.config.models[role];
+      if (cur && ![...sel.options].some((o) => o.value === cur)) {
+        const o = document.createElement('option');
+        o.value = cur;
+        o.textContent = cur;
+        sel.appendChild(o);
+      }
+      sel.value = cur;
+      sel.addEventListener('change', () => this.net.send({ type: 'setModels', role, model: sel.value }));
+      card.appendChild(sel);
+
+      const u = s.usage?.byRole?.[role];
+      if (u) {
+        const cost = (c: UsageCounts) => this.pricedCost(c, s, s.config.models[role]);
+        const tbl = document.createElement('div');
+        tbl.className = 'note';
+        tbl.textContent =
+          `today ${this.costLine(u.day, cost(u.day), s.config.usdToZar)}\n` +
+          `hour  ${this.costLine(u.hour, cost(u.hour), s.config.usdToZar)}\n` +
+          `total ${this.costLine(u.total, cost(u.total), s.config.usdToZar)}`;
+        tbl.style.whiteSpace = 'pre-wrap';
+        card.appendChild(tbl);
+      }
+      b.appendChild(card);
+    }
+
+    const mh = document.createElement('div');
+    mh.className = 'md-h';
+    mh.textContent = 'Per model';
+    b.appendChild(mh);
+    const models = Object.entries(s.usage?.byModel ?? {});
+    if (!models.length) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = '(no usage recorded yet)';
+      b.appendChild(d);
+    }
+    for (const [model, u] of models) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = `${model} — today ${this.costLine(u.day, this.pricedCost(u.day, s, model), s.config.usdToZar)}`;
+      b.appendChild(d);
+    }
+
+    const ch = document.createElement('div');
+    ch.className = 'md-h';
+    ch.textContent = 'Daily token caps (total incl. cached)';
+    b.appendChild(ch);
+    const caps = s.config.dailyTokenCaps ?? {};
+    const capRow = document.createElement('div');
+    capRow.className = 'cmd';
+    const mk = (label: string, key: 'overlord' | 'workers') => {
+      const w = document.createElement('label');
+      w.className = 'note';
+      w.style.display = 'flex';
+      w.style.gap = '6px';
+      w.style.alignItems = 'center';
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.min = '0';
+      inp.placeholder = 'off';
+      inp.value = caps[key] != null ? String(caps[key]) : '';
+      inp.id = `cap-${key}`;
+      inp.style.width = '9em';
+      w.append(label + ' ', inp);
+      return w;
+    };
+    const capBtn = document.createElement('button');
+    capBtn.className = 'btn primary';
+    capBtn.textContent = '[ set caps ]';
+    capBtn.disabled = !s.devinEnabled;
+    capBtn.addEventListener('click', () => {
+      const v = (id: string) => {
+        const n = Number((this.el.querySelector(`#cap-${id}`) as HTMLInputElement)?.value);
+        return n > 0 ? n : null;
+      };
+      this.net.send({ type: 'setCaps', caps: { overlord: v('overlord'), workers: v('workers') } });
+    });
+    capRow.append(mk('overlord', 'overlord'), mk('workers', 'workers'), capBtn);
+    b.appendChild(capRow);
+    if (s.tokenCapHit) {
+      const d = document.createElement('div');
+      d.className = 'note';
+      d.textContent = '⚠ daily token cap hit — paused until midnight or raise the cap';
+      b.appendChild(d);
     }
   }
 

@@ -471,3 +471,138 @@ test('opportunitiesToCandidates: pending candidates with clamped fields', () => 
   assert.equal(cs[0].reportN, 3);
   assert.equal(cs[1].id, 'c9');
 });
+
+// ---- job → agent kind + load-time recovery -------------------------------------
+
+test('JOB_AGENT_KIND maps every job kind to an agent kind', async () => {
+  const { JOB_AGENT_KIND, inspectingRecoverySkus } = await import('./parse.js');
+  assert.deepEqual(JOB_AGENT_KIND, { scout: 'scout', forge: 'smith', inspect: 'inspector', pack: 'packer' });
+  // the old bug: job.kind === agent.kind — inspect/pack never matched
+  const assets = [
+    { sku: 'a1', status: 'forging' },
+    { sku: 'a2', status: 'forging' },
+    { sku: 'a3', status: 'queued' },
+  ];
+  const jobs = [
+    { kind: 'forge' as const, sku: 'a1', status: 'done' },
+    { kind: 'inspect' as const, sku: 'a1', status: 'queued' },
+    { kind: 'inspect' as const, sku: 'a2', status: 'queued' }, // forge not done
+    { kind: 'forge' as const, sku: 'a3', status: 'done' },
+    { kind: 'inspect' as const, sku: 'a3', status: 'queued' },
+  ];
+  assert.deepEqual(inspectingRecoverySkus(assets, jobs), ['a1']);
+});
+
+// ---- config migration -----------------------------------------------------------
+
+test('migrateConfig drops the old model keys and merges nested maps', async () => {
+  const { migrateConfig, DEFAULT_CONFIG } = await import('./config.js');
+  const c = migrateConfig({
+    overlordModel: 'old-opus',
+    workerModel: 'old-worker',
+    workerSessionJobLimit: 9,
+    smiths: 5,
+    models: { smith: 'custom-smith' },
+  });
+  assert.equal(c.smiths, 5);
+  assert.equal(c.models.overlord, 'claude-sonnet-5-5-medium'); // old value ignored
+  assert.equal(c.models.scout, 'claude-haiku-5-5-medium');
+  assert.equal(c.models.inspector, 'claude-haiku-5-5-low');
+  assert.equal(c.models.packer, 'swe-1-6-fast');
+  assert.equal(c.models.smith, 'custom-smith'); // partial map merged
+  assert.deepEqual(c.sessionJobLimit, { scout: 1, smith: 1, inspector: 4, packer: 6 });
+  assert.equal(c.dailyTokenCaps, null);
+  assert.equal('overlordModel' in c, false);
+  assert.equal('workerSessionJobLimit' in c, false);
+  assert.equal(DEFAULT_CONFIG.rescoutHours, 6);
+});
+
+// ---- full-mode rescout window ----------------------------------------------------
+
+test('shouldQueueScout: full mode re-scouts fresh analysis or after the window', async () => {
+  const { shouldQueueScout } = await import('./parse.js');
+  const now = 1_800_000_000_000;
+  const base = {
+    mode: 'full' as const,
+    analysisAt: 100,
+    hasPendingCandidates: false,
+    hasScoutJob: false,
+    reportScanAts: [100], // current analysis already covered
+    now,
+    rescoutMs: 6 * 3_600_000,
+  };
+  // covered by a report → only re-scout when the window elapsed
+  assert.equal(shouldQueueScout({ ...base, lastScoutAt: now - 7 * 3_600_000 }), true);
+  assert.equal(shouldQueueScout({ ...base, lastScoutAt: now - 1 * 3_600_000 }), false);
+  // uncovered analysis → scout regardless of how recent the last run was
+  assert.equal(shouldQueueScout({ ...base, reportScanAts: [], lastScoutAt: now - 1000 }), true);
+  // pending proposals still gate it
+  assert.equal(shouldQueueScout({ ...base, reportScanAts: [], hasPendingCandidates: true }), false);
+});
+
+// ---- token usage -----------------------------------------------------------------
+
+test('usageFromUpdate prefers _meta keys, falls back to used', async () => {
+  const { usageFromUpdate } = await import('./parse.js');
+  assert.deepEqual(
+    usageFromUpdate({
+      used: 24985,
+      _meta: {
+        'cognition.ai/inputTokens': 23543,
+        'cognition.ai/outputTokens': 1442,
+        'cognition.ai/cachedReadTokens': 100,
+        'cognition.ai/cachedWriteTokens': 7,
+      },
+    }),
+    { input: 23543, cachedRead: 100, cachedWrite: 7, output: 1442 },
+  );
+  assert.deepEqual(usageFromUpdate({ used: 900 }), { input: 900, cachedRead: 0, cachedWrite: 0, output: 0 });
+  assert.deepEqual(usageFromUpdate({}), { input: 0, cachedRead: 0, cachedWrite: 0, output: 0 });
+});
+
+test('recordUsage accumulates by role+model, counts requests, rolls day buckets', async () => {
+  const { recordUsage, emptyUsageState, totalTokens } = await import('./parse.js');
+  const u = emptyUsageState();
+  const upd = { _meta: { 'cognition.ai/inputTokens': 1000, 'cognition.ai/outputTokens': 100 } };
+  const day1 = Date.parse('2026-10-22T10:00:00');
+  const day2 = Date.parse('2026-10-23T10:00:00');
+  recordUsage(u, 'smith', 'm1', upd, day1);
+  recordUsage(u, 'smith', 'm1', upd, day1);
+  recordUsage(u, 'overlord', 'm2', { _meta: { 'cognition.ai/inputTokens': 500 } }, day1);
+  const sm = u.byRole.smith!;
+  assert.equal(sm.day.requests, 2);
+  assert.equal(totalTokens(sm.day), 2200);
+  assert.equal(totalTokens(u.byModel.m1!.day), 2200);
+  assert.equal(totalTokens(sm.total), 2200);
+  assert.equal(u.byRole.overlord!.day.requests, 1);
+  // next local day → day bucket resets, total keeps going
+  recordUsage(u, 'smith', 'm1', upd, day2);
+  const sm2 = u.byRole.smith!;
+  assert.equal(sm2.day.requests, 1);
+  assert.equal(totalTokens(sm2.day), 1100);
+  assert.equal(totalTokens(sm2.total), 3300);
+});
+
+test('capExceeded: overlord cap and summed workers cap', async () => {
+  const { recordUsage, emptyUsageState, capExceeded } = await import('./parse.js');
+  const u = emptyUsageState();
+  const now = Date.parse('2026-10-23T10:00:00');
+  const big = { _meta: { 'cognition.ai/inputTokens': 60_000 } };
+  recordUsage(u, 'smith', 'm1', big, now);
+  recordUsage(u, 'packer', 'm1', big, now);
+  recordUsage(u, 'overlord', 'm2', { _meta: { 'cognition.ai/inputTokens': 5_000 } }, now);
+  assert.equal(capExceeded(u, { overlord: 10_000 }), false);
+  assert.equal(capExceeded(u, { overlord: 4_000 }), true);
+  assert.equal(capExceeded(u, { workers: 200_000 }), false);
+  assert.equal(capExceeded(u, { workers: 100_000 }), true); // smith+packer = 120k
+  assert.equal(capExceeded(u, null), false);
+  assert.equal(capExceeded(u, {}), false);
+});
+
+test('usageCostUsd prices token buckets, null when unpriced', async () => {
+  const { usageCostUsd } = await import('./parse.js');
+  const c = { input: 1_000_000, cachedRead: 500_000, cachedWrite: 100_000, output: 250_000, requests: 4 };
+  const cost = usageCostUsd(c, { inPerM: 3, cachedReadPerM: 0.3, cachedWritePerM: 3.75, outPerM: 15 });
+  assert.ok(Math.abs(cost! - (3 + 0.15 + 0.375 + 3.75)) < 1e-9);
+  assert.equal(usageCostUsd(c, undefined), null);
+});

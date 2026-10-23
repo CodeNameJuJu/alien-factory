@@ -1,7 +1,19 @@
 // Pure parsing / decision helpers for the factory pipeline — kept free of IO
 // so parse.test.ts can drive them directly.
 import { resolve, sep } from 'node:path';
-import type { AssetInspection, Candidate, Opportunity, OrderSpec } from '../../shared/protocol.js';
+import type {
+  AgentKind,
+  AssetInspection,
+  Candidate,
+  DailyTokenCaps,
+  JobKind,
+  ModelPrices,
+  Opportunity,
+  OrderSpec,
+  UsageCounts,
+  UsageState,
+  UsageTotals,
+} from '../../shared/protocol.js';
 
 type Json = any;
 
@@ -301,11 +313,37 @@ export function checkMeta(meta: MetaJson | null, order: OrderLike): { passed: bo
   return { passed: issues.length === 0, issues };
 }
 
+// ---- job → agent kind ---------------------------------------------------------
+
+/// Which agent role takes which job kind — job kinds are verbs
+/// (forge/inspect/pack), agent kinds are nouns (smith/inspector/packer).
+export const JOB_AGENT_KIND: Record<JobKind, AgentKind> = {
+  scout: 'scout',
+  forge: 'smith',
+  inspect: 'inspector',
+  pack: 'packer',
+};
+
+/// Skus whose forge job is done and whose inspect job is queued but whose
+/// asset status never moved past 'forging' (leftover from the old
+/// assignable() bug — inspect jobs could never be picked up, so the handoff
+/// status was never set). Used by loadState recovery.
+export function inspectingRecoverySkus(
+  assets: { sku: string; status: string }[],
+  jobs: { kind: JobKind; sku?: string; status: string }[],
+): string[] {
+  const doneForge = new Set(jobs.filter((j) => j.kind === 'forge' && j.status === 'done').map((j) => j.sku));
+  const queuedInspect = new Set(jobs.filter((j) => j.kind === 'inspect' && j.status === 'queued').map((j) => j.sku));
+  return assets.filter((a) => a.status === 'forging' && doneForge.has(a.sku) && queuedInspect.has(a.sku)).map((a) => a.sku);
+}
+
 // ---- scout gating + research→full promotion (pure) ----------------------------
 
 /// "Do we have fresh data for the scout to analyse?" — separate from "did a
 /// scan just succeed". Returns true when a scout job should be queued:
-/// - FULL: itch analysis exists, nothing pending for the overlord, no scout job
+/// - FULL: itch analysis exists, nothing pending for the overlord, no scout
+///   job, AND (the current analysis isn't covered by any trend report OR the
+///   last scout run finished more than `rescoutMs` ago)
 /// - RESEARCH: itch analysis exists and no trend report covers that scan yet
 export function shouldQueueScout(args: {
   mode: 'research' | 'full';
@@ -315,11 +353,20 @@ export function shouldQueueScout(args: {
   hasScoutJob: boolean;
   /// scanAt of every existing trend report
   reportScanAts: (number | undefined)[];
+  /// when the last scout job finished (any outcome) — full-mode rescout window
+  lastScoutAt?: number | null;
+  now?: number;
+  rescoutMs?: number;
 }): boolean {
   if (args.analysisAt == null) return false;
   if (args.hasScoutJob) return false;
-  if (args.mode === 'full') return !args.hasPendingCandidates;
-  return !args.reportScanAts.includes(args.analysisAt);
+  if (args.mode === 'research') return !args.reportScanAts.includes(args.analysisAt);
+  if (args.hasPendingCandidates) return false;
+  // fresh analysis never analysed → always scout
+  if (!args.reportScanAts.includes(args.analysisAt)) return true;
+  // covered already → only re-scout after the window
+  const last = args.lastScoutAt ?? 0;
+  return (args.now ?? Date.now()) - last >= (args.rescoutMs ?? 6 * 3_600_000);
 }
 
 /// Turn a research-mode trend report's opportunities into pending candidates
@@ -341,4 +388,107 @@ export function opportunitiesToCandidates(
     status: 'pending' as const,
     createdAt: opts.now,
   }));
+}
+
+// ---- token usage meter ---------------------------------------------------------
+
+export interface TokenCounts {
+  input: number;
+  cachedRead: number;
+  cachedWrite: number;
+  output: number;
+}
+
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+
+/// Pull per-request token counts out of a usage_update payload. Prefers the
+/// cognition.ai `_meta` keys; when absent, `used` (= input+output of that
+/// request) lands in `input` so the total still counts. APPROXIMATE — the
+/// raw event is logged to usage.jsonl so the assumption can be validated.
+export function usageFromUpdate(update: Json): TokenCounts {
+  const m = update?._meta ?? {};
+  const c: TokenCounts = {
+    input: num(m['cognition.ai/inputTokens']),
+    cachedRead: num(m['cognition.ai/cachedReadTokens']),
+    cachedWrite: num(m['cognition.ai/cachedWriteTokens']),
+    output: num(m['cognition.ai/outputTokens']),
+  };
+  if (!c.input && !c.output && !c.cachedRead && !c.cachedWrite) c.input = num(update?.used);
+  return c;
+}
+
+export const localDayKey = (now: number): string => {
+  const d = new Date(now);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+export const localHourKey = (now: number): string =>
+  `${localDayKey(now)} ${String(new Date(now).getHours()).padStart(2, '0')}`;
+
+const zeroCounts = (): UsageCounts => ({ input: 0, cachedRead: 0, cachedWrite: 0, output: 0, requests: 0 });
+
+export function emptyUsageTotals(now: number): UsageTotals {
+  return {
+    day: { ...zeroCounts(), date: localDayKey(now) },
+    hour: { ...zeroCounts(), hour: localHourKey(now) },
+    total: zeroCounts(),
+  };
+}
+
+/// Add one request's counts into a UsageTotals — day/hour buckets roll over
+/// when their key differs from `now`.
+export function addUsageTo(t: UsageTotals, c: TokenCounts, now: number): void {
+  const dk = localDayKey(now);
+  if (t.day.date !== dk) t.day = { ...zeroCounts(), date: dk };
+  const hk = localHourKey(now);
+  if (t.hour.hour !== hk) t.hour = { ...zeroCounts(), hour: hk };
+  for (const b of [t.day, t.hour, t.total]) {
+    b.input += c.input;
+    b.cachedRead += c.cachedRead;
+    b.cachedWrite += c.cachedWrite;
+    b.output += c.output;
+    b.requests += 1;
+  }
+}
+
+export const emptyUsageState = (): UsageState => ({ byRole: {}, byModel: {} });
+
+/// Record a usage_update under both the agent's role and its model id.
+export function recordUsage(state: UsageState, role: AgentKind, model: string, update: Json, now: number): void {
+  const c = usageFromUpdate(update);
+  const rt = (state.byRole[role] ??= emptyUsageTotals(now));
+  addUsageTo(rt, c, now);
+  const mt = (state.byModel[model] ??= emptyUsageTotals(now));
+  addUsageTo(mt, c, now);
+}
+
+export const totalTokens = (c: UsageCounts): number => c.input + c.cachedRead + c.cachedWrite + c.output;
+
+/// Sum of today's tokens for every non-overlord role.
+export function workersDayTokens(state: UsageState): number {
+  let n = 0;
+  for (const [role, t] of Object.entries(state.byRole)) {
+    if (role !== 'overlord') n += totalTokens(t.day);
+  }
+  return n;
+}
+
+/// True when a configured daily cap is exceeded (total tokens incl. cached).
+export function capExceeded(state: UsageState, caps: DailyTokenCaps | null | undefined): boolean {
+  if (!caps) return false;
+  if (typeof caps.overlord === 'number' && totalTokens(state.byRole.overlord?.day ?? zeroCounts()) > caps.overlord) {
+    return true;
+  }
+  if (typeof caps.workers === 'number' && workersDayTokens(state) > caps.workers) return true;
+  return false;
+}
+
+/// USD cost of a token bucket at the model's prices — null when unpriced.
+/// Approx: cached tokens priced at their own rates, everything else in/out.
+export function usageCostUsd(c: UsageCounts, prices: ModelPrices | undefined): number | null {
+  if (!prices) return null;
+  return (
+    (c.input * prices.inPerM + c.cachedRead * prices.cachedReadPerM +
+     c.cachedWrite * prices.cachedWritePerM + c.output * prices.outPerM) / 1e6
+  );
 }

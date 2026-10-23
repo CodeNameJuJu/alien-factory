@@ -139,9 +139,16 @@ pipeline data from the old design on load.
   e.g. `run("rm -rf ...")` — are allowed since no path exists to check; the
   agent's session cwd is the factory and prompts keep work inside it, but
   the guard cannot see inside opaque shell commands. Documented risk.
-- **Worker sessions are recycled** after `workerSessionJobLimit` jobs so the
-  cheap model keeps a small context; on server restart all sessionIds are
-  dropped and active jobs requeue.
+- **Worker sessions are recycled** per role after `sessionJobLimit` jobs
+  (scout 1, smith 1, inspector 4, packer 6) so the cheap models keep small
+  contexts; the overlord keeps its session. On server restart all
+  sessionIds are dropped and active jobs requeue.
+- **Token meter**: every `usage_update` is appended to
+  `logs/usage.jsonl` (rotated at 20 MB) and accumulated into `state.usage`
+  byRole/byModel day/hour/total buckets — approximate (1 update = 1
+  request). `config.prices` maps model ids to USD/1M rates for cost
+  display; `config.dailyTokenCaps` pauses the shift when a day's total
+  (cached included) is exceeded.
 - Server imports use `.js` extensions (NodeNext); client imports are
   extensionless (bundler resolution). Both import shared types from
   `../shared/protocol` (`.js` on the server).
@@ -153,19 +160,31 @@ defaults:
 
 ```json
 {
-  "overlordModel": "claude-opus-5-5-high",
-  "workerModel": "swe-1-7-lightning-medium",
+  "models": {
+    "overlord": "claude-sonnet-5-5-medium",
+    "scout": "claude-haiku-5-5-medium",
+    "smith": "swe-1-7-lightning-medium",
+    "inspector": "claude-haiku-5-5-low",
+    "packer": "swe-1-6-fast"
+  },
   "smiths": 3,
   "maxOverlordTurnsPerHour": 6,
   "maxApprovalsPerTurn": 4,
-  "workerSessionJobLimit": 6,
+  "sessionJobLimit": { "scout": 1, "smith": 1, "inspector": 4, "packer": 6 },
+  "rescoutHours": 6,
   "usdToZar": 18.5,
+  "prices": {},
+  "dailyTokenCaps": null,
   "mode": "research",
   "marketSource": "itch",
   "itchScanMinutes": 60,
   "itchFeeds": ["game-assets/top-sellers/tag-pixel-art:2", "..."]
 }
 ```
+
+Model ids are ACP `model` config values, set per role via `[ models ]` or
+`setModels { role, model }`; if a configured id isn't offered, the session
+default is used. `setCaps { overlord?, workers? }` adjusts daily caps.
 
 Model ids are ACP `model` config values; if a configured id isn't offered,
 the session default is used. Data dir `~/.alien-factory/`: `state.json`,

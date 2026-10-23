@@ -288,14 +288,58 @@ export interface TrendReport {
   promoted?: boolean;
 }
 
+// ---- token usage meter -----------------------------------------------------
+
+export interface UsageCounts {
+  input: number;
+  cachedRead: number;
+  cachedWrite: number;
+  output: number;
+  /// one usage_update = one model request (approx — see usage.jsonl)
+  requests: number;
+}
+
+/// day bucket rolls at local midnight; hour bucket at the top of the hour
+export interface UsageTotals {
+  day: UsageCounts & { date: string };
+  hour: UsageCounts & { hour: string };
+  total: UsageCounts;
+}
+
+export interface UsageState {
+  byRole: Partial<Record<AgentKind, UsageTotals>>;
+  byModel: Record<string, UsageTotals>;
+}
+
+/// USD per 1M tokens for a model — absent = tokens only, no cost shown
+export interface ModelPrices {
+  inPerM: number;
+  cachedReadPerM: number;
+  cachedWritePerM: number;
+  outPerM: number;
+}
+
+/// daily caps counted across ALL tokens incl. cached; null field = uncapped
+export interface DailyTokenCaps {
+  overlord?: number;
+  workers?: number;
+}
+
 export interface FactoryConfig {
-  overlordModel: string;
-  workerModel: string;
+  /// ACP model id per agent role
+  models: Record<AgentKind, string>;
   smiths: number;
   maxOverlordTurnsPerHour: number;
   maxApprovalsPerTurn: number;
-  workerSessionJobLimit: number;
+  /// fresh session after N jobs per worker role (overlord keeps its session)
+  sessionJobLimit: Record<'scout' | 'smith' | 'inspector' | 'packer', number>;
+  /// full-mode rescout cadence when the current analysis is already covered
+  rescoutHours: number;
   usdToZar: number;
+  /// USD/1M tokens per model id — empty = show tokens only
+  prices: Record<string, ModelPrices>;
+  /// daily total-token caps (incl. cached); null = off
+  dailyTokenCaps: DailyTokenCaps | null;
   /// research = scout analyses itch.io only; full = produce+sell on the mock market
   mode: 'research' | 'full';
   /// which market data the scout reads (mock stays the only sales target)
@@ -329,6 +373,10 @@ export interface StateMessage {
   devinEnabled: boolean;
   /// relay deployments only: is the agent-running worker linked right now
   worker?: WorkerStatus;
+  /// token meter (approx — raw events also in logs/usage.jsonl)
+  usage: UsageState;
+  /// shift was auto-paused because a daily token cap was exceeded
+  tokenCapHit: boolean;
 }
 
 export interface ErrorMessage {
@@ -372,7 +420,8 @@ export type ClientMessage =
   | { type: 'startShift' }
   | { type: 'pauseShift' }
   | { type: 'stopShift' }
-  | { type: 'setModels'; overlordModel?: string; workerModel?: string }
+  | { type: 'setModels'; role: AgentKind; model: string }
+  | { type: 'setCaps'; caps: { overlord?: number | null; workers?: number | null } }
   | { type: 'directive'; text: string }
   | { type: 'cancelAgent'; agentId: string }
   | { type: 'signIn' }
