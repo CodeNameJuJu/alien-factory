@@ -1046,6 +1046,20 @@ export class Drawers {
         det.append(sum, pre);
         card.appendChild(det);
       }
+    } else {
+      // not listed and never shipped — explain why there's no ship button
+      const why = document.createElement('div');
+      why.className = 'note';
+      why.style.color = 'var(--amber)';
+      const lastFail =
+        IN_PIPELINE.has(a.status) && a.inspection?.verdict === 'FAIL'
+          ? ` · last inspection ${a.inspection.score}/10 FAIL`
+          : '';
+      why.textContent =
+        a.status === 'failed' || a.status === 'scrapped'
+          ? `✗ ${a.status} — can't be shipped${lastFail}`
+          : `✗ not ready — still ${a.status}; ships once it passes inspection and is packaged (listed)${lastFail}`;
+      card.appendChild(why);
     }
 
     // links — one per line; kit art is synced to the relay, zip stays on the Mac

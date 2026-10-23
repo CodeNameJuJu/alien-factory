@@ -1230,6 +1230,27 @@ test('moveToArchive: moves the dir, writes archived.json, null when missing', as
   assert.match(dup, /archive\/dup-\d+$/);
 });
 
+test('findOrphans: mid-pipeline assets with no live job get requeued kind', async () => {
+  const { findOrphans } = await import('./factory.js');
+  const a = (sku: string, status: string) => ({ sku, status: status as import('../../shared/protocol.js').Asset['status'] });
+  const j = (sku: string, status: string) => ({ sku, status: status as import('../../shared/protocol.js').Job['status'] });
+  // the reported bug: 'inspecting' asset whose only inspect job failed
+  assert.deepEqual(
+    findOrphans([a('x1', 'inspecting')], [j('x1', 'failed')]),
+    [{ sku: 'x1', kind: 'inspect' }],
+  );
+  // a queued inspect counts as live — not an orphan
+  assert.deepEqual(findOrphans([a('x1', 'inspecting')], [j('x1', 'queued')]), []);
+  // listed assets are never orphans
+  assert.deepEqual(findOrphans([a('x2', 'listed')], []), []);
+  // on_conveyor with no job → pack; forging with a done forge → forge
+  assert.deepEqual(findOrphans([a('x3', 'on_conveyor')], []), [{ sku: 'x3', kind: 'pack' }]);
+  assert.deepEqual(
+    findOrphans([a('x4', 'forging')], [j('x4', 'done')]),
+    [{ sku: 'x4', kind: 'forge' }],
+  );
+});
+
 test('canClearGumroad: only failed records without a productId', () => {
   assert.equal(canClearGumroad(shipAsset({ channels: { gumroad: { status: 'error' } } })), true);
   assert.equal(

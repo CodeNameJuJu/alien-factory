@@ -92,6 +92,30 @@ export function moveToArchive(factoryDir: string, sku: string, record: Record<st
   return dst;
 }
 
+/// Assets mid-pipeline whose driving job vanished (the old no-verdict /
+/// invalid-listing holes) — returns the job kind each status implies.
+/// Pure (testable); queued/active jobs count as live, done/failed don't.
+export function findOrphans(
+  assets: { sku: string; status: Asset['status'] }[],
+  jobs: Pick<Job, 'sku' | 'status'>[],
+): { sku: string; kind: 'forge' | 'inspect' | 'pack' }[] {
+  const implies: Record<string, 'forge' | 'inspect' | 'pack'> = {
+    forging: 'forge',
+    inspecting: 'inspect',
+    packing: 'pack',
+    on_conveyor: 'pack',
+  };
+  const live = new Set(
+    jobs.filter((j) => j.status === 'queued' || j.status === 'active').map((j) => j.sku),
+  );
+  const out: { sku: string; kind: 'forge' | 'inspect' | 'pack' }[] = [];
+  for (const a of assets) {
+    const kind = implies[a.status];
+    if (kind && !live.has(a.sku)) out.push({ sku: a.sku, kind });
+  }
+  return out;
+}
+
 const ALIEN_SYL_A = ['Zor', 'Bli', 'Kre', 'Vex', 'Nur', 'Oo', 'Spl', 'Woz', 'Gli', 'Tha', 'Mur', 'Plo'];
 const ALIEN_SYL_B = ['p', 'x', 'll', 'gg', 'ma', 'na', 'qi', 'zz', 'rk', 'b', 'sh', 't'];
 const ALIEN_SYL_C = ['', '', '', 'a', 'ex', 'or', 'ix', 'un', 'el', 'ok'];
@@ -301,6 +325,7 @@ export class FactoryManager extends EventEmitter {
       const a = this.asset(sku);
       if (a) a.status = 'inspecting';
     }
+    this.healOrphans();
   }
 
   private ensureRoster(): void {
@@ -363,6 +388,27 @@ export class FactoryManager extends EventEmitter {
     const j: Job = { id: randomUUID().slice(0, 8), kind, sku, status: 'queued', note, pinnedTo, createdAt: Date.now() };
     this.jobs.push(j);
     return j;
+  }
+
+  /// Re-enqueue mid-pipeline assets whose job vanished. Runs on load and
+  /// shift start — statuses match the normal flow (a queued forge waits
+  /// at 'queued'; queued inspect/pack keep 'inspecting'/'on_conveyor'
+  /// until dispatch marks them working).
+  private healOrphans(): void {
+    const orphans = findOrphans(this.assets, this.jobs);
+    for (const { sku, kind } of orphans) {
+      const a = this.asset(sku);
+      if (kind === 'forge') {
+        this.setAssetStatus(sku, 'queued', 'healed orphan');
+        this.queueJob('forge', sku, 'healed orphan', a?.smith);
+      } else {
+        this.queueJob(kind, sku, 'healed orphan');
+      }
+    }
+    if (orphans.length) {
+      this.event(`requeued ${orphans.length} orphaned asset(s)`);
+      this.changed();
+    }
   }
 
   private assignable(agent: Agent, job: Job): boolean {
@@ -486,10 +532,7 @@ export class FactoryManager extends EventEmitter {
       agent.statusLine = `recovered after error: ${msg}`;
       if (job) {
         if (!job.note?.startsWith('retried')) {
-          job.status = 'queued';
-          job.assignee = undefined;
-          job.note = `retried after: ${msg}`.slice(0, 200);
-          agent.currentJobId = null;
+          this.requeueJob(job, agent, `retried after: ${msg}`);
         } else {
           this.finishJob(job, false);
           if (job.sku) {
@@ -500,6 +543,20 @@ export class FactoryManager extends EventEmitter {
       }
       this.event(`${agent.name} errored: ${msg}`, agent.id, job?.sku);
     }
+    this.changed();
+  }
+
+  /// Put a job back on the queue with a fresh agent context — same
+  /// shape as the onTurnError retry (queued, unassigned, 'retried' note,
+  /// agent idle with a dropped session). Callers check the 'retried'
+  /// note first so the loop stays one retry deep.
+  private requeueJob(job: Job, agent: Agent, note: string): void {
+    job.status = 'queued';
+    job.assignee = undefined;
+    job.note = note.slice(0, 200);
+    agent.currentJobId = null;
+    agent.sessionId = null;
+    if (agent.state !== 'error') agent.state = 'idle';
     this.changed();
   }
 
@@ -746,7 +803,15 @@ export class FactoryManager extends EventEmitter {
     const ins = parseInspection(text);
     if (!ins) {
       this.event(`inspection of ${asset.sku} had no verdict`, agent.id, asset.sku);
-      this.finishJob(job, false);
+      // a missed verdict used to orphan the asset at 'inspecting' forever —
+      // retry once with a fresh session, then fail like a real FAIL
+      if (!job.note?.startsWith('retried')) {
+        this.requeueJob(job, agent, 'retried after: no verdict');
+      } else {
+        this.finishJob(job, false);
+        this.setAssetStatus(asset.sku, 'failed', 'inspection had no verdict twice');
+        this.maybeArchiveFailed(asset.sku, 'failed: no inspection verdict');
+      }
       return;
     }
     asset.inspection = ins;
@@ -795,7 +860,14 @@ export class FactoryManager extends EventEmitter {
     }
     if (!listing) {
       this.event(`${asset.sku}: listing.json invalid`, agent.id, asset.sku);
-      this.finishJob(job, false);
+      // same orphan hole as a missed inspection verdict — one retry, then fail
+      if (!job.note?.startsWith('retried')) {
+        this.requeueJob(job, agent, 'retried after: invalid listing.json');
+      } else {
+        this.finishJob(job, false);
+        this.setAssetStatus(asset.sku, 'failed', 'listing.json invalid twice');
+        this.maybeArchiveFailed(asset.sku, 'failed: invalid listing.json');
+      }
       return;
     }
     asset.listing = listing;
@@ -1430,6 +1502,7 @@ export class FactoryManager extends EventEmitter {
     }
     this.tokenCapHit = false;
     this.shift = 'running';
+    this.healOrphans();
     this.event('shift started — the factory hums to life');
     for (const a of this.agents) {
       if (a.state === 'offline' || a.state === 'error') a.state = 'idle';
