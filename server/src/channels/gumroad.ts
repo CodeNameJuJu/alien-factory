@@ -193,7 +193,24 @@ export async function shipGumroad(
     ],
     kit: { zip: kit.zipName, bytes: zip.length, files: kit.files },
   };
-  if (opts.dryRun) return { ship: { ...(prev ?? { status: 'none' as const }), plan }, kit, plan };
+  if (opts.dryRun) {
+    // a successful dry run clears any stale error/status — keep a real
+    // draft/published record, else back to 'none'
+    const status =
+      prev?.status === 'draft' || prev?.status === 'published' ? prev.status : ('none' as const);
+    return {
+      ship: {
+        status,
+        productId: prev?.productId,
+        editUrl: prev?.editUrl,
+        shortUrl: prev?.shortUrl,
+        at: prev?.at,
+        plan,
+      },
+      kit,
+      plan,
+    };
+  }
 
   if (!gumroadToken()) {
     return { ship: { status: 'error', error: 'GUMROAD_ACCESS_TOKEN not set — add it to worker.env and restart the worker' }, kit };
@@ -270,7 +287,8 @@ export async function publishGumroad(
   const f = opts.fetchImpl ?? realFetch;
   try {
     await apiPost(f, `/products/${encodeURIComponent(cur.productId)}/enable`, {}, 'PUT');
-    return { ...cur, status: 'published', at: Date.now() };
+    // fresh record — drops any stale error/plan text
+    return { status: 'published', productId: cur.productId, editUrl: cur.editUrl, shortUrl: cur.shortUrl, at: Date.now() };
   } catch (err) {
     return { ...cur, status: 'error', error: (err as Error).message.slice(0, 300) };
   }

@@ -1000,6 +1000,28 @@ test('gumroad dry-run: exact request plan, zero fetch', async () => {
   assert.ok(plan.kit.bytes > 0);
 });
 
+test('gumroad: successful dry run clears stale error; error status never blocks a ship', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  // asset carries a stale error from a previous failed attempt
+  const stale = shipAsset({ channels: { gumroad: { status: 'error', error: 'gumroad POST /files/presign: 500 nope' } } });
+  const dry = await shipGumroad(
+    { asset: stale, meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { dryRun: true, fetchImpl: stubFetch([]) as never },
+  );
+  assert.equal(dry.ship.status, 'none');
+  assert.equal(dry.ship.error, undefined);
+  assert.ok(dry.ship.plan);
+  // …and the stale error does not block a real ship afterwards
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: stale, meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: stubFetch(calls) as never },
+  );
+  assert.equal(res.ship.status, 'draft');
+  assert.equal(res.ship.productId, 'prod123');
+  assert.equal(res.ship.error, undefined);
+});
+
 test('publishGumroad: enable + refuse without a draft', async () => {
   process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
   const calls: StubCall[] = [];
