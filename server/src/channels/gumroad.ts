@@ -50,15 +50,20 @@ interface Presign {
 async function apiPost(
   f: FetchLike,
   path: string,
-  params: Record<string, string | number>,
+  params: Record<string, unknown>,
   method = 'POST',
 ): Promise<Record<string, unknown>> {
-  const body = new URLSearchParams({ access_token: gumroadToken() });
-  for (const [k, v] of Object.entries(params)) body.append(k, String(v));
+  // JSON + Bearer: Rails parses form-encoded indexed keys (parts[0][etag])
+  // into a HASH, not an array — Gumroad's `Array(params[:parts])` then 400s
+  // ("each part must have scalar part_number and etag values"). JSON bodies
+  // carry real arrays for parts/files/tags. Bearer verified on GET /v2/user.
   const res = await f(`${API}${path}`, {
     method,
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${gumroadToken()}`,
+    },
+    body: JSON.stringify(params),
   });
   const j: Record<string, unknown> = await res.json().catch(() => ({}));
   if (!res.ok || j.success === false) {
@@ -166,24 +171,26 @@ export async function shipGumroad(
   const kit = buildKit(req.dir, kitSpec(asset, meta));
   const zip = readFileSync(join(kit.dir, kit.zipName));
   const priceCents = Math.round((asset.listing?.priceUsd ?? 2.99) * 100);
-  const createParams: Record<string, string | number> = {
+  const createBody: Record<string, unknown> = {
     native_type: 'digital',
     name: asset.listing?.title ?? asset.title,
     price: priceCents,
-    'files[][url]': '<file_url from upload>',
+    files: [{ url: '<file_url from upload>' }],
     description: descriptionHtml(asset, meta),
     custom_summary: customSummary(asset, meta),
-    published: 'false',
+    published: false,
+    tags: (asset.listing?.tags ?? asset.tags).slice(0, 6),
   };
-  (asset.listing?.tags ?? asset.tags).slice(0, 6).forEach((t, i) => {
-    createParams[`tags[${i}]`] = t;
-  });
   const plan = {
     steps: [
-      { method: 'POST', url: `${API}/files/presign`, params: { filename: kit.zipName, file_size: zip.length } },
+      { method: 'POST', url: `${API}/files/presign`, body: { filename: kit.zipName, file_size: zip.length } },
       { method: 'PUT', url: '<part presigned_url>', note: `${Math.ceil(zip.length / (100 * 1024 * 1024))} part(s), raw bytes` },
-      { method: 'POST', url: `${API}/files/complete`, params: { upload_id: '<id>', key: '<key>', parts: '<etags>' } },
-      { method: 'POST', url: `${API}/products`, params: createParams },
+      {
+        method: 'POST',
+        url: `${API}/files/complete`,
+        body: { upload_id: '<id>', key: '<key>', parts: [{ part_number: 1, etag: '"<etag from PUT>"' }] },
+      },
+      { method: 'POST', url: `${API}/products`, body: createBody },
       ...(cfg.autoPublish ? [{ method: 'PUT', url: `${API}/products/<id>/enable` }] : []),
       {
         method: 'manual',
@@ -233,15 +240,10 @@ export async function shipGumroad(
       if (!etag) throw new GumroadError(`part ${part.part_number} upload returned no ETag`);
       etags.push({ part_number: Number(part.part_number), etag });
     }
-    const completeParams: Record<string, string | number> = { upload_id: uploadId, key };
-    etags.forEach((p, i) => {
-      completeParams[`parts[${i}][part_number]`] = p.part_number;
-      completeParams[`parts[${i}][etag]`] = p.etag;
-    });
-    await apiPost(f, '/files/complete', completeParams);
+    await apiPost(f, '/files/complete', { upload_id: uploadId, key, parts: etags });
 
-    createParams['files[][url]'] = String(presign.file_url);
-    const created = await apiPost(f, '/products', createParams);
+    createBody.files = [{ url: String(presign.file_url) }];
+    const created = await apiPost(f, '/products', createBody);
     const product = (created.product ?? created) as { id?: string; product_id?: string; edit_url?: string; short_url?: string };
     const productId = String(product.id ?? product.product_id ?? '');
     const ship: GumroadShip = {

@@ -927,12 +927,12 @@ test('buildKit: zip, readme, license, cover + thumbnail', () => {
 
 // ---- gumroad api flow (stubbed fetch — no network) --------------------------
 
-interface StubCall { url: string; method: string; body?: string }
+interface StubCall { url: string; method: string; body?: string; headers?: Record<string, string> }
 
 function stubFetch(calls: StubCall[], etag = '"ETAG-abc"') {
-  return (url: string, init: { method?: string; body?: unknown } = {}) => {
+  return (url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) => {
     const method = init.method ?? 'GET';
-    calls.push({ url, method, body: typeof init.body === 'string' ? init.body : undefined });
+    calls.push({ url, method, body: typeof init.body === 'string' ? init.body : undefined, headers: init.headers });
     if (url.endsWith('/files/presign')) {
       return Promise.resolve({
         ok: true, status: 200, headers: { get: () => null },
@@ -967,15 +967,19 @@ test('gumroad ship: presign → PUT(etag) → complete → create draft, no toke
   assert.match(seq[2], /POST .*files\/complete/);
   assert.match(seq[3], /POST .*\/products$/);
   assert.equal(calls.length, 4, 'no enable call when autoPublish is off');
-  const completeBody = calls[2].body!;
-  assert.match(completeBody, /parts\[0\]\[etag\]=%22ETAG-abc%22|parts%5B0%5D%5Betag%5D=%22ETAG-abc%22/);
-  const createBody = calls[3].body!;
-  assert.match(createBody, /files%5B%5D%5Burl%5D=https/);
-  assert.match(createBody, /price=499/);
-  assert.match(createBody, /native_type=digital/);
-  // the token rides in request bodies but NEVER in stored state or errors
+  // JSON bodies carry real arrays (form-encoded parts[i][k] 400s on Rails)
+  const completeBody = JSON.parse(calls[2].body!);
+  assert.deepEqual(completeBody.parts, [{ part_number: 1, etag: '"ETAG-abc"' }]);
+  assert.equal(completeBody.upload_id, 'u1');
+  const createBody = JSON.parse(calls[3].body!);
+  assert.deepEqual(createBody.files, [{ url: 'https://files.example/x.zip' }]);
+  assert.equal(createBody.price, 499);
+  assert.equal(createBody.native_type, 'digital');
+  assert.deepEqual(createBody.tags, ['potions']);
+  // Bearer header auth — token rides in headers, never in bodies/state/errors
+  assert.equal(calls[0].headers?.authorization, 'Bearer TESTTOKEN-should-never-leak');
   assert.ok(!JSON.stringify(res.ship).includes('TESTTOKEN'));
-  assert.ok(calls.every((c) => !c.url.includes('TESTTOKEN')));
+  assert.ok(calls.every((c) => !c.url.includes('TESTTOKEN') && !(c.body ?? '').includes('TESTTOKEN')));
 });
 
 test('gumroad ship: autoPublish enables; gate failure preserves prior draft', async () => {
@@ -998,6 +1002,35 @@ test('gumroad ship: autoPublish enables; gate failure preserves prior draft', as
   assert.equal(again.ship.status, 'draft');
   assert.equal(again.ship.productId, 'prod123');
   assert.match(again.ship.error!, /already shipped/);
+});
+
+test('gumroad ship: failed part upload aborts the multipart with JSON', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    {
+      fetchImpl: ((url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) => {
+        calls.push({ url, method: init.method ?? 'GET', body: typeof init.body === 'string' ? init.body : undefined, headers: init.headers });
+        if (url.endsWith('/files/presign')) {
+          return Promise.resolve({
+            ok: true, status: 200, headers: { get: () => null },
+            json: () => Promise.resolve({ success: true, upload_id: 'u9', key: 'k9', file_url: 'https://files.example/x.zip', parts: [{ part_number: 1, presigned_url: 'https://put.example/p1' }] }),
+          });
+        }
+        if (url === 'https://put.example/p1') {
+          return Promise.resolve({ ok: false, status: 503, headers: { get: () => null }, json: () => Promise.resolve({}) });
+        }
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+      }) as never,
+    },
+  );
+  assert.equal(res.ship.status, 'error');
+  assert.equal(res.ship.productId, undefined, 'no productId → a retry is allowed');
+  const abort = calls.find((c) => c.url.endsWith('/files/abort'));
+  assert.ok(abort, 'abort was called');
+  assert.deepEqual(JSON.parse(abort!.body!), { upload_id: 'u9', key: 'k9' });
+  assert.ok(!JSON.stringify(res.ship).includes('TESTTOKEN'));
 });
 
 test('gumroad dry-run: exact request plan, zero fetch', async () => {
