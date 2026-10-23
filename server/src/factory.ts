@@ -29,8 +29,8 @@ import {
   urlsAllowed,
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
-import { attachGumroadImages as gumroadAttach, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
-import { shipEligibility } from '../../shared/shop.js';
+import { attachGumroadImages as gumroadAttach, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, refreshGumroadStatus as gumroadRefresh, shipGumroad as gumroadShip } from './channels/gumroad.js';
+import { canClearGumroad, shipEligibility } from '../../shared/shop.js';
 import {
   analyseSnapshot,
   getBackoffUntil,
@@ -1109,6 +1109,12 @@ export class FactoryManager extends EventEmitter {
       case 'attachGumroadImages':
         await this.attachGumroadImages(msg.sku);
         return;
+      case 'clearGumroad':
+        this.clearGumroad(msg.sku);
+        return;
+      case 'refreshGumroad':
+        await this.refreshGumroad();
+        return;
       case 'setGumroadConfig':
         this.setGumroadConfig(msg.config);
         return;
@@ -1193,6 +1199,36 @@ export class FactoryManager extends EventEmitter {
     asset.channels = { ...(asset.channels ?? {}), gumroad: ship };
     if (ship.imagesError) this.event(`gumroad images failed for ${sku}: ${ship.imagesError}`, undefined, sku);
     else this.event(`gumroad images attached for ${sku} — ${ship.images?.covers ?? 0} covers${ship.images?.thumbnail ? ' + thumbnail' : ''}`, undefined, sku);
+    this.changed();
+  }
+
+  /// Drop a failed local record — never touches Gumroad itself. Records
+  /// with a productId are real products and are refused.
+  private clearGumroad(sku: string): void {
+    const asset = this.asset(sku);
+    if (!asset?.channels?.gumroad) return;
+    if (!canClearGumroad(asset)) {
+      this.event(`gumroad record for ${sku} is a real product — not cleared`, undefined, sku);
+      return;
+    }
+    delete asset.channels.gumroad;
+    if (!Object.keys(asset.channels).length) delete asset.channels;
+    this.event(`gumroad record cleared for ${sku}`, undefined, sku);
+    this.changed();
+  }
+
+  /// Re-poll every shipped product's live draft/published status.
+  private async refreshGumroad(): Promise<void> {
+    const shipped = this.assets.filter((a) => a.channels?.gumroad?.productId);
+    let published = 0;
+    let draft = 0;
+    for (const a of shipped) {
+      const ship = await gumroadRefresh(a.channels!.gumroad!);
+      a.channels = { ...(a.channels ?? {}), gumroad: ship };
+      if (ship.status === 'published') published++;
+      else if (ship.status === 'draft') draft++;
+    }
+    this.event(`gumroad refreshed: ${shipped.length} product(s) — ${published} published, ${draft} draft`);
     this.changed();
   }
 

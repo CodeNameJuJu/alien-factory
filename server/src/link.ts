@@ -23,6 +23,7 @@ export const FORWARDABLE = new Set<ClientMessage['type']>([
   'startShift', 'pauseShift', 'stopShift', 'setModels', 'setCaps', 'setMode',
   'setMarketSource', 'directive', 'cancelAgent',
   'shipGumroad', 'publishGumroad', 'setGumroadConfig', 'attachGumroadImages',
+  'clearGumroad', 'refreshGumroad',
 ]);
 
 // ---- signed public kit image URLs ------------------------------------------

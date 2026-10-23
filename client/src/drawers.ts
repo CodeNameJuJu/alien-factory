@@ -6,7 +6,7 @@ import { atlasFor, drawAssetFrame, drawAtlasItem, fetchAtlas, fetchMeta, metaFor
 import type { AtlasItem } from './assets';
 import { fmtTokens } from './hud';
 import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
-import { shipEligibility } from '../../shared/shop';
+import { canClearGumroad, shipEligibility } from '../../shared/shop';
 
 export type Selection =
   | { type: 'overlord' }
@@ -984,6 +984,14 @@ export class Drawers {
         img.addEventListener('click', () => this.net.send({ type: 'attachGumroadImages', sku: a.sku }));
         row.appendChild(img);
       }
+      if (canClearGumroad(a)) {
+        const clr = document.createElement('button');
+        clr.className = 'btn';
+        clr.textContent = '[ clear ]';
+        clr.title = 'drop this failed gumroad record (local only — never touches gumroad)';
+        clr.addEventListener('click', () => this.net.send({ type: 'clearGumroad', sku: a.sku }));
+        row.appendChild(clr);
+      }
       card.appendChild(row);
       if (g?.images) {
         const im = document.createElement('div');
@@ -1035,10 +1043,6 @@ export class Drawers {
         links.appendChild(l);
       }
       if (links.childElementCount) card.appendChild(links);
-      const manual = document.createElement('div');
-      manual.className = 'note';
-      manual.textContent = 'covers/thumbnail are a manual step — the API only accepts public URLs; attach these two in the gumroad editor';
-      card.appendChild(manual);
     }
     b.appendChild(card);
   }
@@ -1102,24 +1106,10 @@ export class Drawers {
 
     const n = document.createElement('div');
     n.className = 'note';
-    n.textContent = 'each ship builds a kit (zip + readme + license + cover/thumbnail) on the worker, uploads it, and creates a draft product. nothing ships without clicking it here.';
+    n.textContent = 'each ship builds a kit (zip, readme, license, cover, thumbnail, gallery, gif) on the worker, uploads it, creates a draft with a download page and attaches the images. nothing ships without clicking it here.';
     b.appendChild(n);
 
-    // shipped assets
-    const shipped = s.assets.filter((a) => a.channels?.gumroad && a.channels.gumroad.status !== 'none');
-    const h = document.createElement('div');
-    h.className = 'sec';
-    h.textContent = `shipped (${shipped.length})`;
-    b.appendChild(h);
-    if (!shipped.length) {
-      const none = document.createElement('div');
-      none.className = 'note';
-      none.textContent = 'nothing yet — ship from a listed asset\'s drawer';
-      b.appendChild(none);
-    }
-    for (const a of shipped) {
-      const row = document.createElement('div');
-      row.className = 'kv';
+    const skuLink = (a: Asset): HTMLAnchorElement => {
       const k = document.createElement('a');
       k.textContent = a.sku;
       k.href = '#';
@@ -1127,6 +1117,31 @@ export class Drawers {
         e.preventDefault();
         this.open({ type: 'asset', id: a.sku });
       });
+      return k;
+    };
+
+    // products that exist on gumroad (draft or published)
+    const live = s.assets.filter((a) => a.channels?.gumroad?.productId);
+    const h = document.createElement('div');
+    h.className = 'sec';
+    h.textContent = `on gumroad (${live.length}) `;
+    const refresh = document.createElement('button');
+    refresh.className = 'btn';
+    refresh.textContent = '[ refresh ]';
+    refresh.disabled = !configured;
+    refresh.title = 're-poll live draft/published status from gumroad';
+    refresh.addEventListener('click', () => this.net.send({ type: 'refreshGumroad' }));
+    h.appendChild(refresh);
+    b.appendChild(h);
+    if (!live.length) {
+      const none = document.createElement('div');
+      none.className = 'note';
+      none.textContent = 'nothing yet — ship from a listed asset\'s drawer';
+      b.appendChild(none);
+    }
+    for (const a of live) {
+      const row = document.createElement('div');
+      row.className = 'kv';
       const v = document.createElement('span');
       const gg = a.channels!.gumroad!;
       v.textContent = gg.status + (gg.shortUrl ? '' : gg.error ? ` — ${gg.error.slice(0, 60)}` : '');
@@ -1138,8 +1153,30 @@ export class Drawers {
         l.textContent = ' ↗';
         v.appendChild(l);
       }
-      row.append(k, v);
+      row.append(skuLink(a), v);
       b.appendChild(row);
+    }
+
+    // failed local records — clearable (local only)
+    const failed = s.assets.filter((a) => canClearGumroad(a) && a.channels!.gumroad!.status !== 'none');
+    if (failed.length) {
+      const fh = document.createElement('div');
+      fh.className = 'sec';
+      fh.textContent = `failed (${failed.length})`;
+      b.appendChild(fh);
+      for (const a of failed) {
+        const row = document.createElement('div');
+        row.className = 'kv';
+        const gg = a.channels!.gumroad!;
+        const v = document.createElement('span');
+        v.textContent = gg.status + (gg.error ? ` — ${gg.error.slice(0, 60)}` : '');
+        const clr = document.createElement('button');
+        clr.className = 'btn';
+        clr.textContent = '[ clear ]';
+        clr.addEventListener('click', () => this.net.send({ type: 'clearGumroad', sku: a.sku }));
+        row.append(skuLink(a), v, clr);
+        b.appendChild(row);
+      }
     }
   }
 

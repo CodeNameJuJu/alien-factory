@@ -503,4 +503,8 @@ export type ClientMessage =
   | { type: 'publishGumroad'; sku: string }
   /// attach kit cover/thumbnail/gallery/gif to an existing product
   | { type: 'attachGumroadImages'; sku: string }
+  /// drop a failed gumroad record (LOCAL state only — refuses productIds)
+  | { type: 'clearGumroad'; sku: string }
+  /// re-poll live draft/published status for every shipped product
+  | { type: 'refreshGumroad' }
   | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> };

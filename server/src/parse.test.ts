@@ -27,10 +27,10 @@ import {
 import { RateLimiter, passwordMatches, sessionToken, sessionValid, SESSION_COOKIE } from './auth.js';
 import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile, relayHttpBase, signKitUrl, verifyKitSig } from './link.js';
 import type { Asset, GumroadConfig, ItchItem, ItchSnapshot } from '../../shared/protocol.js';
-import { countClaims, listingConsistency, shipEligibility } from '../../shared/shop.js';
+import { canClearGumroad, countClaims, listingConsistency, shipEligibility } from '../../shared/shop.js';
 import { crc32, decodePng, encodePng } from './png.js';
 import { buildKit, drawCover, kitSubtitle, zipFiles, type KitItem, type KitSpec } from './kit.js';
-import { publishGumroad, shipGumroad, attachGumroadImages } from './channels/gumroad.js';
+import { publishGumroad, shipGumroad, attachGumroadImages, refreshGumroadStatus } from './channels/gumroad.js';
 import { encodeGif } from './gif.js';
 import { execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync } from 'node:fs';
@@ -1183,6 +1183,74 @@ test('gumroad content page: PUT failure keeps the draft and skips auto-publish',
   assert.match(res.ship.error!, /content page failed/);
   assert.match(res.ship.error!, /add the file in the gumroad Content tab/);
   assert.ok(!calls.some((c) => c.url.includes('/enable')), 'a failed content page never publishes');
+});
+
+test('canClearGumroad: only failed records without a productId', () => {
+  assert.equal(canClearGumroad(shipAsset({ channels: { gumroad: { status: 'error' } } })), true);
+  assert.equal(
+    canClearGumroad(shipAsset({ channels: { gumroad: { status: 'draft', productId: 'p1' } } })),
+    false,
+  );
+  assert.equal(canClearGumroad(shipAsset()), false); // no gumroad record
+});
+
+test('refreshGumroadStatus: published/draft/deleted/404/no-productId', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const get = (body: Record<string, unknown>, status = 200) =>
+    ((url: string, init: { method?: string } = {}) => {
+      calls.push(`${init.method ?? 'GET'} ${url}`);
+      return Promise.resolve({
+        ok: status < 400, status, headers: { get: () => null },
+        json: () => Promise.resolve(body),
+      });
+    }) as never;
+  let calls: string[] = [];
+
+  // published:true → 'published', stale error cleared
+  const base = { status: 'draft' as const, productId: 'prod1', error: 'stale' };
+  const pub = await refreshGumroadStatus(base, { fetchImpl: get({ success: true, product: { published: true, short_url: 'https://gum.co/new' } }) });
+  assert.equal(pub.status, 'published');
+  assert.equal(pub.shortUrl, 'https://gum.co/new');
+  assert.equal(pub.error, undefined);
+
+  // published:false → 'draft'
+  const dr = await refreshGumroadStatus(
+    { status: 'published', productId: 'prod1' },
+    { fetchImpl: get({ success: true, product: { published: false } }) },
+  );
+  assert.equal(dr.status, 'draft');
+
+  // deleted:true → 'not found' error, status + productId kept
+  const del = await refreshGumroadStatus(
+    { status: 'draft', productId: 'prod1' },
+    { fetchImpl: get({ success: true, product: { deleted: true } }) },
+  );
+  assert.match(del.error!, /not found/);
+  assert.equal(del.status, 'draft');
+  assert.equal(del.productId, 'prod1');
+
+  // GET 404 → same 'not found'
+  const nf = await refreshGumroadStatus(
+    { status: 'draft', productId: 'prod1' },
+    { fetchImpl: get({ success: false, message: 'nope' }, 404) },
+  );
+  assert.match(nf.error!, /not found/);
+  assert.equal(nf.productId, 'prod1');
+
+  // no productId → unchanged, zero fetch calls
+  calls = [];
+  const same = { status: 'error' as const, error: 'x' };
+  const untouched = await refreshGumroadStatus(same, { fetchImpl: get({}) });
+  assert.equal(untouched, same);
+  assert.equal(calls.length, 0);
+
+  // other errors → 'refresh failed: …'
+  const boom = await refreshGumroadStatus(
+    { status: 'draft', productId: 'prod1' },
+    { fetchImpl: get({ success: false, message: 'rate limited' }, 429) },
+  );
+  assert.match(boom.error!, /refresh failed: .*429.*rate limited/);
+  assert.equal(boom.status, 'draft');
 });
 
 test('gumroad dry-run: plan includes the rich_content PUT step', async () => {

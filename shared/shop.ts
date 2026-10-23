@@ -94,6 +94,17 @@ export function listingConsistency(
   return issues;
 }
 
+/// May the local gumroad record be dropped? Only failed/no-product
+/// records — anything with a productId is a REAL product on Gumroad and
+/// must never be cleared from here.
+export function canClearGumroad(
+  asset: Pick<Asset, 'channels'>,
+): boolean {
+  const g = asset.channels?.gumroad;
+  // a ship in flight isn't failed yet — its result would overwrite the clear
+  return !!g && !g.productId && g.status !== 'building' && g.status !== 'uploading';
+}
+
 /// The ship gate. Everything must pass before a real upload happens.
 export function shipEligibility(
   asset: Pick<Asset, 'status' | 'kind' | 'inspection' | 'listing' | 'channels'>,

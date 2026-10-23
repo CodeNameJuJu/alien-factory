@@ -102,6 +102,9 @@ client/               # Vite + TS, zero runtime deps
   (`server/src/channels/gumroad.ts`): explicit per-asset click in the
   SHOP section, draft product by default, `autoPublish` opt-in, strict
   ship gate (`shared/shop.ts`), daily draft cap, no duplicate shipment.
+  SHOP also offers `[ clear ]` (drops a FAILED local record only — never
+  deletes anything on Gumroad, and refuses records with a productId) and
+  `[ refresh ]` (re-polls live draft/published status via GET /products).
   No other marketplace/upload code may be added without an explicit
   future decision — and never to itch.io (research stays read-only).
 

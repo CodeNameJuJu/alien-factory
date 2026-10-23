@@ -42,7 +42,14 @@ export interface FetchLike {
 const realFetch: FetchLike = (url, init) =>
   fetch(url, init as RequestInit) as unknown as ReturnType<FetchLike>;
 
-class GumroadError extends Error {}
+class GumroadError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
 
 interface Presign {
   upload_id: string;
@@ -71,7 +78,7 @@ async function apiPost(
   });
   const j: Record<string, unknown> = await res.json().catch(() => ({}));
   if (!res.ok || j.success === false) {
-    throw new GumroadError(`gumroad ${method} ${path}: ${res.status} ${String(j.message ?? j.error ?? '').slice(0, 200)}`);
+    throw new GumroadError(`gumroad ${method} ${path}: ${res.status} ${String(j.message ?? j.error ?? '').slice(0, 200)}`, res.status);
   }
   return j;
 }
@@ -82,7 +89,7 @@ async function apiGet(f: FetchLike, path: string): Promise<Record<string, unknow
   });
   const j: Record<string, unknown> = await res.json().catch(() => ({}));
   if (!res.ok || j.success === false) {
-    throw new GumroadError(`gumroad GET ${path}: ${res.status} ${String(j.message ?? j.error ?? '').slice(0, 200)}`);
+    throw new GumroadError(`gumroad GET ${path}: ${res.status} ${String(j.message ?? j.error ?? '').slice(0, 200)}`, res.status);
   }
   return j;
 }
@@ -475,6 +482,39 @@ export async function publishGumroad(
     return { status: 'published', productId: cur.productId, editUrl: cur.editUrl, shortUrl: cur.shortUrl, at: Date.now() };
   } catch (err) {
     return { ...cur, status: 'error', error: (err as Error).message.slice(0, 300) };
+  }
+}
+
+/// Re-poll a product's live status (GET /v2/products/:id). Local record is
+/// updated in place by the caller — a missing/deleted product is flagged
+/// as an error, never auto-cleared.
+export async function refreshGumroadStatus(
+  ship: GumroadShip,
+  opts: { fetchImpl?: FetchLike } = {},
+): Promise<GumroadShip> {
+  if (!ship.productId) return ship;
+  if (!gumroadToken()) {
+    return { ...ship, error: 'GUMROAD_ACCESS_TOKEN not set' };
+  }
+  const f = opts.fetchImpl ?? realFetch;
+  try {
+    const j = await apiGet(f, `/products/${encodeURIComponent(ship.productId)}`);
+    const p = (j.product ?? j) as { published?: boolean; deleted?: boolean; short_url?: string };
+    if (p.deleted === true) {
+      return { ...ship, error: 'product not found on gumroad — deleted there?' };
+    }
+    const out: GumroadShip = {
+      ...ship,
+      status: p.published ? 'published' : 'draft',
+      shortUrl: typeof p.short_url === 'string' ? p.short_url : ship.shortUrl,
+    };
+    delete out.error;
+    return out;
+  } catch (err) {
+    if ((err as GumroadError).status === 404) {
+      return { ...ship, error: 'product not found on gumroad — deleted there?' };
+    }
+    return { ...ship, error: `refresh failed: ${(err as Error).message.slice(0, 200)}` };
   }
 }
 
