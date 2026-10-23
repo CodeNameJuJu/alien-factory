@@ -479,7 +479,7 @@ export async function publishGumroad(
   try {
     await apiPost(f, `/products/${encodeURIComponent(cur.productId)}/enable`, {}, 'PUT');
     // fresh record — drops any stale error/plan text
-    return { status: 'published', productId: cur.productId, editUrl: cur.editUrl, shortUrl: cur.shortUrl, at: Date.now() };
+    return { status: 'published', productId: cur.productId, editUrl: cur.editUrl, shortUrl: cur.shortUrl, images: cur.images, at: Date.now() };
   } catch (err) {
     return { ...cur, status: 'error', error: (err as Error).message.slice(0, 300) };
   }

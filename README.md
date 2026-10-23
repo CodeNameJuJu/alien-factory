@@ -60,6 +60,10 @@ only ever runs on the Mac worker (never on the Railway relay).
   no re-shipping the same sku, listing-vs-contents consistency — e.g. a
   listing claiming "600 items" or "32x32" that doesn't match the files is
   refused) is checked both in the UI and server-side.
+- The SHOP drawer's bulk card ships/publishes everything at once —
+  `[ ship all eligible ]`, `[ ship + publish all ]`, `[ publish all drafts ]`.
+  Every asset still passes the full gate and the daily cap (the run stops
+  there with an event saying so).
 
 **What ships**: `kit/<sku>.zip` = `sheet.png` (+ `items/*.png` and
 `atlas.json` for packs) + `preview.png` + `README.txt` (contents, sizes,

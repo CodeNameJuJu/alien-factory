@@ -5,7 +5,7 @@ import { renderMd } from './md';
 import { atlasFor, drawAssetFrame, drawAtlasItem, fetchAtlas, fetchMeta, metaFor } from './assets';
 import type { AtlasItem } from './assets';
 import { fmtTokens } from './hud';
-import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
+import type { Agent, AgentKind, Asset, ClientMessage, StateMessage, UsageCounts } from '../../shared/protocol';
 import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop';
 
 /// statuses where an agent/pipeline still owns the asset — never archive
@@ -1132,6 +1132,68 @@ export class Drawers {
     n.className = 'note';
     n.textContent = 'each ship builds a kit (zip, readme, license, cover, thumbnail, gallery, gif) on the worker, uploads it, creates a draft with a download page and attaches the images. nothing ships without clicking it here.';
     b.appendChild(n);
+
+    // bulk actions — every asset still passes the full per-asset gate
+    const bulkRunning = s.channels?.gumroad?.bulkRunning === true;
+    const shippedToday = this.shippedToday(s);
+    const eligible = s.assets.filter((a) =>
+      shipEligibility(a, metaFor(a.sku) ?? undefined, s.config.gumroad, shippedToday).ok);
+    const capNow = Math.max(0, s.config.gumroad.maxDraftsPerDay - shippedToday);
+    const drafts = s.assets.filter(
+      (a) => a.channels?.gumroad?.status === 'draft' && a.channels.gumroad.productId && !a.channels.gumroad.error,
+    );
+    const bulk = document.createElement('div');
+    bulk.className = 'acard';
+    bulk.appendChild(Object.assign(document.createElement('div'), { innerHTML: '<b>bulk</b>' }));
+    const capNote =
+      capNow < eligible.length
+        ? `\n\ndaily cap allows ${capNow} today — raise 'max drafts / day' above to ship more`
+        : '';
+    const mkBtn = (
+      label: string,
+      count: number,
+      msg: ClientMessage,
+      extra = '',
+    ): HTMLButtonElement => {
+      const btn = document.createElement('button');
+      btn.className = 'btn';
+      btn.textContent = label;
+      btn.disabled = !configured || count === 0 || bulkRunning;
+      btn.addEventListener('click', () => {
+        if (confirm(`${label}\n\n${extra}${capNote}`.trim())) this.net.send(msg);
+      });
+      return btn;
+    };
+    const brow = document.createElement('div');
+    brow.className = 'btnrow';
+    brow.append(
+      mkBtn(
+        `[ ship all eligible (${eligible.length}) ]`,
+        eligible.length,
+        { type: 'shipAllGumroad', publish: false },
+        `skus: ${eligible.map((a) => a.sku).join(', ')}`,
+      ),
+      mkBtn(
+        `[ ship + publish all (${eligible.length}) ]`,
+        eligible.length,
+        { type: 'shipAllGumroad', publish: true },
+        `skus: ${eligible.map((a) => a.sku).join(', ')}\n\nthey go LIVE for sale immediately`,
+      ),
+      mkBtn(
+        `[ publish all drafts (${drafts.length}) ]`,
+        drafts.length,
+        { type: 'publishAllGumroad' },
+        `skus: ${drafts.map((a) => a.sku).join(', ')}`,
+      ),
+    );
+    bulk.appendChild(brow);
+    if (bulkRunning) {
+      const run = document.createElement('div');
+      run.className = 'note';
+      run.textContent = 'bulk run in progress…';
+      bulk.appendChild(run);
+    }
+    b.appendChild(bulk);
 
     const skuLink = (a: Asset): HTMLAnchorElement => {
       const k = document.createElement('a');

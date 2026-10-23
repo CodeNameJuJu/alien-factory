@@ -101,8 +101,10 @@ client/               # Vite + TS, zero runtime deps
   `marketSource: 'itch'` the scout reads `reports/itch-latest.md` instead
   of the mock report. The packer "lists" on the in-memory mock market;
   real publishing exists ONLY through the gated **Gumroad channel**
-  (`server/src/channels/gumroad.ts`): explicit per-asset click in the
-  SHOP section, draft product by default, `autoPublish` opt-in, strict
+  (`server/src/channels/gumroad.ts`): explicit click in the SHOP section
+  (per asset, or the bulk ship/publish buttons — each asset still passes
+  the full gate and the daily draft cap), draft product by default,
+  `autoPublish` opt-in, strict
   ship gate (`shared/shop.ts`), daily draft cap, no duplicate shipment.
   SHOP also offers `[ clear ]` (drops a FAILED local record only — never
   deletes anything on Gumroad, and refuses records with a productId) and

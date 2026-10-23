@@ -448,7 +448,7 @@ export interface StateMessage {
   /// shift was auto-paused because a daily token cap was exceeded
   tokenCapHit: boolean;
   /// sales channels — only booleans, no secrets
-  channels: { gumroad: { configured: boolean } };
+  channels: { gumroad: { configured: boolean; bulkRunning?: boolean } };
 }
 
 export interface ErrorMessage {
@@ -509,6 +509,10 @@ export type ClientMessage =
   | { type: 'clearGumroad'; sku: string }
   /// re-poll live draft/published status for every shipped product
   | { type: 'refreshGumroad' }
+  /// ship every eligible asset as drafts (publish:true → publish each too)
+  | { type: 'shipAllGumroad'; publish?: boolean }
+  /// publish every clean draft in one go
+  | { type: 'publishAllGumroad' }
   /// move one unshippable asset to archive/ (local only — never gumroad)
   | { type: 'archiveAsset'; sku: string }
   /// archive every failed/scrapped/permanently-unshippable asset

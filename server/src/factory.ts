@@ -1067,7 +1067,7 @@ export class FactoryManager extends EventEmitter {
       usage: this.usage,
       tokenCapHit: this.tokenCapHit,
       // the token never leaves the process — clients only get a boolean
-      channels: { gumroad: { configured: !!process.env.GUMROAD_ACCESS_TOKEN } },
+      channels: { gumroad: { configured: !!process.env.GUMROAD_ACCESS_TOKEN, bulkRunning: this.gumroadBulkRunning } },
     };
   }
 
@@ -1143,6 +1143,12 @@ export class FactoryManager extends EventEmitter {
         return;
       case 'archiveUnshippable':
         this.archiveUnshippable();
+        return;
+      case 'shipAllGumroad':
+        await this.shipAllGumroad(msg.publish === true);
+        return;
+      case 'publishAllGumroad':
+        await this.publishAllGumroad();
         return;
       case 'setGumroadConfig':
         this.setGumroadConfig(msg.config);
@@ -1259,6 +1265,83 @@ export class FactoryManager extends EventEmitter {
     }
     this.event(`gumroad refreshed: ${shipped.length} product(s) — ${published} published, ${draft} draft`);
     this.changed();
+  }
+
+  /// One bulk ship/publish at a time — exposed to the client as
+  /// channels.gumroad.bulkRunning so the buttons disable themselves.
+  private gumroadBulkRunning = false;
+
+  /// Ship every asset that passes the full per-asset gate, sequentially.
+  /// Eligibility is re-evaluated before EACH ship because gumroadShippedToday
+  /// moves as drafts are created — the run stops at the daily cap.
+  /// publish=true immediately /enables drafts — but a ship that ended with
+  /// an error (e.g. content page failed) stays a draft.
+  private async shipAllGumroad(publish: boolean): Promise<void> {
+    if (this.gumroadBulkRunning) {
+      this.event('gumroad bulk already running');
+      return;
+    }
+    this.gumroadBulkRunning = true;
+    this.changed();
+    try {
+      let shipped = 0;
+      let published = 0;
+      let failed = 0;
+      let stoppedAtCap = false;
+      for (const sku of this.assets.map((a) => a.sku)) {
+        const elig = this.gumroadEligibility(sku);
+        if (!elig.ok) {
+          if (elig.issues.some((i) => i.startsWith('daily draft limit'))) {
+            stoppedAtCap = true;
+            break;
+          }
+          continue;
+        }
+        await this.shipGumroad(sku, false);
+        const ship = this.asset(sku)?.channels?.gumroad;
+        if (ship?.status === 'draft' || ship?.status === 'published') {
+          shipped++;
+          if (publish && ship.status === 'draft' && ship.productId && !ship.error) {
+            await this.publishGumroad(sku);
+            if (this.asset(sku)?.channels?.gumroad?.status === 'published') published++;
+          }
+        } else {
+          failed++;
+        }
+      }
+      this.event(
+        `gumroad bulk: ${shipped} shipped, ${published} published, ${failed} failed` +
+          (stoppedAtCap ? `, stopped at daily limit (${this.config.gumroad.maxDraftsPerDay}/day)` : ''),
+      );
+    } finally {
+      this.gumroadBulkRunning = false;
+      this.changed();
+    }
+  }
+
+  /// Publish every clean draft — drafts carrying an error stay drafts.
+  private async publishAllGumroad(): Promise<void> {
+    if (this.gumroadBulkRunning) {
+      this.event('gumroad bulk already running');
+      return;
+    }
+    this.gumroadBulkRunning = true;
+    this.changed();
+    try {
+      let published = 0;
+      let failed = 0;
+      for (const a of [...this.assets]) {
+        const g = a.channels?.gumroad;
+        if (g?.status !== 'draft' || !g.productId || g.error) continue;
+        await this.publishGumroad(a.sku);
+        if (this.asset(a.sku)?.channels?.gumroad?.status === 'published') published++;
+        else failed++;
+      }
+      this.event(`gumroad bulk publish: ${published} published, ${failed} failed`);
+    } finally {
+      this.gumroadBulkRunning = false;
+      this.changed();
+    }
   }
 
   /// Move an asset out of the pipeline: its folder goes to archive/ and
