@@ -412,6 +412,8 @@ export interface FactoryConfig {
   marketSource: 'itch' | 'mock';
   /// Gumroad channel gates (token itself is env-only, never here)
   gumroad: GumroadConfig;
+  /// failed/scrapped assets are moved to archive/ automatically
+  autoArchiveFailed: boolean;
   itchScanMinutes: number;
   /// e.g. "game-assets/top-sellers/tag-pixel-art" (+ optional ":N" pages)
   itchFeeds: (string | { feed: string; pages: number })[];
@@ -507,4 +509,8 @@ export type ClientMessage =
   | { type: 'clearGumroad'; sku: string }
   /// re-poll live draft/published status for every shipped product
   | { type: 'refreshGumroad' }
+  /// move one unshippable asset to archive/ (local only — never gumroad)
+  | { type: 'archiveAsset'; sku: string }
+  /// archive every failed/scrapped/permanently-unshippable asset
+  | { type: 'archiveUnshippable' }
   | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> };

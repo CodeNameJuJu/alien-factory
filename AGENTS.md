@@ -77,6 +77,8 @@ client/               # Vite + TS, zero runtime deps
                       # per item) + atlas.json + preview.png contact sheet
                       # + meta.json {kind:'pack', perItem, duplicateItems}
   STYLE.md            # house rules handed to every prompt
+  archive/<sku>/      # archived assets (moved here + dropped from state,
+                      # archived.json explains why; gumroad products are never archived)
   assets/<sku>/       # gen.mjs + sheet.png + preview.png + meta.json + listing.json
                       # + kit/ (<sku>.zip, README/LICENSE.txt, cover.png,
                       # thumbnail.png, gallery-1.png, preview.gif) once the
@@ -148,7 +150,10 @@ no publishing code exists.
    mock market.
 
 Asset statuses: `queued → forging → inspecting → on_conveyor → packing →
-listed` (plus `scrapped`/`failed`). The output conveyor only ever carries
+listed` (plus `scrapped`/`failed` — with `autoArchiveFailed` on, those are
+moved to `archive/` as soon as the job ends; `[ archive ]` /
+`[ archive unshippable ]` in the UI do the same by hand — local only,
+never deletes anything on Gumroad). The output conveyor only ever carries
 `on_conveyor`+`packing` items. `examples/` holds the starter
 generators (style references, not catalog items — `potion-pack` is the
 pack reference); `stateVersion: 2` wipes
@@ -210,6 +215,7 @@ defaults:
   "mode": "research",
   "marketSource": "itch",
   "gumroad": { "minScore": 7, "packsOnly": true, "maxDraftsPerDay": 3, "autoPublish": false },
+  "autoArchiveFailed": true,
   "itchScanMinutes": 60,
   "itchFeeds": ["game-assets/top-sellers/tag-pixel-art:2", "..."]
 }

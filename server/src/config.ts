@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG: FactoryConfig = {
   mode: 'research',
   marketSource: 'itch',
   gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
+  autoArchiveFailed: true,
   itchScanMinutes: 60,
   itchFeeds: [
     'game-assets/top-sellers/tag-pixel-art:2',

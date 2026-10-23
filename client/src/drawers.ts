@@ -6,7 +6,19 @@ import { atlasFor, drawAssetFrame, drawAtlasItem, fetchAtlas, fetchMeta, metaFor
 import type { AtlasItem } from './assets';
 import { fmtTokens } from './hud';
 import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
-import { canClearGumroad, shipEligibility } from '../../shared/shop';
+import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop';
+
+/// statuses where an agent/pipeline still owns the asset — never archive
+const IN_PIPELINE = new Set(['queued', 'forging', 'inspecting', 'on_conveyor', 'packing']);
+
+/// Assets the bulk archive would take — mirrors factory.archiveUnshippable.
+function unshippableAssets(s: StateMessage): Asset[] {
+  return s.assets.filter((a) => {
+    if (a.channels?.gumroad?.productId || IN_PIPELINE.has(a.status)) return false;
+    if (a.status === 'failed' || a.status === 'scrapped') return true;
+    return a.status === 'listed' && unshippableReasons(a, metaFor(a.sku) ?? undefined, s.config.gumroad).length > 0;
+  });
+}
 
 export type Selection =
   | { type: 'overlord' }
@@ -422,7 +434,19 @@ export class Drawers {
 
   private renderAsset(a: Asset, s: StateMessage): void {
     const isPack = a.kind === 'pack';
-    this.head(a.sku, `${a.status}${isPack ? ` · pack ×${a.items ?? '?'}` : ''}`, { label: '[ show in finder ]', fn: () => reveal({ sku: a.sku }) });
+    const ah = this.head(a.sku, `${a.status}${isPack ? ` · pack ×${a.items ?? '?'}` : ''}`, { label: '[ show in finder ]', fn: () => reveal({ sku: a.sku }) });
+    if (!IN_PIPELINE.has(a.status) && !a.channels?.gumroad?.productId) {
+      const arch = document.createElement('button');
+      arch.className = 'btn';
+      arch.textContent = '[ archive ]';
+      arch.title = 'move the asset folder to archive/ and drop it from state (never touches gumroad)';
+      arch.addEventListener('click', () => {
+        if (confirm(`archive ${a.sku}? the folder moves to archive/ and the asset leaves the factory`)) {
+          this.net.send({ type: 'archiveAsset', sku: a.sku });
+        }
+      });
+      ah.insertBefore(arch, ah.lastChild);
+    }
     const b = this.body();
     const meta = metaFor(a.sku);
     const w = meta?.w ?? a.size;
@@ -1183,7 +1207,20 @@ export class Drawers {
   // ---- gallery --------------------------------------------------------------------
 
   private renderGallery(s: StateMessage): void {
-    this.head('GALLERY', `${s.assets.length} assets`, { label: '[ open folder ]', fn: () => reveal({ dir: 'assets' }) });
+    const gh = this.head('GALLERY', `${s.assets.length} assets`, { label: '[ open folder ]', fn: () => reveal({ dir: 'assets' }) });
+    {
+      const count = unshippableAssets(s).length;
+      const arch = document.createElement('button');
+      arch.className = 'btn';
+      arch.textContent = '[ archive unshippable ]';
+      arch.title = 'move every failed/scrapped/permanently-unshippable asset to archive/ (never touches gumroad)';
+      arch.addEventListener('click', () => {
+        if (confirm(`archive ${count} unshippable asset(s)? folders move to archive/ and the assets leave the factory`)) {
+          this.net.send({ type: 'archiveUnshippable' });
+        }
+      });
+      gh.insertBefore(arch, gh.lastChild);
+    }
     const b = this.body();
     const sel = document.createElement('select');
     sel.className = 'gfilter';

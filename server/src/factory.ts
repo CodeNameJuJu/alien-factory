@@ -30,7 +30,7 @@ import {
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
 import { attachGumroadImages as gumroadAttach, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, refreshGumroadStatus as gumroadRefresh, shipGumroad as gumroadShip } from './channels/gumroad.js';
-import { canClearGumroad, shipEligibility } from '../../shared/shop.js';
+import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import {
   analyseSnapshot,
   getBackoffUntil,
@@ -76,6 +76,21 @@ type Json = any;
 /// Thrown when a turn's job was requeued/stopped while the prompt was in
 /// flight — the pipeline must not continue on its result.
 class CancelledError extends Error {}
+
+/// Move assets/<sku> aside to archive/<sku> (suffixing the target if it
+/// exists) and write archived.json inside it. Returns the archive dir, or
+/// null when the source dir wasn't there — state cleanup is the caller's.
+export function moveToArchive(factoryDir: string, sku: string, record: Record<string, unknown>): string | null {
+  const src = join(factoryDir, 'assets', sku);
+  if (!existsSync(src)) return null;
+  const arch = join(factoryDir, 'archive');
+  mkdirSync(arch, { recursive: true });
+  let dst = join(arch, sku);
+  if (existsSync(dst)) dst = join(arch, `${sku}-${Date.now()}`);
+  renameSync(src, dst);
+  writeFileSync(join(dst, 'archived.json'), JSON.stringify(record, null, 2));
+  return dst;
+}
 
 const ALIEN_SYL_A = ['Zor', 'Bli', 'Kre', 'Vex', 'Nur', 'Oo', 'Spl', 'Woz', 'Gli', 'Tha', 'Mur', 'Plo'];
 const ALIEN_SYL_B = ['p', 'x', 'll', 'gg', 'ma', 'na', 'qi', 'zz', 'rk', 'b', 'sh', 't'];
@@ -477,7 +492,10 @@ export class FactoryManager extends EventEmitter {
           agent.currentJobId = null;
         } else {
           this.finishJob(job, false);
-          if (job.sku) this.setAssetStatus(job.sku, 'failed', msg);
+          if (job.sku) {
+            this.setAssetStatus(job.sku, 'failed', msg);
+            this.maybeArchiveFailed(job.sku, 'failed');
+          }
         }
       }
       this.event(`${agent.name} errored: ${msg}`, agent.id, job?.sku);
@@ -703,11 +721,13 @@ export class FactoryManager extends EventEmitter {
         if (!again.passed) {
           this.setAssetStatus(asset.sku, 'failed', again.issues.join('; '));
           this.finishJob(job, false);
+          this.maybeArchiveFailed(asset.sku, 'failed');
           return;
         }
       } else {
         this.setAssetStatus(asset.sku, 'failed', checks.issues.join('; '));
         this.finishJob(job, false);
+        this.maybeArchiveFailed(asset.sku, 'failed');
         return;
       }
     }
@@ -744,6 +764,9 @@ export class FactoryManager extends EventEmitter {
       this.event(`Inspector ✗ ${asset.sku} — scrapped`, agent.id, asset.sku);
     }
     this.finishJob(job, true);
+    if (asset.status === 'scrapped') {
+      this.maybeArchiveFailed(asset.sku, `scrapped: ${ins.notes.slice(0, 80)}`);
+    }
   }
 
   private async jobPack(agent: Agent, job: Job): Promise<void> {
@@ -1115,6 +1138,12 @@ export class FactoryManager extends EventEmitter {
       case 'refreshGumroad':
         await this.refreshGumroad();
         return;
+      case 'archiveAsset':
+        this.archiveAsset(msg.sku, 'archived by hand');
+        return;
+      case 'archiveUnshippable':
+        this.archiveUnshippable();
+        return;
       case 'setGumroadConfig':
         this.setGumroadConfig(msg.config);
         return;
@@ -1229,6 +1258,70 @@ export class FactoryManager extends EventEmitter {
       else if (ship.status === 'draft') draft++;
     }
     this.event(`gumroad refreshed: ${shipped.length} product(s) — ${published} published, ${draft} draft`);
+    this.changed();
+  }
+
+  /// Move an asset out of the pipeline: its folder goes to archive/ and
+  /// every live sku reference is dropped. Never touches Gumroad — a
+  /// productId means a real product exists and the archive is refused.
+  /// Active jobs also refuse (an agent is mid-work); merely QUEUED jobs
+  /// for the sku are removed instead.
+  private archiveAsset(sku: string, reason: string): boolean {
+    const asset = this.asset(sku);
+    if (!asset) return false;
+    if (asset.channels?.gumroad?.productId) {
+      this.event(`archive refused: ${sku} is a real gumroad product`, undefined, sku);
+      return false;
+    }
+    if (this.jobs.some((j) => j.sku === sku && j.status === 'active')) {
+      this.event(`archive refused: ${sku} has an agent working on it`, undefined, sku);
+      return false;
+    }
+    this.jobs = this.jobs.filter((j) => !(j.sku === sku && j.status === 'queued'));
+    try {
+      moveToArchive(FACTORY_DIR, sku, {
+        sku,
+        title: asset.title,
+        status: asset.status,
+        score: asset.inspection?.score,
+        reason,
+        at: Date.now(),
+      });
+    } catch {
+      /* fs hiccup — drop the state anyway */
+    }
+    // live sku-keyed state only — market revenue history/totals stay
+    this.market.quality.delete(sku);
+    this.market.listedAt.delete(sku);
+    this.assets = this.assets.filter((a) => a.sku !== sku);
+    this.event(`archived ${sku}: ${reason}`, undefined, sku);
+    this.changed();
+    return true;
+  }
+
+  /// Auto-archive after the job that produced the verdict is done —
+  /// archiving earlier would hit the active-job refusal.
+  private maybeArchiveFailed(sku: string, reason: string): void {
+    if (this.config.autoArchiveFailed) this.archiveAsset(sku, reason);
+  }
+
+  /// Archive every failed/scrapped asset plus listed ones with a
+  /// PERMANENT ship-gate issue. In-pipeline and real-product assets are
+  /// never touched.
+  private archiveUnshippable(): void {
+    let n = 0;
+    for (const a of [...this.assets]) {
+      if (a.channels?.gumroad?.productId) continue;
+      if (a.status === 'failed' || a.status === 'scrapped') {
+        if (this.archiveAsset(a.sku, `unshippable: ${a.status}`)) n++;
+        continue;
+      }
+      if (a.status === 'listed') {
+        const reasons = unshippableReasons(a, loadShipMeta(a.sku), this.config.gumroad);
+        if (reasons.length && this.archiveAsset(a.sku, `unshippable: ${reasons[0].slice(0, 80)}`)) n++;
+      }
+    }
+    this.event(`archived ${n} unshippable asset(s)`);
     this.changed();
   }
 

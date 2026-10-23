@@ -105,6 +105,19 @@ export function canClearGumroad(
   return !!g && !g.productId && g.status !== 'building' && g.status !== 'uploading';
 }
 
+/// shipEligibility issues that will never fix themselves — "already
+/// shipped" is temporary-state (fix: clear the record) and the daily
+/// limit resets at midnight, so both are transient.
+const TRANSIENT_SHIP_RE = /^(already shipped|daily draft limit)/;
+
+export function unshippableReasons(
+  asset: Pick<Asset, 'status' | 'kind' | 'inspection' | 'listing' | 'channels'>,
+  meta: ShipMeta | undefined,
+  cfg: GumroadConfig,
+): string[] {
+  return shipEligibility(asset, meta, cfg, 0).issues.filter((i) => !TRANSIENT_SHIP_RE.test(i));
+}
+
 /// The ship gate. Everything must pass before a real upload happens.
 export function shipEligibility(
   asset: Pick<Asset, 'status' | 'kind' | 'inspection' | 'listing' | 'channels'>,

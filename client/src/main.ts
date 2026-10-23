@@ -32,6 +32,7 @@ const empty: StateMessage = {
     rescoutHours: 6, usdToZar: 18.5, prices: {}, dailyTokenCaps: null,
     mode: 'research', marketSource: 'itch', itchScanMinutes: 60, itchFeeds: [],
     gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
+    autoArchiveFailed: true,
   },
   channels: { gumroad: { configured: false } },
   acp: { authenticated: false, models: [], modelGroups: [], defaultModel: null, modes: [], alive: false },

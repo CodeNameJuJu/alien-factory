@@ -27,13 +27,13 @@ import {
 import { RateLimiter, passwordMatches, sessionToken, sessionValid, SESSION_COOKIE } from './auth.js';
 import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile, relayHttpBase, signKitUrl, verifyKitSig } from './link.js';
 import type { Asset, GumroadConfig, ItchItem, ItchSnapshot } from '../../shared/protocol.js';
-import { canClearGumroad, countClaims, listingConsistency, shipEligibility } from '../../shared/shop.js';
+import { canClearGumroad, countClaims, listingConsistency, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import { crc32, decodePng, encodePng } from './png.js';
 import { buildKit, drawCover, kitSubtitle, zipFiles, type KitItem, type KitSpec } from './kit.js';
 import { publishGumroad, shipGumroad, attachGumroadImages, refreshGumroadStatus } from './channels/gumroad.js';
 import { encodeGif } from './gif.js';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 const FACTORY = '/factory';
@@ -1183,6 +1183,51 @@ test('gumroad content page: PUT failure keeps the draft and skips auto-publish',
   assert.match(res.ship.error!, /content page failed/);
   assert.match(res.ship.error!, /add the file in the gumroad Content tab/);
   assert.ok(!calls.some((c) => c.url.includes('/enable')), 'a failed content page never publishes');
+});
+
+test('unshippableReasons: permanent gate issues only', () => {
+  // listed pack scoring below the gate → the score issue is permanent
+  assert.deepEqual(
+    unshippableReasons(shipAsset({ inspection: { verdict: 'FAIL', score: 6, notes: '' } }), packMeta8, GCFG),
+    ['inspection score 6 < 7'],
+  );
+  // a listed sprite under packsOnly is permanently out
+  assert.ok(
+    unshippableReasons(shipAsset({ kind: 'sprite', items: undefined }), { w: 16, h: 16, frames: 4 }, GCFG)
+      .some((i) => /packs-only/.test(i)),
+  );
+  // the daily limit is transient — no permanent reasons for an eligible asset
+  assert.deepEqual(unshippableReasons(shipAsset(), packMeta8, GCFG), []);
+  // 'already shipped' is transient too — an existing product has no
+  // permanent reasons (and archive refuses it anyway via productId)
+  assert.deepEqual(
+    unshippableReasons(
+      shipAsset({ channels: { gumroad: { status: 'draft', productId: 'x' } } }),
+      packMeta8, GCFG,
+    ),
+    [],
+  );
+});
+
+test('moveToArchive: moves the dir, writes archived.json, null when missing', async () => {
+  const { moveToArchive } = await import('./factory.js');
+  const dir = mkdtempSync(join(tmpdir(), 'af-arch-'));
+  const sku = 'old-pack-1';
+  mkdirSync(join(dir, 'assets', sku), { recursive: true });
+  writeFileSync(join(dir, 'assets', sku, 'meta.json'), '{}');
+  const rec = { sku, title: 'Old Pack', status: 'failed', score: 5, reason: 'failed', at: 1 };
+  const dst = moveToArchive(dir, sku, rec)!;
+  assert.equal(dst, join(dir, 'archive', sku));
+  assert.equal(existsSync(join(dir, 'assets', sku)), false);
+  assert.equal(existsSync(join(dst, 'meta.json')), true);
+  assert.deepEqual(JSON.parse(readFileSync(join(dst, 'archived.json'), 'utf8')), rec);
+  // existing target → timestamped suffix; missing source → null
+  const again = moveToArchive(dir, sku, rec);
+  assert.equal(again, null);
+  mkdirSync(join(dir, 'assets', 'dup'), { recursive: true });
+  mkdirSync(join(dir, 'archive', 'dup'), { recursive: true });
+  const dup = moveToArchive(dir, 'dup', rec)!;
+  assert.match(dup, /archive\/dup-\d+$/);
 });
 
 test('canClearGumroad: only failed records without a productId', () => {

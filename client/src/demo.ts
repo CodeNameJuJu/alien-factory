@@ -184,6 +184,7 @@ export function startDemo(apply: (s: StateMessage) => void): void {
       itchScanMinutes: 60,
       itchFeeds: [],
       gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
+      autoArchiveFailed: true,
     },
     channels: { gumroad: { configured: true } },
     acp: { authenticated: true, models: [], modelGroups: [{ name: 'demo', values: [{ id: 'claude-opus-5-5-high', name: 'Opus' }, { id: 'swe-2-medium-lightning', name: 'Lightning' }] }], defaultModel: null, modes: [], alive: true },
