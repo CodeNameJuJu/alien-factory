@@ -26,6 +26,8 @@ export class Hud {
     this.bar.innerHTML = `
       <span id="hud-live" class="hud-pill" style="display:none">…</span>
       <span id="hud-shift" class="hud-pill">stopped</span>
+      <span id="hud-research" class="hud-pill warn" style="display:none"></span>
+      <button class="btn" id="hud-gofull" style="display:none">[ switch to full ]</button>
       <button class="btn hud-x" data-act="startShift">[ start ]</button>
       <button class="btn hud-x" data-act="pauseShift">[ pause ]</button>
       <button class="btn hud-x" data-act="stopShift">[ stop ]</button>
@@ -65,6 +67,10 @@ export class Hud {
     this.crew.id = 'crew';
     document.body.insertBefore(this.crew, this.ticker);
     this.crew.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('.crew-gofull')) {
+        this.net.send({ type: 'setMode', mode: 'full' });
+        return;
+      }
       const row = (e.target as HTMLElement).closest<HTMLElement>('.crew-row');
       if (!row?.dataset.agent) return;
       this.hooks.onSelect(row.dataset.agent === 'overlord' ? { type: 'overlord' } : { type: 'agent', id: row.dataset.agent });
@@ -87,6 +93,7 @@ export class Hud {
       else if ((e.target as HTMLElement).id === 'hud-gallery') this.hooks.onSelect({ type: 'gallery' });
       else if ((e.target as HTMLElement).id === 'hud-market') this.hooks.onSelect({ type: 'market' });
       else if ((e.target as HTMLElement).id === 'hud-menu') this.bar.classList.toggle('menu-open');
+      else if ((e.target as HTMLElement).id === 'hud-gofull') this.net.send({ type: 'setMode', mode: 'full' });
     });
     const modelChanged = () => {
       this.net.send({
@@ -119,6 +126,17 @@ export class Hud {
     pill('#hud-shift', s.shift);
     shiftEl.className = `hud-pill shift-${s.shift}`;
     const research = s.config.mode === 'research';
+    // research banner: running but idle → explain + offer the full pipeline
+    const idle = !s.jobs.some((j) => j.status === 'queued' || j.status === 'active');
+    const researchIdle = research && s.shift === 'running' && idle;
+    const nextScan = Math.max((s.itch.lastScanAt ?? 0) + s.config.itchScanMinutes * 60_000, s.itch.backoffUntil ?? 0);
+    const banner = researchIdle
+      ? `research — scout only · next scan ${String(new Date(nextScan).getHours()).padStart(2, '0')}:${String(new Date(nextScan).getMinutes()).padStart(2, '0')}`
+      : '';
+    const rp = this.bar.querySelector('#hud-research') as HTMLElement;
+    rp.style.display = researchIdle ? '' : 'none';
+    if (rp.textContent !== banner) rp.textContent = banner;
+    (this.bar.querySelector('#hud-gofull') as HTMLElement).style.display = researchIdle ? '' : 'none';
     this.lastMode = s.config.mode;
     this.lastSource = s.config.marketSource;
     (this.bar.querySelector('#hud-mode') as HTMLElement).textContent = `[ mode: ${s.config.mode} ]`;
@@ -236,8 +254,11 @@ export class Hud {
   /// "What are they busy with" — one row per agent, narrow screens only.
   private renderCrew(s: StateMessage): void {
     const pending = s.candidates.filter((c) => c.status === 'pending').length;
+    const idle = !s.jobs.some((j) => j.status === 'queued' || j.status === 'active');
+    const researchIdle = s.config.mode === 'research' && s.shift === 'running' && idle;
     const key = JSON.stringify([
       pending,
+      researchIdle,
       s.agents.map((a) => [a.id, a.state, a.statusLine, a.currentJobId]),
       s.jobs.filter((j) => j.status === 'active').map((j) => [j.id, j.sku, j.createdAt]),
     ]);
@@ -252,6 +273,15 @@ export class Hud {
       const m = Math.floor((Date.now() - at) / 60_000);
       return m < 1 ? '<1m' : `${m}m`;
     };
+
+    if (researchIdle) {
+      const nextScan = Math.max((s.itch.lastScanAt ?? 0) + s.config.itchScanMinutes * 60_000, s.itch.backoffUntil ?? 0);
+      const d = new Date(nextScan);
+      const head = document.createElement('div');
+      head.className = 'crew-head';
+      head.innerHTML = `research — scout only · next scan ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} <button class="btn crew-gofull">[ switch to full ]</button>`;
+      this.crew.appendChild(head);
+    }
 
     const overlord = s.agents.find((a) => a.kind === 'overlord');
     const rest = s.agents.filter((a) => a.kind !== 'overlord');

@@ -39,6 +39,8 @@ seedFactory();
 const factory = new FactoryManager(config);
 const relay = IS_RELAY ? new Relay() : null;
 const link = IS_WORKER ? new WorkerLink(RELAY_URL, WORKER_KEY, factory) : null;
+// while the worker is linked (or was recently), the relay is the scanner
+if (link) factory.relayAvailable = () => !link.fallbackDue();
 
 // ---- websocket ------------------------------------------------------------
 

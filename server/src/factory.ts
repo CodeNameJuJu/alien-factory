@@ -17,6 +17,8 @@ import {
   parseDemand,
   parseInspection,
   pickSmith,
+  opportunitiesToCandidates,
+  shouldQueueScout,
   urlsAllowed,
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
@@ -126,6 +128,11 @@ export class FactoryManager extends EventEmitter {
   lastScoutTick = -999;
   trendReports: TrendReport[] = [];
   itch: ItchState = { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null };
+
+  /// Set by main.ts when a relay link is configured — true while the worker
+  /// is linked (or was within the last 2h). A linked worker never scans
+  /// itch.io itself; it uses relay-pushed analysis.
+  relayAvailable: () => boolean = () => false;
   market = new Market();
   acp: AcpClient;
 
@@ -341,6 +348,7 @@ export class FactoryManager extends EventEmitter {
     // research mode: rescan + rescout on the itchScanMinutes cadence
     if (
       this.config.mode === 'research' &&
+      !this.relayAvailable() && // linked worker: the relay scans, not us
       !this.itch.scanning &&
       Date.now() - (this.itch.lastScanAt ?? 0) >= this.config.itchScanMinutes * 60_000
     ) {
@@ -877,8 +885,12 @@ export class FactoryManager extends EventEmitter {
     if (this.itch.scanning) return;
     const gate = scanAllowed(manual);
     if (!gate.ok) {
-      this.itch.error = gate.reason ?? `rate-limited — next scan in ${Math.ceil(gate.retryAfterMs / 60_000)} min`;
-      this.event(`itch scan refused: rate-limited (${Math.ceil(gate.retryAfterMs / 60_000)} min)`);
+      const d = new Date(Date.now() + gate.retryAfterMs);
+      const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+      this.itch.error = gate.reason ?? `next scan allowed at ${hhmm}`;
+      this.event(`itch scan refused: ${this.itch.error}`);
+      // a refusal doesn't stall the line — use whatever data we already hold
+      if (!scoutless) this.maybeQueueScout();
       this.changed();
       return;
     }
@@ -894,18 +906,52 @@ export class FactoryManager extends EventEmitter {
       this.itch.lastScanAt = snapshot.at;
       setLastScanAt(snapshot.at);
       this.event(`itch scan done — ${this.itch.analysis.priceStats.count} items (${requests} requests)`);
-      const noAgents = scoutless || DEVIN_DISABLED;
-      if (!noAgents && !this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed')) {
-        this.queueJob('scout');
-        this.event('scout dispatched to read the itch report');
-      }
     } catch (err) {
       this.itch.error = (err as Error).message;
       this.event(`itch scan failed: ${this.itch.error}`);
     } finally {
       this.itch.scanning = false;
+      // success OR refusal — if we hold analysable data the scout should run
+      if (!scoutless) this.maybeQueueScout();
       this.changed();
     }
+  }
+
+  /// Queue the scout when we hold fresh data it hasn't analysed yet —
+  /// independent of whether a scan just ran (linked workers get their data
+  /// pushed from the relay, and a refused scan shouldn't stall the line).
+  private maybeQueueScout(): void {
+    if (DEVIN_DISABLED) return;
+    if (
+      shouldQueueScout({
+        mode: this.config.mode,
+        analysisAt: this.itch.lastScanAt,
+        hasPendingCandidates: this.candidates.some((c) => c.status === 'pending'),
+        hasScoutJob: this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed'),
+        reportScanAts: this.trendReports.map((t) => t.scanAt),
+      })
+    ) {
+      this.queueJob('scout');
+      this.event('scout dispatched to read the itch report');
+    }
+  }
+
+  /// Research → Full handoff: the newest trend report's opportunities become
+  /// pending overlord candidates (once per report).
+  private promoteOpportunities(): void {
+    if (this.config.mode !== 'full') return;
+    const report = this.trendReports.find((t) => !t.promoted && t.opportunities.length > 0);
+    if (!report) return;
+    report.promoted = true;
+    const news = opportunitiesToCandidates(report.opportunities, {
+      startCounter: this.candidateCounter,
+      reportN: report.n,
+      now: Date.now(),
+    });
+    this.candidateCounter += news.length;
+    this.candidates.push(...news);
+    for (const c of news) this.event(`research opportunity promoted: ${c.title} (demand ${c.demand})`);
+    this.changed();
   }
 
   /// The full browser-visible payload — shared by local /ws broadcasts and
@@ -949,13 +995,7 @@ export class FactoryManager extends EventEmitter {
     this.itch.scanning = false;
     setLastScanAt(lastScanAt);
     this.event(`relay pushed itch research (${analysis?.priceStats.count ?? 0} items)`);
-    const shouldScout =
-      this.config.mode === 'research' && this.shift === 'running' && !DEVIN_DISABLED &&
-      !this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed');
-    if (shouldScout) {
-      this.queueJob('scout');
-      this.event('scout dispatched to read the itch report');
-    }
+    if (this.config.mode === 'research' && this.shift === 'running') this.maybeQueueScout();
     this.changed();
   }
 
@@ -1003,10 +1043,14 @@ export class FactoryManager extends EventEmitter {
     }
     if (this.config.mode === 'research') {
       // research-only: scan itch.io, then the scout analyses the report.
-      // No production, no mock-market sales.
-      void this.scanThenScout(true);
+      // No production, no mock-market sales. A LINKED worker never scans
+      // locally — it works from relay-pushed analysis.
+      if (this.relayAvailable()) this.maybeQueueScout();
+      else void this.scanThenScout(true);
     } else {
       this.market.writeReport(this.assets);
+      this.promoteOpportunities();
+      this.maybeQueueScout();
       this.maybeScout();
     }
     this.changed();
@@ -1018,6 +1062,12 @@ export class FactoryManager extends EventEmitter {
     this.config.mode = mode;
     saveConfig(this.config);
     this.event(`mode: ${mode === 'research' ? 'RESEARCH (itch.io, read-only)' : 'FULL (mock market pipeline)'}`);
+    if (mode === 'full') {
+      this.promoteOpportunities();
+      this.maybeQueueScout();
+    } else {
+      this.maybeQueueScout();
+    }
     this.changed();
   }
 

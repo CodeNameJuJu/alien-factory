@@ -644,3 +644,19 @@ details pre {
   .nameplate { font-size: 8px; padding: 0 3px; gap: 3px; }
   .nameplate .np-dot { width: 4px; height: 4px; }
 }
+
+/* crew header (research-mode banner inside the crew list) */
+.crew-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--amber);
+  border-bottom: 1px solid var(--amber);
+  background: rgba(255, 184, 74, 0.06);
+  text-shadow: 0 0 4px currentColor;
+}
+.crew-gofull { font-size: 9px; min-height: 30px; padding: 4px 8px; }

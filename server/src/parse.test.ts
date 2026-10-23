@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import {
   applyApprovalCap,
+  opportunitiesToCandidates,
+  shouldQueueScout,
   checkMeta,
   decidePermission,
   extractReport,
@@ -364,7 +366,7 @@ const wsStub = () => ({
 }) as unknown as import('../../shared/protocol.js').WorkerStatePayload;
 
 test('mergeRelayState: no worker → null; connected → live; offline → persisted', () => {
-  const itch = { lastScanAt: 5, scanning: false, error: null, analysis: null };
+  const itch = { lastScanAt: 5, scanning: false, error: null, backoffUntil: null, analysis: null };
   assert.equal(mergeRelayState(null, itch, { connected: false, lastSeenAt: null }), null);
   const live = mergeRelayState(wsStub(), itch, { connected: true, lastSeenAt: 9 })!;
   assert.equal(live.worker?.connected, true);
@@ -437,4 +439,35 @@ test('scanFeeds: 429 aborts the whole scan and starts the backoff window', async
     globalThis.fetch = orig;
     setBackoffUntil(0, 0);
   }
+});
+
+// ---- scout gating + promotion ---------------------------------------------------
+
+test('shouldQueueScout: research dedupes by scanAt, full needs no pending', () => {
+  const base = { mode: 'research' as const, analysisAt: 100, hasPendingCandidates: false, hasScoutJob: false, reportScanAts: [] };
+  assert.equal(shouldQueueScout(base), true);                       // no report for scan 100
+  assert.equal(shouldQueueScout({ ...base, reportScanAts: [50, 100] }), false); // already analysed
+  assert.equal(shouldQueueScout({ ...base, analysisAt: null }), false);         // no data
+  assert.equal(shouldQueueScout({ ...base, hasScoutJob: true }), false);        // one running
+  const full = { ...base, mode: 'full' as const };
+  assert.equal(shouldQueueScout(full), true);
+  assert.equal(shouldQueueScout({ ...full, hasPendingCandidates: true }), false);
+});
+
+test('opportunitiesToCandidates: pending candidates with clamped fields', () => {
+  const cs = opportunitiesToCandidates(
+    [
+      { title: 'Slime King', tags: ['slime'], size: 64, frames: 99, why: 'big', demand: 42, variantOf: 'slime-1' },
+      { title: 'UI Pack', tags: ['ui'], size: 16, frames: 1, why: 'needs', demand: 3 },
+    ],
+    { startCounter: 7, reportN: 3, now: 999 },
+  );
+  assert.equal(cs.length, 2);
+  assert.equal(cs[0].id, 'c8');
+  assert.equal(cs[0].size, 32);         // clamped to 16|32
+  assert.equal(cs[0].demand, 10);       // clamped to 1-10
+  assert.equal(cs[0].frames, 8);        // clamped to 1-8
+  assert.equal(cs[0].status, 'pending');
+  assert.equal(cs[0].reportN, 3);
+  assert.equal(cs[1].id, 'c9');
 });

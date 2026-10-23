@@ -284,6 +284,8 @@ export interface TrendReport {
   opportunities: Opportunity[];
   /// itch scan the report was based on (if any)
   scanAt?: number;
+  /// its opportunities were turned into overlord candidates (full mode)
+  promoted?: boolean;
 }
 
 export interface FactoryConfig {

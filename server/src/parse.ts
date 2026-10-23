@@ -1,7 +1,7 @@
 // Pure parsing / decision helpers for the factory pipeline — kept free of IO
 // so parse.test.ts can drive them directly.
 import { resolve, sep } from 'node:path';
-import type { AssetInspection, OrderSpec } from '../../shared/protocol.js';
+import type { AssetInspection, Candidate, Opportunity, OrderSpec } from '../../shared/protocol.js';
 
 type Json = any;
 
@@ -299,4 +299,46 @@ export function checkMeta(meta: MetaJson | null, order: OrderLike): { passed: bo
     issues.push('all frames are identical — animate it');
   }
   return { passed: issues.length === 0, issues };
+}
+
+// ---- scout gating + research→full promotion (pure) ----------------------------
+
+/// "Do we have fresh data for the scout to analyse?" — separate from "did a
+/// scan just succeed". Returns true when a scout job should be queued:
+/// - FULL: itch analysis exists, nothing pending for the overlord, no scout job
+/// - RESEARCH: itch analysis exists and no trend report covers that scan yet
+export function shouldQueueScout(args: {
+  mode: 'research' | 'full';
+  /// itch.lastScanAt — null = no data yet
+  analysisAt: number | null;
+  hasPendingCandidates: boolean;
+  hasScoutJob: boolean;
+  /// scanAt of every existing trend report
+  reportScanAts: (number | undefined)[];
+}): boolean {
+  if (args.analysisAt == null) return false;
+  if (args.hasScoutJob) return false;
+  if (args.mode === 'full') return !args.hasPendingCandidates;
+  return !args.reportScanAts.includes(args.analysisAt);
+}
+
+/// Turn a research-mode trend report's opportunities into pending candidates
+/// for the overlord. Pure — the caller assigns the id counter + timestamps.
+export function opportunitiesToCandidates(
+  opps: Opportunity[],
+  opts: { startCounter: number; reportN: number; now: number },
+): Candidate[] {
+  return opps.map((o, i) => ({
+    id: `c${opts.startCounter + i + 1}`,
+    title: o.title,
+    tags: o.tags,
+    size: o.size >= 32 ? 32 : 16,
+    frames: Math.min(8, Math.max(1, o.frames | 0)),
+    why: o.why,
+    demand: Math.min(10, Math.max(1, o.demand | 0)),
+    variantOf: o.variantOf,
+    reportN: opts.reportN,
+    status: 'pending' as const,
+    createdAt: opts.now,
+  }));
 }
