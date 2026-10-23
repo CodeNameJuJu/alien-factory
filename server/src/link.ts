@@ -8,7 +8,10 @@ import type {
 export const SKU_RE = /^[a-z0-9-]{1,60}$/;
 /// files a worker may push for an asset — nothing else is ever written.
 /// `atlas.json` is the pack layout; `items/<slug>.png` are pack strips.
-export const ASSET_FILES = new Set(['sheet.png', 'preview.png', 'meta.json', 'atlas.json', 'listing.json', 'gen.mjs']);
+export const ASSET_FILES = new Set([
+  'sheet.png', 'preview.png', 'meta.json', 'atlas.json', 'listing.json', 'gen.mjs',
+  'kit/cover.png', 'kit/thumbnail.png', // zip stays on the worker — too big
+]);
 export const ASSET_ITEM_RE = /^items\/[a-z0-9-]{1,40}\.png$/;
 export const assetFileOk = (name: string): boolean => ASSET_FILES.has(name) || ASSET_ITEM_RE.test(name);
 export const MAX_LINK_MSG = 4 * 1024 * 1024;
@@ -18,6 +21,7 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const FORWARDABLE = new Set<ClientMessage['type']>([
   'startShift', 'pauseShift', 'stopShift', 'setModels', 'setCaps', 'setMode',
   'setMarketSource', 'directive', 'cancelAgent',
+  'shipGumroad', 'publishGumroad', 'setGumroadConfig',
 ]);
 
 /// Timing-safe `Authorization: Bearer <key>` check.
@@ -76,6 +80,7 @@ export function mergeRelayState(
     worker: status,
     usage: worker.usage,
     tokenCapHit: worker.tokenCapHit,
+    channels: worker.channels ?? { gumroad: { configured: false } },
   };
 }
 

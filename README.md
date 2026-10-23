@@ -8,7 +8,9 @@ and ship the approved ones down a conveyor into the market portal.
 Watch the floor, press **Start** to run a shift, click aliens / crates /
 the Overlord's dais / the scout's radar dish for details, and send the
 Overlord directives like "more slime variants". Everything it sells is on a
-**mock market** — nothing is ever published anywhere real.
+**mock market** — nothing is ever published anywhere real unless you
+explicitly ship a listed asset through the gated **Gumroad channel**
+(below — draft product by default, one click per asset).
 
 ## Research mode (default)
 
@@ -23,8 +25,52 @@ the permission layer also rejects any tool call that would fetch a
 non-itch.io URL.
 
 `mode: "full"` runs the produce-and-sell pipeline; `marketSource: "itch"`
-makes the scout read the itch report instead of the mock one. There is no
-publishing code — the packer "lists" on the in-memory mock market only.
+makes the scout read the itch report instead of the mock one. The packer
+"lists" on the in-memory mock market; the only real storefront is the
+Gumroad channel below.
+
+## Selling for real: the Gumroad channel (off by default)
+
+The ONE real exit off the mock market — entirely manual, per asset, and it
+only ever runs on the Mac worker (never on the Railway relay).
+
+**Setup (once):**
+
+1. Create a Gumroad account and connect your bank
+   (`gumroad.com` → settings → payout).
+2. Gumroad settings → **Advanced → Apps → "Register application"** (the
+   redirect URI can be anything, e.g. `http://localhost`), then
+   **Generate access token** with the **`edit_products`** scope.
+3. Put it in `~/.alien-factory/worker.env` on the Mac:
+   `GUMROAD_ACCESS_TOKEN=...` (gitignored, never leaves the worker — the
+   dashboard only sees `channels.gumroad.configured: true/false`).
+4. Restart the worker (`npm run start:worker`). The `[ shop ]` drawer shows
+   "✓ configured".
+
+**Shipping an asset** — open a *listed* asset's drawer → **SHOP**:
+
+- `[ dry run ]` builds the kit and shows the exact request plan (endpoints,
+  params, file size) without touching the network.
+- `[ ship as draft ]` uploads `assets/<sku>/kit/<sku>.zip` via Gumroad's
+  multipart file API and creates a **draft** product (`published: false`)
+  with the packer's title/price, an HTML description (contents + license +
+  AI-disclosure line) and tags. `[ publish ]` enables it when you're happy;
+  `autoPublish` skips the draft step.
+- The gate (`minScore` ≥ inspector score, packs-only, `maxDraftsPerDay`,
+  no re-shipping the same sku, listing-vs-contents consistency — e.g. a
+  listing claiming "600 items" or "32x32" that doesn't match the files is
+  refused) is checked both in the UI and server-side.
+
+**What ships**: `kit/<sku>.zip` = `sheet.png` (+ `items/*.png` and
+`atlas.json` for packs) + `preview.png` + `README.txt` (contents, sizes,
+frames/fps, atlas usage) + `LICENSE.txt` (free for personal & commercial
+use, modify freely, no attribution, may not resell the assets themselves;
+includes "Made with procedural code written by AI agents and reviewed
+before release."). `kit/cover.png` (1280×720) and `kit/thumbnail.png`
+(600×600) are generated too — the public v2 API only accepts *publicly
+reachable* cover URLs (and a thumbnail `signed_blob_id` it can't produce),
+so attach those two by hand in the Gumroad product editor. The zip itself
+stays on the Mac.
 
 ## Run
 

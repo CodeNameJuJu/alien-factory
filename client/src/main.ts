@@ -31,7 +31,9 @@ const empty: StateMessage = {
     sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6 },
     rescoutHours: 6, usdToZar: 18.5, prices: {}, dailyTokenCaps: null,
     mode: 'research', marketSource: 'itch', itchScanMinutes: 60, itchFeeds: [],
+    gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
   },
+  channels: { gumroad: { configured: false } },
   acp: { authenticated: false, models: [], modelGroups: [], defaultModel: null, modes: [], alive: false },
   latestTrendReport: null,
   itch: { lastScanAt: null, scanning: false, error: null, backoffUntil: null, analysis: null },
@@ -56,6 +58,7 @@ const hud = new Hud(net, {
     else if (sel.type === 'gallery') select({ type: 'gallery' });
     else if (sel.type === 'trends') select({ type: 'trends' });
     else if (sel.type === 'models') select({ type: 'models' });
+    else if (sel.type === 'shop') select({ type: 'shop' });
     else select({ type: 'overlord' });
   },
 });

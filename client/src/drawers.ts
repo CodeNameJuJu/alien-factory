@@ -6,6 +6,7 @@ import { atlasFor, drawAssetFrame, drawAtlasItem, fetchAtlas, fetchMeta, metaFor
 import type { AtlasItem } from './assets';
 import { fmtTokens } from './hud';
 import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
+import { shipEligibility } from '../../shared/shop';
 
 export type Selection =
   | { type: 'overlord' }
@@ -14,7 +15,8 @@ export type Selection =
   | { type: 'market' }
   | { type: 'trends' }
   | { type: 'gallery' }
-  | { type: 'models' };
+  | { type: 'models' }
+  | { type: 'shop' };
 
 /// POST /api/reveal — server-side `open` on the factory dir (no-op errors).
 function reveal(body: { sku?: string; dir?: string }): void {
@@ -127,6 +129,12 @@ export class Drawers {
           s.devinEnabled,
           s.agents.map((a) => a.modelMismatch?.want),
         ]);
+      case 'shop':
+        return JSON.stringify([
+          s.config.gumroad,
+          s.channels?.gumroad,
+          s.assets.map((a) => a.channels?.gumroad),
+        ]);
       case 'gallery':
         return this.galleryFilter + JSON.stringify(s.assets.map((a) => [a.sku, a.status]));
     }
@@ -178,6 +186,9 @@ export class Drawers {
         break;
       case 'models':
         this.renderModels(s);
+        break;
+      case 'shop':
+        this.renderShop(s);
         break;
       case 'gallery':
         this.renderGallery(s);
@@ -504,6 +515,7 @@ export class Drawers {
       b.appendChild(d);
     }
     this.kv(b, 'sales', `${a.sales.views} views · ${a.sales.units} units · $${a.sales.revenueUsd.toFixed(2)} · R${(a.sales.revenueUsd * s.config.usdToZar).toFixed(2)}`);
+    this.renderShopSection(b, a, s, meta);
     // fetch meta/atlas only when missing — otherwise the resolved microtask
     // would re-render this drawer forever (the freeze bug)
     if (!meta) {
@@ -887,6 +899,225 @@ export class Drawers {
         det.appendChild(row);
       }
       b.appendChild(det);
+    }
+  }
+
+  // ---- shop (gumroad) --------------------------------------------------------------
+
+  /// products drafted/published/uploading today — mirrors the server gate
+  private shippedToday(s: StateMessage): number {
+    const today = new Date().toDateString();
+    return s.assets.filter((a) => {
+      const g = a.channels?.gumroad;
+      return (
+        g?.at && new Date(g.at).toDateString() === today && g.status !== 'error' && g.status !== 'none'
+      );
+    }).length;
+  }
+
+  /// SHOP section inside the asset drawer — vertical stack: header + status
+  /// badge, eligibility, buttons, links (one per line), manual-cover note.
+  private renderShopSection(b: HTMLElement, a: Asset, s: StateMessage, meta: ReturnType<typeof metaFor>): void {
+    const g = a.channels?.gumroad;
+    const configured = s.channels?.gumroad?.configured === true;
+    const elig = shipEligibility(a, meta ?? undefined, s.config.gumroad, this.shippedToday(s));
+    const card = document.createElement('div');
+    card.className = 'acard v';
+
+    const head = document.createElement('div');
+    head.className = 'kv';
+    const ht = document.createElement('b');
+    ht.textContent = 'SHOP — gumroad';
+    const badge = document.createElement('span');
+    badge.textContent = g && g.status !== 'none' ? g.status : 'not shipped';
+    head.append(ht, badge);
+    card.appendChild(head);
+
+    if (a.status === 'listed' || a.channels?.gumroad) {
+      if (elig.ok) {
+        const ok = document.createElement('div');
+        ok.className = 'note';
+        ok.textContent = '✓ eligible to ship';
+        card.appendChild(ok);
+      } else {
+        for (const issue of elig.issues) {
+          const i = document.createElement('div');
+          i.className = 'note';
+          i.style.color = 'var(--amber)';
+          i.style.marginBottom = '2px';
+          i.textContent = `✗ ${issue}`;
+          card.appendChild(i);
+        }
+      }
+      if (!configured) {
+        const n = document.createElement('div');
+        n.className = 'note';
+        n.textContent = 'not configured — set GUMROAD_ACCESS_TOKEN in ~/.alien-factory/worker.env and restart the worker';
+        card.appendChild(n);
+      }
+      const row = document.createElement('div');
+      row.className = 'btnrow';
+      const dry = document.createElement('button');
+      dry.className = 'btn';
+      dry.textContent = '[ dry run ]';
+      dry.addEventListener('click', () => this.net.send({ type: 'shipGumroad', sku: a.sku, dryRun: true }));
+      const ship = document.createElement('button');
+      ship.className = 'btn';
+      ship.textContent = s.config.gumroad.autoPublish ? '[ ship + publish ]' : '[ ship as draft ]';
+      ship.disabled = !configured || !elig.ok || g?.status === 'building' || g?.status === 'uploading';
+      ship.addEventListener('click', () => this.net.send({ type: 'shipGumroad', sku: a.sku }));
+      row.append(dry, ship);
+      if (g?.status === 'draft' && g.productId) {
+        const pub = document.createElement('button');
+        pub.className = 'btn go';
+        pub.textContent = '[ publish ]';
+        pub.disabled = !configured;
+        pub.addEventListener('click', () => this.net.send({ type: 'publishGumroad', sku: a.sku }));
+        row.appendChild(pub);
+      }
+      card.appendChild(row);
+      if (g?.error && (g.status === 'error' || elig.ok)) {
+        const e = document.createElement('div');
+        e.className = 'note';
+        e.style.color = 'var(--amber)';
+        e.textContent = `⚠ ${g.error}`;
+        card.appendChild(e);
+      }
+      if (g?.plan) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.textContent = 'last dry-run request plan';
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(g.plan, null, 2);
+        det.append(sum, pre);
+        card.appendChild(det);
+      }
+    }
+
+    // links — one per line; kit art is synced to the relay, zip stays on the Mac
+    if (g && g.status !== 'none') {
+      const links = document.createElement('div');
+      links.className = 'shopline';
+      for (const [label, href] of [
+        ['gumroad product', g.shortUrl],
+        ['edit in gumroad', g.editUrl],
+        ['kit/cover.png', `/files/assets/${a.sku}/kit/cover.png`],
+        ['kit/thumbnail.png', `/files/assets/${a.sku}/kit/thumbnail.png`],
+      ] as const) {
+        if (!href) continue;
+        const l = document.createElement('a');
+        l.href = href;
+        l.target = '_blank';
+        l.rel = 'noopener';
+        l.textContent = `→ ${label}`;
+        links.appendChild(l);
+      }
+      if (links.childElementCount) card.appendChild(links);
+      const manual = document.createElement('div');
+      manual.className = 'note';
+      manual.textContent = 'covers/thumbnail are a manual step — the API only accepts public URLs; attach these two in the gumroad editor';
+      card.appendChild(manual);
+    }
+    b.appendChild(card);
+  }
+
+  private renderShop(s: StateMessage): void {
+    this.head('SHOP — GUMROAD', 'gated · draft by default · runs on the mac worker');
+    const b = this.body();
+    const configured = s.channels?.gumroad?.configured === true;
+    const st = document.createElement('div');
+    st.className = 'note';
+    st.textContent = configured
+      ? '✓ configured — GUMROAD_ACCESS_TOKEN is set on the worker'
+      : 'not configured — set GUMROAD_ACCESS_TOKEN in ~/.alien-factory/worker.env and restart the worker';
+    if (!configured) st.style.color = 'var(--amber)';
+    b.appendChild(st);
+
+    // config editor → setGumroadConfig
+    const card = document.createElement('div');
+    card.className = 'acard';
+    card.appendChild(Object.assign(document.createElement('div'), { innerHTML: '<b>gate</b>' }));
+    const g = s.config.gumroad;
+    const inputs: Record<string, HTMLInputElement> = {};
+    const field = (label: string, key: string, type: 'number' | 'checkbox', val: number | boolean): void => {
+      const row = document.createElement('div');
+      row.className = 'kv';
+      const k = document.createElement('span');
+      k.textContent = label;
+      const inp = document.createElement('input');
+      inp.type = type;
+      if (type === 'checkbox') inp.checked = val as boolean;
+      else {
+        inp.value = String(val);
+        inp.min = '1';
+        inp.max = key === 'minScore' ? '10' : '20';
+        inp.style.width = '4em';
+      }
+      inputs[key] = inp;
+      row.append(k, inp);
+      card.appendChild(row);
+    };
+    field('min inspection score', 'minScore', 'number', g.minScore);
+    field('packs only', 'packsOnly', 'checkbox', g.packsOnly);
+    field('max drafts / day', 'maxDraftsPerDay', 'number', g.maxDraftsPerDay);
+    field('auto-publish (skip draft)', 'autoPublish', 'checkbox', g.autoPublish);
+    const save = document.createElement('button');
+    save.className = 'btn';
+    save.textContent = '[ save ]';
+    save.addEventListener('click', () =>
+      this.net.send({
+        type: 'setGumroadConfig',
+        config: {
+          minScore: Number(inputs.minScore.value) || g.minScore,
+          packsOnly: inputs.packsOnly.checked,
+          maxDraftsPerDay: Number(inputs.maxDraftsPerDay.value) || g.maxDraftsPerDay,
+          autoPublish: inputs.autoPublish.checked,
+        },
+      }),
+    );
+    card.appendChild(save);
+    b.appendChild(card);
+
+    const n = document.createElement('div');
+    n.className = 'note';
+    n.textContent = 'each ship builds a kit (zip + readme + license + cover/thumbnail) on the worker, uploads it, and creates a draft product. nothing ships without clicking it here.';
+    b.appendChild(n);
+
+    // shipped assets
+    const shipped = s.assets.filter((a) => a.channels?.gumroad && a.channels.gumroad.status !== 'none');
+    const h = document.createElement('div');
+    h.className = 'sec';
+    h.textContent = `shipped (${shipped.length})`;
+    b.appendChild(h);
+    if (!shipped.length) {
+      const none = document.createElement('div');
+      none.className = 'note';
+      none.textContent = 'nothing yet — ship from a listed asset\'s drawer';
+      b.appendChild(none);
+    }
+    for (const a of shipped) {
+      const row = document.createElement('div');
+      row.className = 'kv';
+      const k = document.createElement('a');
+      k.textContent = a.sku;
+      k.href = '#';
+      k.addEventListener('click', (e) => {
+        e.preventDefault();
+        this.open({ type: 'asset', id: a.sku });
+      });
+      const v = document.createElement('span');
+      const gg = a.channels!.gumroad!;
+      v.textContent = gg.status + (gg.shortUrl ? '' : gg.error ? ` — ${gg.error.slice(0, 60)}` : '');
+      if (gg.shortUrl) {
+        const l = document.createElement('a');
+        l.href = gg.shortUrl;
+        l.target = '_blank';
+        l.rel = 'noopener';
+        l.textContent = ' ↗';
+        v.appendChild(l);
+      }
+      row.append(k, v);
+      b.appendChild(row);
     }
   }
 

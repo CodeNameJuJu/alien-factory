@@ -109,6 +109,44 @@ export interface AssetListing {
   priceUsd: number;
 }
 
+// ---- sales channels (Gumroad) ------------------------------------------------
+//
+// The ONLY path off the mock market: a gated, per-asset, manual-approval
+// ship to a real Gumroad store (draft by default). Runs on the Mac worker —
+// the token lives in worker.env and is NEVER sent to clients; the state
+// only reports `channels.gumroad.configured`.
+
+export type GumroadShipStatus =
+  | 'none'
+  | 'building' // kit being written
+  | 'uploading' // multipart file upload in flight
+  | 'draft' // product created, published:false
+  | 'published' // /v2/products/:id/enable accepted
+  | 'error';
+
+export interface GumroadShip {
+  status: GumroadShipStatus;
+  productId?: string;
+  editUrl?: string;
+  shortUrl?: string;
+  at?: number;
+  /// last error (NEVER contains the token)
+  error?: string;
+  /// dry-run request plan (endpoints + non-secret params), for inspection
+  plan?: unknown;
+}
+
+export interface GumroadConfig {
+  /// minimum inspector score required to ship
+  minScore: number;
+  /// only multi-sprite packs may ship
+  packsOnly: boolean;
+  /// product creates per local day (Gumroad rate-limits creation too)
+  maxDraftsPerDay: number;
+  /// immediately /enable a new draft product
+  autoPublish: boolean;
+}
+
 export interface AssetSales {
   views: number;
   units: number;
@@ -136,6 +174,8 @@ export interface Asset {
   checks?: AssetChecks;
   inspection?: AssetInspection;
   listing?: AssetListing;
+  /// off-mock-market shipping state (Gumroad draft/publish)
+  channels?: { gumroad?: GumroadShip };
   sales: AssetSales;
   assignedTo?: string;
   createdAt: number;
@@ -366,6 +406,8 @@ export interface FactoryConfig {
   mode: 'research' | 'full';
   /// which market data the scout reads (mock stays the only sales target)
   marketSource: 'itch' | 'mock';
+  /// Gumroad channel gates (token itself is env-only, never here)
+  gumroad: GumroadConfig;
   itchScanMinutes: number;
   /// e.g. "game-assets/top-sellers/tag-pixel-art" (+ optional ":N" pages)
   itchFeeds: (string | { feed: string; pages: number })[];
@@ -399,6 +441,8 @@ export interface StateMessage {
   usage: UsageState;
   /// shift was auto-paused because a daily token cap was exceeded
   tokenCapHit: boolean;
+  /// sales channels — only booleans, no secrets
+  channels: { gumroad: { configured: boolean } };
 }
 
 export interface ErrorMessage {
@@ -449,4 +493,8 @@ export type ClientMessage =
   | { type: 'signIn' }
   | { type: 'setMode'; mode: 'research' | 'full' }
   | { type: 'setMarketSource'; source: 'itch' | 'mock' }
-  | { type: 'scanNow' };
+  | { type: 'scanNow' }
+  /// Gumroad channel — dryRun returns the request plan without uploading
+  | { type: 'shipGumroad'; sku: string; dryRun?: boolean }
+  | { type: 'publishGumroad'; sku: string }
+  | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> };

@@ -40,6 +40,11 @@ server/               # tsx (dev) / tsx watch (dev:watch), node:http + ws :4790
                       # listings, sales sim, reports/market-latest.md
   src/itch.ts         # itch.io research (READ ONLY): polite feed fetcher,
                       # cell parser, snapshot analyser, reports/itch-latest.md
+  src/channels/gumroad.ts # the ONLY real storefront: kit → multipart upload →
+                      # draft product → optional publish (fetch injected)
+  src/kit.ts          # zero-dep kit builder: zip writer (DEFLATE+CRC32),
+                      # README/LICENSE.txt, cover.png 1280x720 + thumbnail.png
+  src/png.ts          # server PNG codec + pixel buffer + 5x7 bitmap font
   src/parse.ts        # pure helpers: section/fenced-json parsers, inspection
                       # parser, permission path guard, meta.json checks
   src/prompts.ts      # every agent prompt template (structured block at the end)
@@ -70,6 +75,8 @@ client/               # Vite + TS, zero runtime deps
                       # + meta.json {kind:'pack', perItem, duplicateItems}
   STYLE.md            # house rules handed to every prompt
   assets/<sku>/       # gen.mjs + sheet.png + preview.png + meta.json + listing.json
+                      # + kit/ (<sku>.zip, README/LICENSE.txt, cover.png,
+                      # thumbnail.png) once the Gumroad channel builds it
   examples/<name>/    # seeded references: slime, carrot, potion + potion-pack
                       # (the PARAMETRIC pack reference — palette + param loop)
   reports/            # market-latest.md, trends-<n>.md (written by the scout)
@@ -86,9 +93,13 @@ client/               # Vite + TS, zero runtime deps
   rejects tool calls containing non-itch.io URLs in research mode.
 - **`mode: 'full'`** — the produce-and-sell pipeline below; with
   `marketSource: 'itch'` the scout reads `reports/itch-latest.md` instead
-  of the mock report. **Nothing is ever published**: the packer only
-  "lists" on the in-memory mock market. No code may upload to itch.io or
-  any marketplace without an explicit future decision.
+  of the mock report. The packer "lists" on the in-memory mock market;
+  real publishing exists ONLY through the gated **Gumroad channel**
+  (`server/src/channels/gumroad.ts`): explicit per-asset click in the
+  SHOP section, draft product by default, `autoPublish` opt-in, strict
+  ship gate (`shared/shop.ts`), daily draft cap, no duplicate shipment.
+  No other marketplace/upload code may be added without an explicit
+  future decision — and never to itch.io (research stays read-only).
 
 itch.io politeness (itch.ts): feeds are `game-assets/{top-sellers|top-rated|
 new-and-popular|newest}[/tag-x]` (validated), sequential requests ≥1.5 s
@@ -191,6 +202,7 @@ defaults:
   "dailyTokenCaps": null,
   "mode": "research",
   "marketSource": "itch",
+  "gumroad": { "minScore": 7, "packsOnly": true, "maxDraftsPerDay": 3, "autoPublish": false },
   "itchScanMinutes": 60,
   "itchFeeds": ["game-assets/top-sellers/tag-pixel-art:2", "..."]
 }

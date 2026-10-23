@@ -183,7 +183,9 @@ export function startDemo(apply: (s: StateMessage) => void): void {
       marketSource: 'itch',
       itchScanMinutes: 60,
       itchFeeds: [],
+      gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
     },
+    channels: { gumroad: { configured: true } },
     acp: { authenticated: true, models: [], modelGroups: [{ name: 'demo', values: [{ id: 'claude-opus-5-5-high', name: 'Opus' }, { id: 'swe-2-medium-lightning', name: 'Lightning' }] }], defaultModel: null, modes: [], alive: true },
     latestTrendReport: null,
     devinEnabled: true,
@@ -249,6 +251,18 @@ export function startDemo(apply: (s: StateMessage) => void): void {
       job('j-scout', 'scout', 'scout'); ev('scout dispatched to read the market');
       // a pack already riding the belt → shows the ×N badge + flip-through
       push(mkAsset('potion-shelf-8', 'on_conveyor', 'potions', 'smith-1', 8));
+      // a listed sprite with a gumroad draft → SHOP section + shop drawer
+      const demoShipped = mkAsset('potion-purple', 'listed', 'potions', 'smith-1');
+      demoShipped.listing = { title: 'Purple Potion', description: 'demo', tags: ['potions'], priceUsd: 2.49 };
+      demoShipped.channels = {
+        gumroad: {
+          status: 'draft',
+          productId: 'demo-abc123',
+          shortUrl: 'https://gumroad.com/l/demo',
+          at: Date.now() - 60_000,
+        },
+      };
+      push(demoShipped);
     },
     () => {
       doneJob('j-scout');

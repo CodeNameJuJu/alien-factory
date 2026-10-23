@@ -17,6 +17,7 @@ import {
   extractReport,
   inspectingRecoverySkus,
   JOB_AGENT_KIND,
+  localDayKey,
   parseDecisions,
   parseDemand,
   parseInspection,
@@ -28,6 +29,8 @@ import {
   urlsAllowed,
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
+import { loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
+import { shipEligibility } from '../../shared/shop.js';
 import {
   analyseSnapshot,
   getBackoffUntil,
@@ -1040,6 +1043,8 @@ export class FactoryManager extends EventEmitter {
       devinEnabled: !DEVIN_DISABLED,
       usage: this.usage,
       tokenCapHit: this.tokenCapHit,
+      // the token never leaves the process — clients only get a boolean
+      channels: { gumroad: { configured: !!process.env.GUMROAD_ACCESS_TOKEN } },
     };
   }
 
@@ -1095,7 +1100,92 @@ export class FactoryManager extends EventEmitter {
       case 'scanNow':
         await this.scanThenScout(true);
         return;
+      case 'shipGumroad':
+        await this.shipGumroad(msg.sku, msg.dryRun === true);
+        return;
+      case 'publishGumroad':
+        await this.publishGumroad(msg.sku);
+        return;
+      case 'setGumroadConfig':
+        this.setGumroadConfig(msg.config);
+        return;
     }
+  }
+
+  // ---- gumroad channel --------------------------------------------------------
+
+  /// products drafted/published/uploading today (the daily gate counts them)
+  private gumroadShippedToday(): number {
+    const today = localDayKey(Date.now());
+    return this.assets.filter((a) => {
+      const g = a.channels?.gumroad;
+      return (
+        g?.at &&
+        localDayKey(g.at) === today &&
+        g.status !== 'error' &&
+        g.status !== 'none'
+      );
+    }).length;
+  }
+
+  /// What the asset drawer's SHOP section shows — same gate the ship uses.
+  gumroadEligibility(sku: string): { ok: boolean; issues: string[] } {
+    const asset = this.asset(sku);
+    if (!asset) return { ok: false, issues: ['unknown sku'] };
+    return shipEligibility(asset, loadShipMeta(sku), this.config.gumroad, this.gumroadShippedToday());
+  }
+
+  private async shipGumroad(sku: string, dryRun: boolean): Promise<void> {
+    const asset = this.asset(sku);
+    if (!asset) {
+      this.event(`gumroad ship: unknown sku ${sku}`);
+      return;
+    }
+    asset.channels = { ...(asset.channels ?? {}) };
+    if (!dryRun) {
+      asset.channels.gumroad = { ...(asset.channels.gumroad ?? {}), status: 'building' };
+      this.changed();
+    }
+    const meta = loadShipMeta(sku);
+    if (!dryRun) {
+      asset.channels.gumroad = { ...(asset.channels.gumroad ?? {}), status: 'uploading' };
+      this.changed();
+    }
+    const res = await gumroadShip(
+      { asset, meta, cfg: this.config.gumroad, shippedToday: this.gumroadShippedToday(), dir: join(FACTORY_DIR, 'assets', sku) },
+      { dryRun },
+    );
+    asset.channels.gumroad = res.ship;
+    if (dryRun) {
+      this.event(`gumroad dry-run for ${sku} — request plan stored (nothing sent)`, undefined, sku);
+    } else if (res.ship.status === 'draft' || res.ship.status === 'published') {
+      this.event(`${sku} shipped to Gumroad — ${res.ship.status} ${res.ship.productId ?? ''}`, undefined, sku);
+    } else {
+      this.event(`gumroad ship failed for ${sku}: ${res.ship.error ?? 'unknown'}`, undefined, sku);
+    }
+    this.changed();
+  }
+
+  private async publishGumroad(sku: string): Promise<void> {
+    const asset = this.asset(sku);
+    if (!asset) return;
+    const ship = await gumroadPublish(asset);
+    asset.channels = { ...(asset.channels ?? {}), gumroad: ship };
+    if (ship.status === 'published') this.event(`${sku} published on Gumroad`, undefined, sku);
+    else this.event(`gumroad publish failed for ${sku}: ${ship.error ?? 'unknown'}`, undefined, sku);
+    this.changed();
+  }
+
+  private setGumroadConfig(raw: Record<string, unknown>): void {
+    const g = { ...this.config.gumroad };
+    if (typeof raw.minScore === 'number') g.minScore = Math.min(10, Math.max(1, Math.round(raw.minScore)));
+    if (typeof raw.maxDraftsPerDay === 'number') g.maxDraftsPerDay = Math.min(20, Math.max(1, Math.round(raw.maxDraftsPerDay)));
+    if (typeof raw.packsOnly === 'boolean') g.packsOnly = raw.packsOnly;
+    if (typeof raw.autoPublish === 'boolean') g.autoPublish = raw.autoPublish;
+    this.config.gumroad = g;
+    saveConfig(this.config);
+    this.event(`gumroad config updated (score≥${g.minScore}${g.packsOnly ? ', packs only' : ''}, ${g.maxDraftsPerDay}/day${g.autoPublish ? ', auto-publish' : ''})`);
+    this.changed();
   }
 
   private startShift(): void {

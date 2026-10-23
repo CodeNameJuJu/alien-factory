@@ -26,7 +26,14 @@ import {
 } from './itch.js';
 import { RateLimiter, passwordMatches, sessionToken, sessionValid, SESSION_COOKIE } from './auth.js';
 import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile } from './link.js';
-import type { ItchItem, ItchSnapshot } from '../../shared/protocol.js';
+import type { Asset, GumroadConfig, ItchItem, ItchSnapshot } from '../../shared/protocol.js';
+import { countClaims, listingConsistency, shipEligibility } from '../../shared/shop.js';
+import { crc32, decodePng, encodePng } from './png.js';
+import { buildKit, zipFiles } from './kit.js';
+import { publishGumroad, shipGumroad } from './channels/gumroad.js';
+import { execSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const FACTORY = '/factory';
 
@@ -739,4 +746,242 @@ test('writeIfDiffers rewrites lib when content changes, skips identical', async 
   assert.equal(writeIfDiffers(p, 'v1'), false);  // identical → skip
   assert.equal(writeIfDiffers(p, 'v2'), true);   // differs → update
   assert.equal(readFileSync(p, 'utf8'), 'v2');
+});
+
+// ---- gumroad shop gate -----------------------------------------------------
+
+const GCFG: GumroadConfig = { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false };
+
+const shipAsset = (over: Partial<Asset> = {}): Asset =>
+  ({
+    sku: 'p1',
+    title: 'Potion Pack',
+    tags: ['potions'],
+    size: 16,
+    frames: 4,
+    kind: 'pack',
+    items: 8,
+    orderBrief: 'b',
+    status: 'listed',
+    attempts: 1,
+    inspection: { verdict: 'PASS', score: 8, notes: 'ok' },
+    listing: { title: '8 Potions 16x16', description: 'eight animated potions', tags: ['potions'], priceUsd: 4.99 },
+    sales: { views: 0, units: 0, revenueUsd: 0 },
+    createdAt: 0,
+    updatedAt: 0,
+    ...over,
+  }) as Asset;
+
+const packMeta8 = { w: 16, h: 16, items: 8, frames: 32, perItem: Array.from({ length: 8 }, (_, i) => ({ name: `p${i}`, frames: 4 })) };
+
+test('countClaims: recognises the pack phrasings', () => {
+  const c = countClaims('set of 12 sprites, a 24-pack, x16 icons, 48 items');
+  const ns = c.map(([n]) => n).sort((a, b) => a - b);
+  assert.deepEqual(ns, [12, 16, 24, 48]);
+  // NxN is a size mention, not a count
+  assert.equal(countClaims('32x32 tiles').length, 0);
+});
+
+test('listingConsistency: the 600-items-on-a-sprite failure', () => {
+  const listing = { title: 'Item Icons 32x32 (600 RPG items)', description: 'huge pack' };
+  const issues = listingConsistency(listing, { w: 16, h: 16, frames: 4 });
+  assert.ok(issues.some((i) => /600/.test(i) && /1 item/.test(i)));
+  assert.ok(issues.some((i) => /32x32.*16x16/.test(i)));
+});
+
+test('listingConsistency: size mismatch, static "animated" claim, no listing', () => {
+  assert.ok(listingConsistency({ title: 'Icons 16x16', description: '' }, { w: 32, h: 32 }).some((i) => /16x16.*32x32/.test(i)));
+  assert.ok(listingConsistency({ title: 'Icons', description: 'animated!' }, { w: 16, h: 16, frames: 1 }).some((i) => /single frame/.test(i)));
+  assert.ok(listingConsistency(undefined, { w: 16 }).length > 0);
+  // a consistent pack passes clean
+  assert.deepEqual(
+    listingConsistency({ title: '8 Potions 16x16', description: 'animated' }, packMeta8),
+    [],
+  );
+});
+
+test('shipEligibility: score, packs-only, daily limit, already shipped, ok path', () => {
+  assert.ok(!shipEligibility(shipAsset({ inspection: { verdict: 'PASS', score: 5, notes: '' } }), packMeta8, GCFG, 0).ok);
+  assert.ok(shipEligibility(shipAsset({ kind: 'sprite', items: undefined }), packMeta8, GCFG, 0).issues.some((i) => /packs-only/.test(i)));
+  assert.ok(shipEligibility(shipAsset(), packMeta8, GCFG, 3).issues.some((i) => /daily/.test(i)));
+  assert.ok(
+    shipEligibility(shipAsset({ channels: { gumroad: { status: 'draft', productId: 'x' } } }), packMeta8, GCFG, 0).issues.some((i) => /already shipped/.test(i)),
+  );
+  assert.ok(shipEligibility(shipAsset(), packMeta8, GCFG, 0).ok);
+  // a listed sprite is fine when packsOnly is off
+  assert.ok(shipEligibility(shipAsset({ kind: 'sprite', items: undefined }), { w: 16, h: 16, frames: 4 }, { ...GCFG, packsOnly: false }, 0).ok);
+});
+
+// ---- kit / zip -------------------------------------------------------------
+
+test('crc32: known vector', () => {
+  assert.equal(crc32(Buffer.from('123456789')), 0xcbf43926);
+  assert.equal(crc32(Buffer.alloc(0)), 0);
+});
+
+test('png encode/decode round-trips', () => {
+  const data = new Uint8ClampedArray(4 * 4 * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = 200; data[i + 1] = 50; data[i + 2] = 90; data[i + 3] = 255;
+  }
+  const png = encodePng(4, 4, data);
+  const d = decodePng(png);
+  assert.equal(d.w, 4);
+  assert.equal(d.data[0], 200);
+});
+
+test('zipBytes: real unzip -t validates', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-zip-'));
+  const p = join(dir, 't.zip');
+  writeFileSync(p, zipFiles([
+    { name: 'README.txt', data: Buffer.from('hello world') },
+    { name: 'a/b.png', data: Buffer.from([1, 2, 3, 4]) },
+  ]));
+  const out = execSync(`unzip -t "${p}"`).toString();
+  assert.match(out, /No errors detected/);
+  const list = execSync(`unzip -l "${p}"`).toString();
+  assert.match(list, /README\.txt/);
+  assert.match(list, /a\/b\.png/);
+});
+
+function fakeAssetDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'af-kit-'));
+  const px = (c: [number, number, number]) => {
+    const d = new Uint8ClampedArray(16 * 16 * 4);
+    for (let i = 0; i < d.length; i += 4) { d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = 255; }
+    return encodePng(16, 16, d);
+  };
+  writeFileSync(join(dir, 'sheet.png'), px([220, 90, 90]));
+  writeFileSync(join(dir, 'preview.png'), px([220, 90, 90]));
+  writeFileSync(join(dir, 'atlas.json'), '{}');
+  mkdirSync(join(dir, 'items'));
+  writeFileSync(join(dir, 'items', 'p0.png'), px([90, 90, 220]));
+  return dir;
+}
+
+test('buildKit: zip, readme, license, cover + thumbnail', () => {
+  const dir = fakeAssetDir();
+  const kit = buildKit(dir, {
+    sku: 'test-pack', title: 'Potion Pack Vol 1', isPack: true, size: 16,
+    itemNames: ['p0'], framesPerItem: 4, fps: 4,
+  });
+  const zipPath = join(kit.dir, 'test-pack.zip');
+  assert.match(execSync(`unzip -t "${zipPath}"`).toString(), /No errors detected/);
+  const list = execSync(`unzip -l "${zipPath}"`).toString();
+  for (const f of ['sheet.png', 'preview.png', 'README.txt', 'LICENSE.txt', 'atlas.json', 'items/p0.png']) {
+    assert.match(list, new RegExp(f.replace('.', '\\.')));
+  }
+  const readme = readFileSync(join(kit.dir, 'README.txt'), 'utf8');
+  assert.match(readme, /Potion Pack Vol 1/);
+  assert.match(readme, /atlas\.json/);
+  const lic = readFileSync(join(kit.dir, 'LICENSE.txt'), 'utf8');
+  assert.match(lic, /Made with procedural code written by AI agents/);
+  assert.match(lic, /may not (?:re)?sell|not resell/i);
+  const cover = decodePng(readFileSync(join(kit.dir, 'cover.png')));
+  assert.equal(cover.w, 1280);
+  assert.equal(cover.h, 720);
+  const thumb = decodePng(readFileSync(join(kit.dir, 'thumbnail.png')));
+  assert.equal(thumb.w, 600);
+});
+
+// ---- gumroad api flow (stubbed fetch — no network) --------------------------
+
+interface StubCall { url: string; method: string; body?: string }
+
+function stubFetch(calls: StubCall[], etag = '"ETAG-abc"') {
+  return (url: string, init: { method?: string; body?: unknown } = {}) => {
+    const method = init.method ?? 'GET';
+    calls.push({ url, method, body: typeof init.body === 'string' ? init.body : undefined });
+    if (url.endsWith('/files/presign')) {
+      return Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        json: () => Promise.resolve({ success: true, upload_id: 'u1', key: 'k1', file_url: 'https://files.example/x.zip', parts: [{ part_number: 1, presigned_url: 'https://put.example/p1' }] }),
+      });
+    }
+    if (url === 'https://put.example/p1') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: (n: string) => (n === 'etag' ? etag : null) }, json: () => Promise.resolve({}) });
+    }
+    if (url.endsWith('/files/complete')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+    if (url.endsWith('/products') && method === 'POST') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod123', edit_url: 'https://gumroad.com/products/prod123/edit', short_url: 'https://gum.co/x' } }) });
+    }
+    if (url.includes('/enable')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+    if (url.endsWith('/files/abort')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+    return Promise.resolve({ ok: false, status: 500, headers: { get: () => null }, json: () => Promise.resolve({ success: false, message: 'nope' }) });
+  };
+}
+
+test('gumroad ship: presign → PUT(etag) → complete → create draft, no token leaks', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: stubFetch(calls) as never },
+  );
+  assert.equal(res.ship.status, 'draft');
+  assert.equal(res.ship.productId, 'prod123');
+  const seq = calls.map((c) => `${c.method} ${c.url}`);
+  assert.match(seq[0], /POST .*files\/presign/);
+  assert.equal(seq[1], 'PUT https://put.example/p1');
+  assert.match(seq[2], /POST .*files\/complete/);
+  assert.match(seq[3], /POST .*\/products$/);
+  assert.equal(calls.length, 4, 'no enable call when autoPublish is off');
+  const completeBody = calls[2].body!;
+  assert.match(completeBody, /parts\[0\]\[etag\]=%22ETAG-abc%22|parts%5B0%5D%5Betag%5D=%22ETAG-abc%22/);
+  const createBody = calls[3].body!;
+  assert.match(createBody, /files%5B%5D%5Burl%5D=https/);
+  assert.match(createBody, /price=499/);
+  assert.match(createBody, /native_type=digital/);
+  // the token rides in request bodies but NEVER in stored state or errors
+  assert.ok(!JSON.stringify(res.ship).includes('TESTTOKEN'));
+  assert.ok(calls.every((c) => !c.url.includes('TESTTOKEN')));
+});
+
+test('gumroad ship: autoPublish enables; gate failure preserves prior draft', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: { ...GCFG, autoPublish: true }, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: stubFetch(calls) as never },
+  );
+  assert.equal(res.ship.status, 'published');
+  assert.ok(calls.some((c) => c.url.endsWith('/products/prod123/enable') && c.method === 'PUT'));
+  // already-shipped → refused, and the draft record survives
+  const again = await shipGumroad(
+    {
+      asset: shipAsset({ channels: { gumroad: { status: 'draft', productId: 'prod123', shortUrl: 'https://gum.co/x' } } }),
+      meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir(),
+    },
+    { fetchImpl: stubFetch([]) as never },
+  );
+  assert.equal(again.ship.status, 'draft');
+  assert.equal(again.ship.productId, 'prod123');
+  assert.match(again.ship.error!, /already shipped/);
+});
+
+test('gumroad dry-run: exact request plan, zero fetch', async () => {
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { dryRun: true, fetchImpl: stubFetch(calls) as never },
+  );
+  assert.equal(calls.length, 0);
+  assert.ok(res.plan);
+  const plan = res.ship.plan as { steps: { method: string; url: string }[]; kit: { bytes: number } };
+  assert.equal(plan.steps[0].method, 'POST');
+  assert.match(plan.steps[0].url, /files\/presign/);
+  assert.ok(plan.steps.some((s) => s.url.includes('/products')));
+  assert.ok(plan.kit.bytes > 0);
+});
+
+test('publishGumroad: enable + refuse without a draft', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const asset = shipAsset({ channels: { gumroad: { status: 'draft', productId: 'prod9' } } });
+  const ship = await publishGumroad(asset, { fetchImpl: stubFetch(calls) as never });
+  assert.equal(ship.status, 'published');
+  assert.match(calls[0].url, /products\/prod9\/enable/);
+  const noDraft = await publishGumroad(shipAsset(), { fetchImpl: stubFetch(calls) as never });
+  assert.equal(noDraft.status, 'error');
+  assert.match(noDraft.error!, /no draft/);
 });

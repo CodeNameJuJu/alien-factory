@@ -388,6 +388,14 @@ body.no-crt #crt > div { display: none; }
   padding: 6px;
   margin-bottom: 6px;
 }
+.acard.v {
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+}
+.btnrow { display: flex; flex-wrap: wrap; gap: 6px; }
+.shopline { font-size: 11px; line-height: 1.5; }
+.shopline a { color: var(--amber); display: block; }
 .acard .athumb, .athumb {
   image-rendering: pixelated;
   background: var(--ink);

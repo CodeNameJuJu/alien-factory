@@ -5,7 +5,7 @@ import { drawAssetFrame } from './assets';
 import type { Agent, Asset, StateMessage } from '../../shared/protocol';
 
 export interface HudHooks {
-  onSelect: (sel: { type: 'overlord' | 'agent' | 'market' | 'gallery' | 'asset' | 'trends' | 'models'; id?: string }) => void;
+  onSelect: (sel: { type: 'overlord' | 'agent' | 'market' | 'gallery' | 'asset' | 'trends' | 'models' | 'shop'; id?: string }) => void;
 }
 
 /// ~12.3k / ~4.5M compact token counts
@@ -55,6 +55,7 @@ export class Hud {
       <span id="hud-note" class="hud-pill dim hud-x" style="display:none">agents run on the local Mac</span>
       <button class="btn hud-x" id="hud-signin" style="display:none">[ sign in ]</button>
       <button class="btn hud-x" id="hud-models">[ models ]</button>
+      <button class="btn hud-x" id="hud-shop">[ shop ]</button>
       <span class="hud-sep hud-x"></span>
       <button class="btn hud-x" id="hud-crt">[ crt: on ]</button>
       <button class="btn hud-x" id="hud-gallery">[ gallery ]</button>
@@ -98,7 +99,7 @@ export class Hud {
       else if ((e.target as HTMLElement).id === 'hud-gofull') this.net.send({ type: 'setMode', mode: 'full' });
       else if ((e.target as HTMLElement).id === 'hud-models' || (e.target as HTMLElement).id === 'hud-tok') {
         this.hooks.onSelect({ type: 'models' });
-      }
+      } else if ((e.target as HTMLElement).id === 'hud-shop') this.hooks.onSelect({ type: 'shop' });
     });
 
     if (localStorage.getItem('af-crt') === 'off') {

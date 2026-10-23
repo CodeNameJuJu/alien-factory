@@ -32,6 +32,7 @@ export const DEFAULT_CONFIG: FactoryConfig = {
   dailyTokenCaps: null,
   mode: 'research',
   marketSource: 'itch',
+  gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
   itchScanMinutes: 60,
   itchFeeds: [
     'game-assets/top-sellers/tag-pixel-art:2',
@@ -67,6 +68,7 @@ export function migrateConfig(raw: Record<string, unknown>): FactoryConfig {
   };
   merged.prices = { ...((rest.prices as FactoryConfig['prices']) ?? {}) };
   merged.dailyTokenCaps = (rest.dailyTokenCaps as FactoryConfig['dailyTokenCaps']) ?? null;
+  merged.gumroad = { ...DEFAULT_CONFIG.gumroad, ...(rest.gumroad as Partial<FactoryConfig['gumroad']> | undefined) };
   return merged;
 }
 
