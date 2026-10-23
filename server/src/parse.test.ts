@@ -1031,7 +1031,10 @@ function stubFetch(calls: StubCall[], etag = '"ETAG-abc"') {
     }
     if (url.endsWith('/files/complete')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
     if (url.endsWith('/products') && method === 'POST') {
-      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod123', edit_url: 'https://gumroad.com/products/prod123/edit', short_url: 'https://gum.co/x' } }) });
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod123', edit_url: 'https://gumroad.com/products/prod123/edit', short_url: 'https://gum.co/x', files: [{ id: 'file-1', name: 'x.zip' }] } }) });
+    }
+    if (/\/products\/[^/]+$/.test(url) && method === 'PUT') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
     }
     if (url.includes('/enable')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
     if (url.endsWith('/files/abort')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
@@ -1053,7 +1056,8 @@ test('gumroad ship: presign → PUT(etag) → complete → create draft, no toke
   assert.equal(seq[1], 'PUT https://put.example/p1');
   assert.match(seq[2], /POST .*files\/complete/);
   assert.match(seq[3], /POST .*\/products$/);
-  assert.equal(calls.length, 4, 'no enable call when autoPublish is off');
+  assert.match(seq[4], /PUT .*\/products\/prod123$/); // rich_content content page
+  assert.equal(calls.length, 5, 'no enable call when autoPublish is off');
   // JSON bodies carry real arrays (form-encoded parts[i][k] 400s on Rails)
   const completeBody = JSON.parse(calls[2].body!);
   assert.deepEqual(completeBody.parts, [{ part_number: 1, etag: '"ETAG-abc"' }]);
@@ -1089,6 +1093,109 @@ test('gumroad ship: autoPublish enables; gate failure preserves prior draft', as
   assert.equal(again.ship.status, 'draft');
   assert.equal(again.ship.productId, 'prod123');
   assert.match(again.ship.error!, /already shipped/);
+});
+
+test('gumroad content page: PUT embeds the create-response file id, no GET', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: stubFetch(calls) as never },
+  );
+  assert.equal(res.ship.status, 'draft');
+  assert.equal(res.ship.error, undefined);
+  const put = calls.find((c) => c.method === 'PUT' && /\/products\/prod123$/.test(c.url))!;
+  assert.ok(put, 'PUT /products/prod123 was made');
+  const rich = (JSON.parse(put.body!) as { rich_content: { title: string; description: { content: { type: string; attrs?: { id: string; uid: string } }[] } }[] }).rich_content;
+  assert.equal(rich[0].title, 'Download');
+  const embed = rich[0].description.content.find((b) => b.type === 'fileEmbed')!;
+  assert.equal(embed.attrs!.id, 'file-1'); // from the create response files[0]
+  assert.match(embed.attrs!.uid, /^[0-9a-f-]{36}$/);
+  // no GET of the product — the create response already carried files
+  assert.ok(!calls.some((c) => c.method === 'GET' && c.url.includes('/products/')));
+});
+
+test('gumroad content page: no files on create → GET product for the file id', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const f = (url: string, init: { method?: string; body?: unknown } = {}) => {
+    const method = init.method ?? 'GET';
+    calls.push({ url, method, body: typeof init.body === 'string' ? init.body : undefined });
+    if (url.endsWith('/files/presign')) {
+      return Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        json: () => Promise.resolve({ success: true, upload_id: 'u1', key: 'k1', file_url: 'https://files.example/x.zip', parts: [{ part_number: 1, presigned_url: 'https://put.example/p1' }] }),
+      });
+    }
+    if (url === 'https://put.example/p1') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => '"e1"' }, json: () => Promise.resolve({}) });
+    }
+    if (url.endsWith('/products') && method === 'POST') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod7' } }) }); // no files
+    }
+    if (/\/products\/prod7$/.test(url) && method === 'GET') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod7', files: [{ id: 'fid-from-get' }] } }) });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+  };
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: GCFG, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: f as never },
+  );
+  assert.equal(res.ship.error, undefined);
+  const seq = calls.map((c) => `${c.method} ${c.url}`);
+  const getIdx = seq.findIndex((s) => s === 'GET https://api.gumroad.com/v2/products/prod7');
+  const putIdx = seq.findIndex((s) => s === 'PUT https://api.gumroad.com/v2/products/prod7');
+  assert.ok(getIdx >= 0 && putIdx > getIdx, 'GET precedes the rich_content PUT');
+  const rich = (JSON.parse(calls[putIdx].body!) as { rich_content: { description: { content: { type: string; attrs?: { id: string } }[] } }[] }).rich_content;
+  const embed = rich[0].description.content.find((b) => b.type === 'fileEmbed')!;
+  assert.equal(embed.attrs!.id, 'fid-from-get');
+});
+
+test('gumroad content page: PUT failure keeps the draft and skips auto-publish', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const calls: StubCall[] = [];
+  const f = (url: string, init: { method?: string; body?: unknown } = {}) => {
+    const method = init.method ?? 'GET';
+    calls.push({ url, method, body: typeof init.body === 'string' ? init.body : undefined });
+    if (url.endsWith('/files/presign')) {
+      return Promise.resolve({
+        ok: true, status: 200, headers: { get: () => null },
+        json: () => Promise.resolve({ success: true, upload_id: 'u1', key: 'k1', file_url: 'https://files.example/x.zip', parts: [{ part_number: 1, presigned_url: 'https://put.example/p1' }] }),
+      });
+    }
+    if (url === 'https://put.example/p1') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => '"e1"' }, json: () => Promise.resolve({}) });
+    }
+    if (url.endsWith('/products') && method === 'POST') {
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true, product: { id: 'prod9', files: [{ id: 'fid-9' }] } }) });
+    }
+    if (/\/products\/prod9$/.test(url) && method === 'PUT') {
+      return Promise.resolve({ ok: false, status: 500, headers: { get: () => null }, json: () => Promise.resolve({ success: false, message: 'nope' }) });
+    }
+    return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+  };
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: { ...GCFG, autoPublish: true }, shippedToday: 0, dir: fakeAssetDir() },
+    { fetchImpl: f as never },
+  );
+  assert.equal(res.ship.status, 'draft');
+  assert.match(res.ship.error!, /content page failed/);
+  assert.match(res.ship.error!, /add the file in the gumroad Content tab/);
+  assert.ok(!calls.some((c) => c.url.includes('/enable')), 'a failed content page never publishes');
+});
+
+test('gumroad dry-run: plan includes the rich_content PUT step', async () => {
+  const res = await shipGumroad(
+    { asset: shipAsset(), meta: packMeta8, cfg: { ...GCFG, autoPublish: true }, shippedToday: 0, dir: fakeAssetDir() },
+    { dryRun: true, fetchImpl: stubFetch([]) as never },
+  );
+  const plan = res.ship.plan as { steps: { method: string; url: string; note?: string }[] };
+  const prodIdx = plan.steps.findIndex((s) => s.method === 'POST' && s.url.endsWith('/products'));
+  const putIdx = plan.steps.findIndex((s) => s.method === 'PUT' && s.url.endsWith('/products/<id>'));
+  const enableIdx = plan.steps.findIndex((s) => s.url.includes('/enable'));
+  assert.ok(putIdx > prodIdx, 'rich_content PUT follows POST /products');
+  assert.ok(enableIdx > putIdx, 'enable follows the content page PUT');
 });
 
 test('gumroad ship: failed part upload aborts the multipart with JSON', async () => {

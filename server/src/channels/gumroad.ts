@@ -9,11 +9,14 @@
 //     ApiDocumentation/Endpoints/Covers.tsx — covers take `url` (public URL
 //     only; "cannot be a private or pre-signed upload URL").
 //   .../Endpoints/Thumbnails.tsx — `signed_blob_id` = ActiveStorage direct
-//     upload id, which the public v2 API does NOT expose (it needs Rails'
-//     /rails/active_storage/direct_uploads, session-CSRF side). Our files
-//     aren't publicly reachable, so covers/thumbnail are a MANUAL step —
-//     kit/cover.png + kit/thumbnail.png are uploaded in Gumroad's editor.
+//     upload id, which the public v2 API does NOT expose. Covers/thumbnail
+//     instead take a public `url` — we attach them via signed relay URLs
+//     (/public/kit/*) in attachGumroadImages below.
+//   Buyer Content tab: POST /products leaves rich_content EMPTY, so
+//     shipGumroad PUTs a rich_content page whose fileEmbed references the
+//     product's files[0].id (verified against the live API, Oct 2026).
 import { existsSync, readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { FACTORY_DIR } from '../config.js';
 import { buildKit, type BuiltKit } from '../kit.js';
@@ -73,6 +76,17 @@ async function apiPost(
   return j;
 }
 
+async function apiGet(f: FetchLike, path: string): Promise<Record<string, unknown>> {
+  const res = await f(`${API}${path}`, {
+    headers: { authorization: `Bearer ${gumroadToken()}` },
+  });
+  const j: Record<string, unknown> = await res.json().catch(() => ({}));
+  if (!res.ok || j.success === false) {
+    throw new GumroadError(`gumroad GET ${path}: ${res.status} ${String(j.message ?? j.error ?? '').slice(0, 200)}`);
+  }
+  return j;
+}
+
 const esc = (s: string): string =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -115,6 +129,34 @@ function customSummary(asset: Asset, meta: ShipMeta | undefined): string {
   const atlas = asset.kind === 'pack' ? ' + atlas.json' : '';
   if (frames <= 1) return `${n} static ${asset.size}×${asset.size} sprite${n > 1 ? 's' : ''}, PNG${atlas}`;
   return `${n} ${asset.size}×${asset.size} sprite${n > 1 ? 's' : ''}, ${frames}-frame animation${frames > 1 ? 's' : ''}, PNG${atlas}`;
+}
+
+/// Buyer Content tab body: a rich_content page embedding the uploaded
+/// file — without it Gumroad renders an empty download page. `fileId` is
+/// product.files[0].id (from the create response or GET /products/:id).
+export function contentPages(
+  asset: Asset,
+  meta: ShipMeta | undefined,
+  fileId: string,
+  zipName: string,
+): unknown[] {
+  const n = meta?.items ?? asset.items ?? 1;
+  const note =
+    asset.kind === 'pack'
+      ? `Thanks for your purchase! Unzip ${zipName} for the ${n} PNG sprites, sheet.png + atlas.json, README and LICENSE.`
+      : `Thanks for your purchase! Unzip ${zipName} for the PNG sprite sheet, README and LICENSE.`;
+  return [
+    {
+      title: 'Download',
+      description: {
+        type: 'doc',
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: note }] },
+          { type: 'fileEmbed', attrs: { id: fileId, uid: randomUUID() } },
+        ],
+      },
+    },
+  ];
 }
 
 /// Everything shipGumroad needs resolved up front (testable without IO in
@@ -200,7 +242,13 @@ export async function shipGumroad(
         body: { upload_id: '<id>', key: '<key>', parts: [{ part_number: 1, etag: '"<etag from PUT>"' }] },
       },
       { method: 'POST', url: `${API}/products`, body: createBody },
-      ...(cfg.autoPublish ? [{ method: 'PUT', url: `${API}/products/<id>/enable` }] : []),
+      {
+        method: 'PUT',
+        url: `${API}/products/<id>`,
+        body: { rich_content: '<contentPages() — Download page + fileEmbed of files[0].id>' },
+        note: 'file id comes from the create response; GET /products/<id> first if it has no files',
+      },
+      ...(cfg.autoPublish ? [{ method: 'PUT', url: `${API}/products/<id>/enable`, note: 'skipped if the content page fails' }] : []),
       {
         method: 'POST',
         url: `${API}/products/<id>/covers`,
@@ -259,7 +307,13 @@ export async function shipGumroad(
 
     createBody.files = [{ url: String(presign.file_url) }];
     const created = await apiPost(f, '/products', createBody);
-    const product = (created.product ?? created) as { id?: string; product_id?: string; edit_url?: string; short_url?: string };
+    const product = (created.product ?? created) as {
+      id?: string;
+      product_id?: string;
+      edit_url?: string;
+      short_url?: string;
+      files?: { id?: string }[];
+    };
     const productId = String(product.id ?? product.product_id ?? '');
     const ship: GumroadShip = {
       status: 'draft',
@@ -268,12 +322,34 @@ export async function shipGumroad(
       shortUrl: typeof product.short_url === 'string' ? product.short_url : undefined,
       at: Date.now(),
     };
-    if (cfg.autoPublish && productId) {
+    // Content tab: embed the uploaded file in rich_content or buyers get a
+    // blank download page. Non-fatal — a draft with a missing page beats a
+    // published product with no download.
+    let contentFailed = false;
+    if (productId) {
+      try {
+        let fileId = product.files?.[0]?.id;
+        if (!fileId) {
+          const got = await apiGet(f, `/products/${encodeURIComponent(productId)}`);
+          const p = (got.product ?? got) as { files?: { id?: string }[] };
+          fileId = p.files?.[0]?.id;
+        }
+        if (!fileId) throw new GumroadError('product has no files');
+        await apiPost(f, `/products/${encodeURIComponent(productId)}`, {
+          rich_content: contentPages(asset, meta, fileId, kit.zipName),
+        }, 'PUT');
+      } catch (err) {
+        contentFailed = true;
+        ship.error = `draft created but content page failed: ${(err as Error).message.slice(0, 200)} — add the file in the gumroad Content tab`;
+      }
+    }
+    if (cfg.autoPublish && productId && !contentFailed) {
       try {
         await apiPost(f, `/products/${encodeURIComponent(productId)}/enable`, {}, 'PUT');
         ship.status = 'published';
       } catch (err) {
-        ship.error = `draft created but auto-publish failed: ${(err as Error).message.slice(0, 200)}`;
+        const msg = `draft created but auto-publish failed: ${(err as Error).message.slice(0, 200)}`;
+        ship.error = ship.error ? `${ship.error}; ${msg}` : msg;
       }
     }
     // best-effort: covers + thumbnail via signed public relay URLs — a
