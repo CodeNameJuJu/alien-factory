@@ -508,7 +508,7 @@ test('migrateConfig drops the old model keys and merges nested maps', async () =
   assert.equal(c.models.overlord, 'claude-sonnet-5-5-medium'); // old value ignored
   assert.equal(c.models.scout, 'claude-haiku-5-5-medium');
   assert.equal(c.models.inspector, 'claude-haiku-5-5-low');
-  assert.equal(c.models.packer, 'swe-1-6-fast');
+  assert.equal(c.models.packer, 'swe-1-6');
   assert.equal(c.models.smith, 'custom-smith'); // partial map merged
   assert.deepEqual(c.sessionJobLimit, { scout: 1, smith: 1, inspector: 4, packer: 6 });
   assert.equal(c.dailyTokenCaps, null);
@@ -605,4 +605,23 @@ test('usageCostUsd prices token buckets, null when unpriced', async () => {
   const cost = usageCostUsd(c, { inPerM: 3, cachedReadPerM: 0.3, cachedWritePerM: 3.75, outPerM: 15 });
   assert.ok(Math.abs(cost! - (3 + 0.15 + 0.375 + 3.75)) < 1e-9);
   assert.equal(usageCostUsd(c, undefined), null);
+});
+
+test('resolveModel: wanted id wins, else session default flagged as mismatch', async () => {
+  const { resolveModel } = await import('./parse.js');
+  const offered = [
+    { id: 'swe-1-6', name: 'SWE 1.6' },
+    { id: 'swe-2-medium-lightning', name: 'Lightning' },
+  ];
+  assert.deepEqual(resolveModel('swe-2-medium-lightning', offered, 'swe-1-6'), {
+    id: 'swe-2-medium-lightning', name: 'Lightning', mismatch: false,
+  });
+  // stale config id (removed from Devin) → session default + mismatch flag
+  assert.deepEqual(resolveModel('swe-1-7-lightning-medium', offered, 'swe-1-6'), {
+    id: 'swe-1-6', name: 'SWE 1.6', mismatch: true,
+  });
+  // fallback id itself unknown → pass through with mismatch
+  assert.deepEqual(resolveModel('gone', offered, 'also-gone'), {
+    id: 'also-gone', name: 'also-gone', mismatch: true,
+  });
 });

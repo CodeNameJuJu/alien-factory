@@ -22,6 +22,7 @@ import {
   pickSmith,
   opportunitiesToCandidates,
   recordUsage,
+  resolveModel,
   shouldQueueScout,
   urlsAllowed,
 } from './parse.js';
@@ -503,12 +504,17 @@ export class FactoryManager extends EventEmitter {
       if (want) {
         const r = await this.acp.setConfig(sessionId, modelOpt.id ?? 'model', want.id);
         agent.modelName = want.name;
+        agent.modelMismatch = undefined;
         const cur = configOption(r?.configOptions, 'model');
         const found = offered.find((v) => v.id === cur?.currentValue);
         if (found) agent.modelName = found.name;
       } else {
-        const found = offered.find((v) => v.id === modelOpt.currentValue);
-        if (found) agent.modelName = found.name;
+        // configured model isn't offered by this Devin build — flag it
+        const fb = resolveModel(wantModel, offered, modelOpt.currentValue ?? wantModel);
+        agent.modelName = fb.name;
+        agent.modelMismatch = { want: wantModel, using: fb.name };
+        this.push(agent, 'system', `model ${wantModel} not offered — using ${fb.name}`);
+        this.event(`model ${wantModel} not offered by Devin — ${agent.name} is using ${fb.name}`, agent.id);
       }
       agent.model = want?.id ?? modelOpt.currentValue ?? wantModel;
     }
@@ -1152,6 +1158,7 @@ export class FactoryManager extends EventEmitter {
       if (a.kind !== role) continue;
       a.model = model;
       a.modelName = model;
+      a.modelMismatch = undefined;
       // applies to new sessions: reset idle ones so their next job reconfigures
       if (a.state === 'idle' || a.state === 'offline') {
         a.sessionId = null;

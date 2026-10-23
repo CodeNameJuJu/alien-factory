@@ -40,6 +40,8 @@ export interface Agent {
   transcript: TranscriptEntry[];
   /// Raw usage_update payload (shape unknown — shown as JSON in the UI).
   lastUsage?: unknown;
+  /// configured model wasn't offered by Devin — the session fell back
+  modelMismatch?: { want: string; using: string };
 }
 
 // ---- candidates -------------------------------------------------------------

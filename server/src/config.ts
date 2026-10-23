@@ -18,9 +18,9 @@ export const DEFAULT_CONFIG: FactoryConfig = {
   models: {
     overlord: 'claude-sonnet-5-5-medium',
     scout: 'claude-haiku-5-5-medium',
-    smith: 'swe-1-7-lightning-medium',
+    smith: 'swe-2-medium-lightning',
     inspector: 'claude-haiku-5-5-low',
-    packer: 'swe-1-6-fast',
+    packer: 'swe-1-6',
   },
   smiths: 3,
   maxOverlordTurnsPerHour: 6,

@@ -163,9 +163,9 @@ defaults:
   "models": {
     "overlord": "claude-sonnet-5-5-medium",
     "scout": "claude-haiku-5-5-medium",
-    "smith": "swe-1-7-lightning-medium",
+    "smith": "swe-2-medium-lightning",
     "inspector": "claude-haiku-5-5-low",
-    "packer": "swe-1-6-fast"
+    "packer": "swe-1-6"
   },
   "smiths": 3,
   "maxOverlordTurnsPerHour": 6,
@@ -185,6 +185,10 @@ defaults:
 Model ids are ACP `model` config values, set per role via `[ models ]` or
 `setModels { role, model }`; if a configured id isn't offered, the session
 default is used. `setCaps { overlord?, workers? }` adjusts daily caps.
+Model ids come and go with Devin releases — when a configured id is not
+offered, the agent falls back to the session default and gets a
+`modelMismatch` flag (amber warning in the MODELS drawer and the agent's
+drawer, plus a factory event); check `[ models ]` for warnings.
 
 Model ids are ACP `model` config values; if a configured id isn't offered,
 the session default is used. Data dir `~/.alien-factory/`: `state.json`,

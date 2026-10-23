@@ -117,7 +117,15 @@ export class Drawers {
       case 'trends':
         return JSON.stringify([s.itch.lastScanAt, s.itch.scanning, s.itch.error, s.itch.analysis, s.trendReports.length]);
       case 'models':
-        return JSON.stringify([s.config.models, s.config.dailyTokenCaps, s.usage, s.acp.modelGroups.length, s.devinEnabled]);
+        return JSON.stringify([
+          s.config.models,
+          s.config.dailyTokenCaps,
+          s.usage,
+          s.acp.modelGroups.length,
+          s.acp.models.length,
+          s.devinEnabled,
+          s.agents.map((a) => a.modelMismatch?.want),
+        ]);
       case 'gallery':
         return this.galleryFilter + JSON.stringify(s.assets.map((a) => [a.sku, a.status]));
     }
@@ -344,6 +352,13 @@ export class Drawers {
     this.head(a.name, `${a.kind} · ${a.modelName}`);
     const b = this.body();
     this.kv(b, 'model', a.model);
+    if (a.modelMismatch) {
+      const w = document.createElement('div');
+      w.className = 'note';
+      w.style.color = 'var(--amber)';
+      w.textContent = `⚠ ${a.modelMismatch.want} not offered by Devin — using ${a.modelMismatch.using}`;
+      b.appendChild(w);
+    }
     this.kv(b, 'state', a.state);
     this.kv(b, 'status', a.statusLine);
     this.kv(b, 'jobs in session', String(a.jobsInSession));
@@ -467,6 +482,16 @@ export class Drawers {
     this.head('MODELS & USAGE', 'approx — see logs/usage.jsonl');
     const b = this.body();
     const roles: AgentKind[] = ['overlord', 'scout', 'smith', 'inspector', 'packer'];
+    // what this Devin build actually offers — empty when Devin's offline,
+    // so only flag misses when we have a real list
+    const offered = new Set(s.acp.models.map((m) => m.id));
+    const warn = (card: HTMLElement, text: string) => {
+      const w = document.createElement('div');
+      w.className = 'note';
+      w.style.color = 'var(--amber)';
+      w.textContent = `⚠ ${text}`;
+      card.appendChild(w);
+    };
 
     for (const role of roles) {
       const card = document.createElement('div');
@@ -484,7 +509,7 @@ export class Drawers {
         for (const v of g.values) {
           const o = document.createElement('option');
           o.value = v.id;
-          o.textContent = v.name;
+          o.textContent = offered.size && !offered.has(v.id) ? `${v.name} ⚠` : v.name;
           og.appendChild(o);
         }
         sel.appendChild(og);
@@ -499,6 +524,10 @@ export class Drawers {
       sel.value = cur;
       sel.addEventListener('change', () => this.net.send({ type: 'setModels', role, model: sel.value }));
       card.appendChild(sel);
+      if (cur && offered.size && !offered.has(cur)) warn(card, `${cur} not offered by this Devin`);
+      for (const a of s.agents.filter((x) => x.kind === role && x.modelMismatch)) {
+        warn(card, `${a.name} is using ${a.modelMismatch!.using}`);
+      }
 
       const u = s.usage?.byRole?.[role];
       if (u) {

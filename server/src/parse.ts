@@ -492,3 +492,20 @@ export function usageCostUsd(c: UsageCounts, prices: ModelPrices | undefined): n
      c.cachedWrite * prices.cachedWritePerM + c.output * prices.outPerM) / 1e6
   );
 }
+
+// ---- model fallback ---------------------------------------------------------------
+
+/// Pick the ACP model for an agent: the configured id when Devin offers it,
+/// else the session's current/default id. `mismatch` flags the fallback so
+/// the UI can warn that the configured model isn't (or no longer is)
+/// available.
+export function resolveModel(
+  want: string,
+  offered: { id: string; name: string }[],
+  fallbackId: string,
+): { id: string; name: string; mismatch: boolean } {
+  const hit = offered.find((v) => v.id === want);
+  if (hit) return { id: hit.id, name: hit.name, mismatch: false };
+  const fb = offered.find((v) => v.id === fallbackId);
+  return { id: fb?.id ?? fallbackId, name: fb?.name ?? fallbackId, mismatch: true };
+}
