@@ -975,7 +975,29 @@ export class Drawers {
         pub.addEventListener('click', () => this.net.send({ type: 'publishGumroad', sku: a.sku }));
         row.appendChild(pub);
       }
+      if (g?.productId) {
+        const img = document.createElement('button');
+        img.className = 'btn';
+        img.textContent = '[ add images ]';
+        img.disabled = !configured;
+        img.title = 'attach kit cover/thumbnail/gallery/gif via signed relay urls';
+        img.addEventListener('click', () => this.net.send({ type: 'attachGumroadImages', sku: a.sku }));
+        row.appendChild(img);
+      }
       card.appendChild(row);
+      if (g?.images) {
+        const im = document.createElement('div');
+        im.className = 'note';
+        im.textContent = `images: ${g.images.covers} cover(s)${g.images.thumbnail ? ' + thumbnail' : ''} · ${new Date(g.images.at).toLocaleString()}`;
+        card.appendChild(im);
+      }
+      if (g?.imagesError) {
+        const im = document.createElement('div');
+        im.className = 'note';
+        im.style.color = 'var(--amber)';
+        im.textContent = `⚠ images: ${g.imagesError}`;
+        card.appendChild(im);
+      }
       if (g?.error && (g.status === 'error' || elig.ok)) {
         const e = document.createElement('div');
         e.className = 'note';

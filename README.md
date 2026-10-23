@@ -66,11 +66,22 @@ only ever runs on the Mac worker (never on the Railway relay).
 frames/fps, atlas usage) + `LICENSE.txt` (free for personal & commercial
 use, modify freely, no attribution, may not resell the assets themselves;
 includes "Made with procedural code written by AI agents and reviewed
-before release."). `kit/cover.png` (1280×720) and `kit/thumbnail.png`
-(600×600) are generated too — the public v2 API only accepts *publicly
-reachable* cover URLs (and a thumbnail `signed_blob_id` it can't produce),
-so attach those two by hand in the Gumroad product editor. The zip itself
-stays on the Mac.
+before release."). The zip itself stays on the Mac.
+
+**Product images** — the kit also draws `cover.png` (1280×720),
+`thumbnail.png` (600×600), `gallery-1.png` (every item large with names)
+and `preview.gif` (an animated grid, only when items animate). Gumroad's
+covers/thumbnail API only accepts *publicly reachable* URLs, so the relay
+exposes exactly one unauthenticated route —
+`GET /public/kit/<sku>/<file>?exp&sig` — where `file` is one of those five
+names and `sig` is an HMAC-SHA256 of the worker key over
+`kit:<sku>:<file>:<exp>`, valid for at most 48 h. After a draft is created
+(or via `[ add images ]` on an existing product) the worker signs URLs for
+the synced kit files and posts them to `POST /v2/products/:id/covers`
+(`preview.gif`, `cover.png`, `gallery-1.png` — first is the main cover) and
+`/thumbnail`. Needs the worker linked to the Railway relay
+(`ALIEN_FACTORY_RELAY_URL` + `ALIEN_FACTORY_WORKER_KEY`); without a relay
+the step is skipped with a note and the draft stays a draft.
 
 ## Run
 

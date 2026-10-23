@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { FACTORY_DIR } from '../config.js';
 import { buildKit, type BuiltKit } from '../kit.js';
+import { relayHttpBase, signKitUrl } from '../link.js';
 import { shipEligibility, type ShipMeta } from '../../../shared/shop.js';
 import type { Asset, GumroadConfig, GumroadShip } from '../../../shared/protocol.js';
 
@@ -87,11 +88,11 @@ function itemNamesOf(asset: Asset, meta: ShipMeta | undefined): string[] {
 function descriptionHtml(asset: Asset, meta: ShipMeta | undefined): string {
   const isPack = asset.kind === 'pack';
   const n = meta?.items ?? asset.items ?? 1;
-  const frames = isPack ? (meta?.perItem?.[0]?.frames ?? asset.frames) : (meta?.frames ?? asset.frames);
+  const frames = framesForCopy(asset, meta);
   const items = itemNamesOf(asset, meta);
   const lines = [
     `<p>${esc(asset.listing?.description ?? asset.title)}</p>`,
-    `<p><b>${n}</b> ${isPack ? 'items' : 'sprite'} — ${asset.size}×${asset.size}px, ${frames}-frame animation${frames > 1 ? 's' : ''}, transparent PNG${isPack ? ' + atlas.json' : ''}.</p>`,
+    `<p><b>${n}</b> ${motion(frames)} ${asset.size}×${asset.size}px sprite${n > 1 ? 's' : ''}, transparent PNG${isPack ? ' + atlas.json' : ''}.</p>`,
   ];
   if (items.length) lines.push(`<p>Items: ${esc(items.join(', '))}</p>`);
   lines.push(
@@ -101,10 +102,18 @@ function descriptionHtml(asset: Asset, meta: ShipMeta | undefined): string {
   return lines.join('\n');
 }
 
+/// max frames across items (pack) or the sprite's frames — drives copy
+function framesForCopy(asset: Asset, meta: ShipMeta | undefined): number {
+  return asset.kind === 'pack' ? (meta?.perItem?.[0]?.frames ?? asset.frames) : (meta?.frames ?? asset.frames);
+}
+
+const motion = (frames: number): string => (frames > 1 ? `${frames}-frame animations` : 'static');
+
 function customSummary(asset: Asset, meta: ShipMeta | undefined): string {
   const n = meta?.items ?? asset.items ?? 1;
-  const frames = asset.kind === 'pack' ? (meta?.perItem?.[0]?.frames ?? asset.frames) : (meta?.frames ?? asset.frames);
+  const frames = framesForCopy(asset, meta);
   const atlas = asset.kind === 'pack' ? ' + atlas.json' : '';
+  if (frames <= 1) return `${n} static ${asset.size}×${asset.size} sprite${n > 1 ? 's' : ''}, PNG${atlas}`;
   return `${n} ${asset.size}×${asset.size} sprite${n > 1 ? 's' : ''}, ${frames}-frame animation${frames > 1 ? 's' : ''}, PNG${atlas}`;
 }
 
@@ -152,7 +161,7 @@ export function loadMeta(sku: string): ShipMeta | undefined {
 /// twice. Errors land on ship.error — the token is never in any message.
 export async function shipGumroad(
   req: ShipRequest,
-  opts: { dryRun?: boolean; fetchImpl?: FetchLike } = {},
+  opts: { dryRun?: boolean; fetchImpl?: FetchLike; syncHook?: () => void } = {},
 ): Promise<ShipResult> {
   const { asset, meta, cfg } = req;
   const prev = asset.channels?.gumroad;
@@ -193,9 +202,15 @@ export async function shipGumroad(
       { method: 'POST', url: `${API}/products`, body: createBody },
       ...(cfg.autoPublish ? [{ method: 'PUT', url: `${API}/products/<id>/enable` }] : []),
       {
-        method: 'manual',
-        url: 'gumroad.com/products',
-        note: 'attach kit/cover.png + kit/thumbnail.png in the editor — the API only accepts public URLs or a signed_blob_id the v2 API cannot produce',
+        method: 'POST',
+        url: `${API}/products/<id>/covers`,
+        body: { url: '<signed public relay url — preview.gif, then cover.png, gallery-1.png>' },
+      },
+      { method: 'POST', url: `${API}/products/<id>/thumbnail`, body: { url: '<signed public relay url — thumbnail.png>' } },
+      {
+        method: 'note',
+        url: '',
+        note: 'images attach automatically when the worker is linked to the Railway relay (signed /public/kit URLs); without a relay attach kit/*.png by hand in the gumroad editor',
       },
     ],
     kit: { zip: kit.zipName, bytes: zip.length, files: kit.files },
@@ -261,6 +276,13 @@ export async function shipGumroad(
         ship.error = `draft created but auto-publish failed: ${(err as Error).message.slice(0, 200)}`;
       }
     }
+    // best-effort: covers + thumbnail via signed public relay URLs — a
+    // failure lands in imagesError and never blocks the draft
+    const withImages = await attachGumroadImages(
+      { asset: { ...asset, channels: { ...(asset.channels ?? {}), gumroad: ship } }, meta, dir: req.dir, kit },
+      { fetchImpl: opts.fetchImpl, syncHook: opts.syncHook },
+    );
+    Object.assign(ship, { images: withImages.images, imagesError: withImages.imagesError });
     return { ship, kit };
   } catch (err) {
     if (uploadId) {
@@ -271,6 +293,90 @@ export async function shipGumroad(
       }
     }
     return { ship: { status: 'error', error: (err as Error).message.slice(0, 300) }, kit };
+  }
+}
+
+export interface AttachOpts {
+  fetchImpl?: FetchLike;
+  /// pushes kit files to the relay so the signed URLs go live (worker-link)
+  syncHook?: () => void;
+  pollMs?: number;
+  pollIntervalMs?: number;
+}
+
+/// Attach kit images to a product that already exists on Gumroad, via
+/// signed public URLs on the relay. Needs ALIEN_FACTORY_RELAY_URL +
+/// ALIEN_FACTORY_WORKER_KEY on the worker. Non-fatal: problems land in
+/// ship.imagesError and the draft stays a draft.
+export async function attachGumroadImages(
+  req: { asset: Asset; meta: ShipMeta | undefined; dir: string; kit?: BuiltKit },
+  opts: AttachOpts = {},
+): Promise<GumroadShip> {
+  const cur = req.asset.channels?.gumroad;
+  if (!cur?.productId) {
+    return { ...(cur ?? { status: 'error' }), imagesError: 'no product to attach images to' } as GumroadShip;
+  }
+  const relayUrl = process.env.ALIEN_FACTORY_RELAY_URL ?? '';
+  const key = process.env.ALIEN_FACTORY_WORKER_KEY ?? '';
+  if (!relayUrl || !key) {
+    return { ...cur, imagesError: 'images need the Railway relay for public URLs — attach kit/*.png by hand' };
+  }
+  if (!gumroadToken()) {
+    return { ...cur, imagesError: 'GUMROAD_ACCESS_TOKEN not set' };
+  }
+  const kit = req.kit ?? buildKit(req.dir, kitSpec(req.asset, req.meta));
+  const base = relayHttpBase(relayUrl);
+  const exp = Math.floor(Date.now() / 1000) + 24 * 3600;
+  const urlFor = (file: string) => signKitUrl(key, base, req.asset.sku, file, exp);
+  const wanted = ['preview.gif', 'cover.png', 'gallery-1.png'];
+  const covers = wanted.filter((x) => existsSync(join(kit.dir, x)));
+  const f = opts.fetchImpl ?? realFetch;
+  try {
+    // kit files reach the relay via the normal asset sync — kick it, then
+    // wait until the first signed URL is actually reachable
+    opts.syncHook?.();
+    if (covers.length || existsSync(join(kit.dir, 'thumbnail.png'))) {
+      const deadline = Date.now() + (opts.pollMs ?? 30_000);
+      const first = urlFor(covers[0] ?? 'thumbnail.png');
+      let ok = false;
+      while (Date.now() < deadline && !ok) {
+        try {
+          ok = (await f(first, { method: 'GET' })).ok;
+        } catch {
+          ok = false;
+        }
+        if (!ok) await new Promise((r) => setTimeout(r, opts.pollIntervalMs ?? 2_000));
+      }
+      if (!ok) return { ...cur, imagesError: `kit images never became reachable at ${base} — is the worker linked?` };
+    }
+    const errs: string[] = [];
+    let done = 0;
+    for (const file of covers) {
+      try {
+        await apiPost(f, `/products/${encodeURIComponent(cur.productId)}/covers`, { url: urlFor(file) });
+        done++;
+      } catch (err) {
+        errs.push(`${file}: ${(err as Error).message.slice(0, 120)}`);
+      }
+    }
+    let thumbnail = false;
+    if (existsSync(join(kit.dir, 'thumbnail.png'))) {
+      try {
+        await apiPost(f, `/products/${encodeURIComponent(cur.productId)}/thumbnail`, { url: urlFor('thumbnail.png') });
+        thumbnail = true;
+      } catch (err) {
+        errs.push(`thumbnail: ${(err as Error).message.slice(0, 120)}`);
+      }
+    }
+    const out: GumroadShip = {
+      ...cur,
+      images: { covers: done, thumbnail, at: Date.now() },
+    };
+    if (errs.length) out.imagesError = errs.join('; ');
+    else delete out.imagesError;
+    return out;
+  } catch (err) {
+    return { ...cur, imagesError: (err as Error).message.slice(0, 200) };
   }
 }
 

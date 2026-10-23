@@ -25,12 +25,13 @@ import {
   scanAllowed, scanFeeds, setBackoffUntil, validateFeeds, FEED_RE,
 } from './itch.js';
 import { RateLimiter, passwordMatches, sessionToken, sessionValid, SESSION_COOKIE } from './auth.js';
-import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile } from './link.js';
+import { bearerValid, FORWARDABLE, mergeRelayState, parseAssetMsg, parseEnvFile, relayHttpBase, signKitUrl, verifyKitSig } from './link.js';
 import type { Asset, GumroadConfig, ItchItem, ItchSnapshot } from '../../shared/protocol.js';
 import { countClaims, listingConsistency, shipEligibility } from '../../shared/shop.js';
 import { crc32, decodePng, encodePng } from './png.js';
-import { buildKit, zipFiles } from './kit.js';
-import { publishGumroad, shipGumroad } from './channels/gumroad.js';
+import { buildKit, drawCover, kitSubtitle, zipFiles, type KitItem, type KitSpec } from './kit.js';
+import { publishGumroad, shipGumroad, attachGumroadImages } from './channels/gumroad.js';
+import { encodeGif } from './gif.js';
 import { execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -925,6 +926,92 @@ test('buildKit: zip, readme, license, cover + thumbnail', () => {
   assert.equal(thumb.w, 600);
 });
 
+test('drawCover: oversized preview is downscaled, accent bars survive', () => {
+  const big = new Uint8ClampedArray(700 * 700 * 4);
+  for (let i = 0; i < big.length; i += 4) {
+    big[i] = 220; big[i + 1] = 90; big[i + 2] = 90; big[i + 3] = 255;
+  }
+  const out = decodePng(drawCover({
+    w: 600, h: 600, title: 'Oversized Art', subtitle: 'x',
+    preview: encodePng(700, 700, big),
+  }));
+  assert.equal(out.w, 600);
+  assert.equal(out.h, 600);
+  accentRowsIntact(out);
+});
+
+const solidItem = (rgb: [number, number, number], size = 32): KitItem => {
+  const data = new Uint8ClampedArray(size * size * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = rgb[0]; data[i + 1] = rgb[1]; data[i + 2] = rgb[2]; data[i + 3] = 255;
+  }
+  return { name: 'it', frames: [{ w: size, h: size, data }] };
+};
+
+const accentRowsIntact = (out: { w: number; h: number; data: Uint8ClampedArray }) => {
+  const ACCENT = [92, 242, 200];
+  for (const yRange of [[0, 4], [out.h - 4, out.h]]) {
+    for (let y = yRange[0]; y < yRange[1]; y++) {
+      for (let x = 0; x < out.w; x++) {
+        const i = (y * out.w + x) * 4;
+        assert.deepEqual([out.data[i], out.data[i + 1], out.data[i + 2]], ACCENT, `pixel ${x},${y}`);
+      }
+    }
+  }
+};
+
+test('drawCover: item grid scales up and keeps the accent bars', () => {
+  // 16 distinct-coloured 32x32 items — the grid should upscale ~4x on 1280x720
+  const items = Array.from({ length: 16 }, (_, i) =>
+    solidItem([(i * 37) % 256, 40 + ((i * 61) % 200), (i * 91) % 256]));
+  const cover = decodePng(drawCover({
+    w: 1280, h: 720, title: 'Icon Pack', subtitle: 'x', items,
+  }));
+  assert.equal(cover.w, 1280);
+  assert.equal(cover.h, 720);
+  accentRowsIntact(cover);
+  // k>=3 proof: some row contains ≥96 consecutive pixels of item 0's colour
+  const [r, g, b] = [0, 40, 0];
+  let bestRun = 0;
+  for (let y = 0; y < cover.h; y++) {
+    let run = 0;
+    for (let x = 0; x < cover.w; x++) {
+      const i = (y * cover.w + x) * 4;
+      run = cover.data[i] === r && cover.data[i + 1] === g && cover.data[i + 2] === b ? run + 1 : 0;
+      bestRun = Math.max(bestRun, run);
+    }
+  }
+  assert.ok(bestRun >= 96, `longest item-colour run was ${bestRun}, want >= 96 (k>=3)`);
+  // thumbnail: grid must also fit without clipping the accent bars
+  const thumb = decodePng(drawCover({ w: 600, h: 600, title: 'Icon Pack', subtitle: 'x', items }));
+  assert.equal(thumb.w, 600);
+  accentRowsIntact(thumb);
+});
+
+const subSpec = (over: Partial<KitSpec>): KitSpec => ({
+  sku: 'x', title: 'T', isPack: true, size: 32,
+  itemNames: ['a', 'b'], framesPerItem: 4, fps: 4, ...over,
+});
+
+test('kitSubtitle: static packs say "sprites", never "animations"', () => {
+  const s = kitSubtitle(subSpec({ framesPerItem: 1 }));
+  assert.ok(!/animation/i.test(s));
+  assert.equal(s, '2 sprites - 32x32px - png + atlas');
+  assert.equal(
+    kitSubtitle(subSpec({ framesPerItem: 4 })),
+    '2 sprites - 32x32px - 4-frame animations',
+  );
+  // single sprites
+  assert.equal(
+    kitSubtitle(subSpec({ isPack: false, framesPerItem: 4 })),
+    '32x32px - 4-frame animation',
+  );
+  assert.equal(
+    kitSubtitle(subSpec({ isPack: false, framesPerItem: 1 })),
+    '32x32px sprite',
+  );
+});
+
 // ---- gumroad api flow (stubbed fetch — no network) --------------------------
 
 interface StubCall { url: string; method: string; body?: string; headers?: Record<string, string> }
@@ -1080,4 +1167,121 @@ test('publishGumroad: enable + refuse without a draft', async () => {
   const noDraft = await publishGumroad(shipAsset(), { fetchImpl: stubFetch(calls) as never });
   assert.equal(noDraft.status, 'error');
   assert.match(noDraft.error!, /no draft/);
+});
+
+// ---- signed public kit urls --------------------------------------------------
+
+test('signKitUrl/verifyKitSig: valid, tampered, expired, wrong file, >48h', () => {
+  const key = 'k-test';
+  const now = Date.now();
+  const exp = Math.floor(now / 1000) + 3600;
+  const url = signKitUrl(key, 'https://relay.example', 'potion-pack-1', 'cover.png', exp);
+  const u = new URL(url);
+  assert.equal(u.pathname, '/public/kit/potion-pack-1/cover.png');
+  assert.ok(verifyKitSig(key, 'potion-pack-1', 'cover.png', exp, u.searchParams.get('sig')!, now));
+  // tampered sig, tampered file, expired, beyond the 48h cap, bad file
+  assert.ok(!verifyKitSig(key, 'potion-pack-1', 'cover.png', exp, 'aa'.repeat(32), now));
+  assert.ok(!verifyKitSig(key, 'potion-pack-1', 'thumbnail.png', exp, u.searchParams.get('sig')!, now));
+  assert.ok(!verifyKitSig(key, 'potion-pack-1', 'cover.png', Math.floor(now / 1000) - 10, kitSigFor(key, 'potion-pack-1', 'cover.png', Math.floor(now / 1000) - 10), now));
+  const far = Math.floor(now / 1000) + 49 * 3600;
+  assert.ok(!verifyKitSig(key, 's', 'cover.png', far, kitSigFor(key, 's', 'cover.png', far), now));
+  assert.ok(!verifyKitSig(key, 's', 'gen.mjs', exp, kitSigFor(key, 's', 'gen.mjs', exp), now));
+  assert.equal(relayHttpBase('wss://relay.example/worker'), 'https://relay.example');
+  assert.equal(relayHttpBase('ws://localhost:4850/worker'), 'http://localhost:4850');
+});
+
+import { createHmac } from 'node:crypto';
+function kitSigFor(key: string, sku: string, file: string, exp: number): string {
+  return createHmac('sha256', key).update(`kit:${sku}:${file}:${exp}`).digest('hex');
+}
+
+// ---- gif encoder ---------------------------------------------------------------
+
+test('encodeGif: GIF89a header, NETSCAPE loop, per-frame image data, trailer', () => {
+  const mk = (v: number) => new Uint8Array(16).fill(v);
+  const gif = encodeGif({
+    w: 4, h: 4,
+    palette: [[10, 20, 30], [200, 210, 220]],
+    frames: [mk(0), mk(1), mk(0)],
+    delayCs: 25,
+  });
+  assert.equal(gif.toString('ascii', 0, 6), 'GIF89a');
+  assert.equal(gif[gif.length - 1], 0x3b);
+  assert.match(gif.toString('latin1'), /NETSCAPE2\.0/);
+  // 3 image descriptors (0x2C preceded by a block terminator 0x00)
+  let descriptors = 0;
+  for (let i = 1; i < gif.length; i++) if (gif[i] === 0x2c && gif[i - 1] === 0x00) descriptors++;
+  assert.equal(descriptors, 3);
+  // global palette has the two colours
+  assert.equal(gif[10] & 0x07, 0); // GCT size field → 2 entries
+});
+
+// ---- gumroad image attach ------------------------------------------------------
+
+function animAssetDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'af-kit-anim-'));
+  // sheet 64x32: two items, one row each, 4 frames of 16x16
+  const d = new Uint8ClampedArray(64 * 32 * 4);
+  for (let i = 0; i < d.length; i += 4) { d[i] = 90; d[i + 1] = 160; d[i + 2] = 220; d[i + 3] = 255; }
+  writeFileSync(join(dir, 'sheet.png'), encodePng(64, 32, d));
+  const p = new Uint8ClampedArray(16 * 16 * 4);
+  for (let i = 0; i < p.length; i += 4) { p[i] = 200; p[i + 1] = 80; p[i + 2] = 80; p[i + 3] = 255; }
+  writeFileSync(join(dir, 'preview.png'), encodePng(16, 16, p));
+  writeFileSync(join(dir, 'atlas.json'), JSON.stringify({
+    size: 16, fps: 4,
+    items: [
+      { name: 'p0', x: 0, y: 0, w: 16, h: 16, frames: 4 },
+      { name: 'p1', x: 0, y: 16, w: 16, h: 16, frames: 4 },
+    ],
+  }));
+  return dir;
+}
+
+test('attachGumroadImages: poll → covers order → thumbnail; missing relay skips', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  process.env.ALIEN_FACTORY_RELAY_URL = 'wss://relay.example/worker';
+  process.env.ALIEN_FACTORY_WORKER_KEY = 'k-test';
+  try {
+    const calls: StubCall[] = [];
+    let synced = 0;
+    const f = (url: string, init: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) => {
+      calls.push({ url, method: init.method ?? 'GET', body: typeof init.body === 'string' ? init.body : undefined, headers: init.headers });
+      if (url.startsWith('https://relay.example/public/kit/')) {
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({}) });
+      }
+      if (url.includes('/covers') || url.includes('/thumbnail')) {
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, json: () => Promise.resolve({ success: true }) });
+      }
+      return Promise.resolve({ ok: false, status: 500, headers: { get: () => null }, json: () => Promise.resolve({ success: false }) });
+    };
+    const asset = shipAsset({ channels: { gumroad: { status: 'draft', productId: 'p9' } } });
+    const ship = await attachGumroadImages(
+      { asset, meta: packMeta8, dir: animAssetDir() },
+      { fetchImpl: f as never, syncHook: () => { synced++; }, pollIntervalMs: 1 },
+    );
+    assert.equal(synced, 1);
+    assert.equal(ship.images!.covers, 3);
+    assert.equal(ship.images!.thumbnail, true);
+    const coverCalls = calls.filter((c) => c.url.includes('/covers'));
+    const files = coverCalls.map((c) => JSON.parse(c.body!).url as string);
+    assert.match(files[0], /preview\.gif\?exp=/);
+    assert.match(files[1], /cover\.png\?exp=/);
+    assert.match(files[2], /gallery-1\.png\?exp=/);
+    assert.ok(files.every((u) => u.startsWith('https://relay.example/public/kit/p1/')));
+    const thumbCall = calls.find((c) => c.url.includes('/thumbnail'));
+    assert.match(JSON.parse(thumbCall!.body!).url, /thumbnail\.png\?exp=/);
+    // poll hit the signed url first
+    assert.ok(calls[0].url.startsWith('https://relay.example/public/kit/'));
+
+    // no relay configured → clear, non-fatal skip
+    delete process.env.ALIEN_FACTORY_RELAY_URL;
+    delete process.env.ALIEN_FACTORY_WORKER_KEY;
+    const skip = await attachGumroadImages({ asset, meta: packMeta8, dir: animAssetDir() }, { fetchImpl: f as never });
+    assert.match(skip.imagesError!, /relay/);
+    assert.equal(skip.status, 'draft');
+    assert.equal(skip.productId, 'p9');
+  } finally {
+    delete process.env.ALIEN_FACTORY_RELAY_URL;
+    delete process.env.ALIEN_FACTORY_WORKER_KEY;
+  }
 });

@@ -41,10 +41,13 @@ server/               # tsx (dev) / tsx watch (dev:watch), node:http + ws :4790
   src/itch.ts         # itch.io research (READ ONLY): polite feed fetcher,
                       # cell parser, snapshot analyser, reports/itch-latest.md
   src/channels/gumroad.ts # the ONLY real storefront: kit → multipart upload →
-                      # draft product → optional publish (fetch injected)
+                      # draft product → optional publish → covers/thumbnail
+                      # via signed public relay URLs (fetch injected)
   src/kit.ts          # zero-dep kit builder: zip writer (DEFLATE+CRC32),
-                      # README/LICENSE.txt, cover.png 1280x720 + thumbnail.png
+                      # README/LICENSE.txt, cover.png 1280x720, thumbnail.png
+                      # 600x600, gallery-1.png + animated preview.gif
   src/png.ts          # server PNG codec + pixel buffer + 5x7 bitmap font
+  src/gif.ts          # GIF89a encoder (global palette, LZW, NETSCAPE loop)
   src/parse.ts        # pure helpers: section/fenced-json parsers, inspection
                       # parser, permission path guard, meta.json checks
   src/prompts.ts      # every agent prompt template (structured block at the end)
@@ -76,7 +79,8 @@ client/               # Vite + TS, zero runtime deps
   STYLE.md            # house rules handed to every prompt
   assets/<sku>/       # gen.mjs + sheet.png + preview.png + meta.json + listing.json
                       # + kit/ (<sku>.zip, README/LICENSE.txt, cover.png,
-                      # thumbnail.png) once the Gumroad channel builds it
+                      # thumbnail.png, gallery-1.png, preview.gif) once the
+                      # Gumroad channel builds it
   examples/<name>/    # seeded references: slime, carrot, potion + potion-pack
                       # (the PARAMETRIC pack reference — palette + param loop)
   reports/            # market-latest.md, trends-<n>.md (written by the scout)
@@ -236,6 +240,11 @@ Two roles by env (see README for the diagram/setup):
   ws only, backoff 1s→30s+jitter, ping/25s, state push ≤2/s, asset files
   (allowlist `ASSET_FILES`, ≤2 MB each) pushed on change/welcome-diff,
   `remote: <cmd>` events; self-scans itch only if the relay is silent >2h.
+- **Public kit images**: `GET /public/kit/<sku>/<file>?exp&sig` is the ONLY
+  unauthenticated route — `file` ∈ `PUBLIC_KIT_FILES` (the five kit images),
+  `sig` = HMAC-SHA256(worker key, `kit:<sku>:<file>:<exp>`), ≤48 h. It
+  exists so Gumroad's covers/thumbnail fetchers can pull images; the worker
+  signs URLs and posts them (`channels/gumroad.ts` `attachGumroadImages`).
 - `scripts/run-worker.mjs` loads `~/.alien-factory/worker.env` (never logs
   values); `new-worker-key.mjs`, `install-launchagent.sh [--load]`,
   `uninstall-launchagent.sh`, `worker-status.sh`.

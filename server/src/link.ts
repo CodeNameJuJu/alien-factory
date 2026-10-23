@@ -1,5 +1,5 @@
 // Shared helpers for the worker ⇄ relay link — pure, testable.
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type {
   ClientMessage, StateMessage, ItchState, WorkerStatePayload, WorkerStatus,
@@ -10,7 +10,8 @@ export const SKU_RE = /^[a-z0-9-]{1,60}$/;
 /// `atlas.json` is the pack layout; `items/<slug>.png` are pack strips.
 export const ASSET_FILES = new Set([
   'sheet.png', 'preview.png', 'meta.json', 'atlas.json', 'listing.json', 'gen.mjs',
-  'kit/cover.png', 'kit/thumbnail.png', // zip stays on the worker — too big
+  // zip stays on the worker — too big; kit images are small and feed /public/kit
+  'kit/cover.png', 'kit/thumbnail.png', 'kit/gallery-1.png', 'kit/gallery-2.png', 'kit/preview.gif',
 ]);
 export const ASSET_ITEM_RE = /^items\/[a-z0-9-]{1,40}\.png$/;
 export const assetFileOk = (name: string): boolean => ASSET_FILES.has(name) || ASSET_ITEM_RE.test(name);
@@ -21,8 +22,57 @@ export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 export const FORWARDABLE = new Set<ClientMessage['type']>([
   'startShift', 'pauseShift', 'stopShift', 'setModels', 'setCaps', 'setMode',
   'setMarketSource', 'directive', 'cancelAgent',
-  'shipGumroad', 'publishGumroad', 'setGumroadConfig',
+  'shipGumroad', 'publishGumroad', 'setGumroadConfig', 'attachGumroadImages',
 ]);
+
+// ---- signed public kit image URLs ------------------------------------------
+//
+// Gumroad's covers/thumbnail endpoints only accept PUBLICLY reachable image
+// URLs — but /files sits behind the password gate. So the relay exposes
+// exactly ONE public route, GET /public/kit/<sku>/<file>?exp&sig, where
+// file ∈ PUBLIC_KIT_FILES and sig = HMAC-SHA256(WORKER_KEY, "kit:sku:file:exp").
+// The worker signs (it has the same key); nothing else becomes public.
+
+export const PUBLIC_KIT_FILES = new Set(['cover.png', 'thumbnail.png', 'gallery-1.png', 'gallery-2.png', 'preview.gif']);
+export const KIT_URL_MAX_AGE_S = 48 * 3600;
+
+export function kitSig(key: string, sku: string, file: string, exp: number): string {
+  return createHmac('sha256', key).update(`kit:${sku}:${file}:${exp}`).digest('hex');
+}
+
+/// The URL the worker hands to Gumroad (base = relay https origin).
+export function signKitUrl(key: string, base: string, sku: string, file: string, exp: number): string {
+  return `${base.replace(/\/$/, '')}/public/kit/${encodeURIComponent(sku)}/${file}?exp=${exp}&sig=${kitSig(key, sku, file, exp)}`;
+}
+
+export function verifyKitSig(
+  key: string,
+  sku: string,
+  file: string,
+  exp: number,
+  sig: string,
+  now = Date.now(),
+): boolean {
+  if (!PUBLIC_KIT_FILES.has(file)) return false;
+  if (!Number.isFinite(exp) || exp * 1000 < now || exp * 1000 > now + KIT_URL_MAX_AGE_S * 1000) return false;
+  const want = Buffer.from(kitSig(key, sku, file, exp), 'hex');
+  let got: Buffer;
+  try {
+    got = Buffer.from(sig, 'hex');
+  } catch {
+    return false;
+  }
+  return want.length === got.length && timingSafeEqual(want, got);
+}
+
+/// ws(s)://relay/... → https(s)://relay origin
+export function relayHttpBase(relayUrl: string): string {
+  try {
+    return new URL(relayUrl.replace(/^ws/, 'http')).origin;
+  } catch {
+    return '';
+  }
+}
 
 /// Timing-safe `Authorization: Bearer <key>` check.
 export function bearerValid(header: string | undefined, key: string): boolean {

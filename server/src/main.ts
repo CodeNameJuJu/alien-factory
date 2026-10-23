@@ -8,7 +8,7 @@ import { FACTORY_DIR, loadConfig } from './config.js';
 import { seedFactory } from './seed.js';
 import { FactoryManager } from './factory.js';
 import { loginPage, passwordMatches, RateLimiter, SESSION_COOKIE, sessionToken, sessionValid } from './auth.js';
-import { bearerValid, MAX_LINK_MSG } from './link.js';
+import { bearerValid, MAX_LINK_MSG, PUBLIC_KIT_FILES, SKU_RE, verifyKitSig } from './link.js';
 import { Relay } from './relay.js';
 import { WorkerLink } from './worker-link.js';
 import { DEVIN_DISABLED } from './acp.js';
@@ -41,6 +41,8 @@ const relay = IS_RELAY ? new Relay() : null;
 const link = IS_WORKER ? new WorkerLink(RELAY_URL, WORKER_KEY, factory) : null;
 // while the worker is linked (or was recently), the relay is the scanner
 if (link) factory.relayAvailable = () => !link.fallbackDue();
+// the gumroad channel pushes fresh kit files up before polling public urls
+if (link) factory.assetSyncHook = () => void link.syncAssets();
 
 // ---- websocket ------------------------------------------------------------
 
@@ -243,6 +245,36 @@ async function reveal(req: IncomingMessage, res: ServerResponse): Promise<void> 
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
+
+  // SIGNED PUBLIC kit images — the ONE unauthenticated content route, for
+  // Gumroad's covers/thumbnail fetchers (the dashboard /files stays gated).
+  // GET /public/kit/<sku>/<file>?exp=<unix>&sig=<hmac-hex>
+  if (path.startsWith('/public/kit/')) {
+    const m = /^\/public\/kit\/([a-z0-9-]{1,60})\/([a-z0-9.-]{1,40})$/.exec(path);
+    const file = m?.[2] ?? '';
+    if (!m || !SKU_RE.test(m[1]) || !PUBLIC_KIT_FILES.has(file)) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
+    const exp = Number(url.searchParams.get('exp'));
+    const sig = url.searchParams.get('sig') ?? '';
+    if (!WORKER_KEY || !verifyKitSig(WORKER_KEY, m[1], file, exp, sig)) {
+      res.writeHead(403);
+      res.end('forbidden');
+      return;
+    }
+    const target = resolve(FACTORY_DIR, 'assets', m[1], 'kit', file);
+    if (!existsSync(target) || !statSync(target).isFile()) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
+    const mime = file.endsWith('.gif') ? 'image/gif' : 'image/png';
+    res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' });
+    createReadStream(target).pipe(res);
+    return;
+  }
 
   // auth gate — everything except health + the login routes needs the cookie
   if (PASSWORD) {

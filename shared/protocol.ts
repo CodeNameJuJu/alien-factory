@@ -132,6 +132,10 @@ export interface GumroadShip {
   at?: number;
   /// last error (NEVER contains the token)
   error?: string;
+  /// covers/thumbnail attach result via signed public relay URLs
+  images?: { covers: number; thumbnail: boolean; at: number };
+  /// non-fatal image-attach problem (e.g. no relay configured)
+  imagesError?: string;
   /// dry-run request plan (endpoints + non-secret params), for inspection
   plan?: unknown;
 }
@@ -497,4 +501,6 @@ export type ClientMessage =
   /// Gumroad channel — dryRun returns the request plan without uploading
   | { type: 'shipGumroad'; sku: string; dryRun?: boolean }
   | { type: 'publishGumroad'; sku: string }
+  /// attach kit cover/thumbnail/gallery/gif to an existing product
+  | { type: 'attachGumroadImages'; sku: string }
   | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> };

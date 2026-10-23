@@ -29,7 +29,7 @@ import {
   urlsAllowed,
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
-import { loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
+import { attachGumroadImages as gumroadAttach, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
 import { shipEligibility } from '../../shared/shop.js';
 import {
   analyseSnapshot,
@@ -1106,6 +1106,9 @@ export class FactoryManager extends EventEmitter {
       case 'publishGumroad':
         await this.publishGumroad(msg.sku);
         return;
+      case 'attachGumroadImages':
+        await this.attachGumroadImages(msg.sku);
+        return;
       case 'setGumroadConfig':
         this.setGumroadConfig(msg.config);
         return;
@@ -1153,7 +1156,7 @@ export class FactoryManager extends EventEmitter {
     }
     const res = await gumroadShip(
       { asset, meta, cfg: this.config.gumroad, shippedToday: this.gumroadShippedToday(), dir: join(FACTORY_DIR, 'assets', sku) },
-      { dryRun },
+      { dryRun, syncHook: this.assetSyncHook ?? undefined },
     );
     asset.channels.gumroad = res.ship;
     if (dryRun) {
@@ -1173,6 +1176,23 @@ export class FactoryManager extends EventEmitter {
     asset.channels = { ...(asset.channels ?? {}), gumroad: ship };
     if (ship.status === 'published') this.event(`${sku} published on Gumroad`, undefined, sku);
     else this.event(`gumroad publish failed for ${sku}: ${ship.error ?? 'unknown'}`, undefined, sku);
+    this.changed();
+  }
+
+  /// set by main.ts to the worker-link's syncAssets — kit files ride the
+  /// normal asset push so their signed public URLs go live
+  assetSyncHook: (() => void) | null = null;
+
+  private async attachGumroadImages(sku: string): Promise<void> {
+    const asset = this.asset(sku);
+    if (!asset) return;
+    const ship = await gumroadAttach(
+      { asset, meta: loadShipMeta(sku), dir: join(FACTORY_DIR, 'assets', sku) },
+      { syncHook: this.assetSyncHook ?? undefined },
+    );
+    asset.channels = { ...(asset.channels ?? {}), gumroad: ship };
+    if (ship.imagesError) this.event(`gumroad images failed for ${sku}: ${ship.imagesError}`, undefined, sku);
+    else this.event(`gumroad images attached for ${sku} — ${ship.images?.covers ?? 0} covers${ship.images?.thumbnail ? ' + thumbnail' : ''}`, undefined, sku);
     this.changed();
   }
 
