@@ -15,15 +15,23 @@ export interface ShipMeta {
 /// Every explicit item-count claim in the listing text. Recognises
 /// "600 RPG items", "48 icons", "x24", "24-pack", "set of 12".
 /// Returns [claimed count, matched phrase] pairs.
+/// Numbers describing variation/format — NOT item counts: "4 frames", "4f",
+/// "24 fps", "8-dir"/"8 directions"/"4-way", "16px", "16 colours",
+/// "6 material variants", "3 palettes".
+const NON_COUNT_RE = /\b\d+\s*[-–]?\s*(?:frames?|fps|dirs?|directions?|way|px|colou?rs?|variants?|materials?|palettes?|f)\b/gi;
+
 export function countClaims(text: string): [number, string][] {
   const out: [number, string][] = [];
-  // strip NxNx size mentions first ("32x32" would fake an x-count claim)
-  const t = text.replace(/\b\d{1,3}\s*x\s*\d{1,3}\b/gi, ' ');
+  // strip NxNx size mentions first ("32x32" would fake an x-count claim),
+  // then variation/format numbers so they can't fake item counts
+  const t = text
+    .replace(/\b\d{1,3}\s*x\s*\d{1,3}\b/gi, ' ')
+    .replace(NON_COUNT_RE, ' ');
   const pats = [
     /\bset of (\d+)\b/gi,
     /\b(\d+)\s*[-–]?\s*pack\b/gi,
     /\bx\s*(\d+)\b/gi,
-    /\b(\d+)\s+(?:[\w'-]+\s+){0,2}(?:items?|icons?|sprites?|tiles?|assets?|elements?|pieces?|frames?)\b/gi,
+    /\b(\d+)\s+(?:[\w'-]+\s+){0,2}(?:items?|icons?|sprites?|tiles?|assets?|elements?|pieces?)\b/gi,
   ];
   for (const re of pats) {
     for (const m of t.matchAll(re)) {
@@ -39,6 +47,11 @@ export function countClaims(text: string): [number, string][] {
 /// Every NxN size mention (e.g. "32x32").
 export function sizeClaims(text: string): number[] {
   return [...text.matchAll(/\b(\d{1,3})\s*x\s*\d{1,3}\b/gi)].map((m) => Number(m[1]));
+}
+
+/// Frame-count claims — "4 frames", "4-frame", "4f" (not "fps" — that's speed).
+export function frameClaims(text: string): [number, string][] {
+  return [...text.matchAll(/\b(\d+)\s*[-–]?\s*(?:frames?|f)\b/gi)].map((m) => [Number(m[1]), m[0]]);
 }
 
 /// Listing-vs-contents consistency — catches the classic failure where a
@@ -61,6 +74,14 @@ export function listingConsistency(
   for (const s of sizeClaims(text)) {
     if (realSize && s !== realSize) {
       issues.push(`listing says ${s}x${s} but the frames are ${realSize}x${realSize}`);
+    }
+  }
+  // pack meta.frames is the TOTAL across items — per-item max is the claim ceiling
+  const perItemMax = Math.max(0, ...(meta?.perItem ?? []).map((i) => i.frames));
+  const realMaxFrames = perItemMax || (meta?.frames ?? 0);
+  for (const [claimed, phrase] of frameClaims(text)) {
+    if (claimed > realMaxFrames) {
+      issues.push(`listing claims "${phrase.trim()}" but items have at most ${realMaxFrames || '?'} frames`);
     }
   }
   if (/\banimat/i.test(text)) {

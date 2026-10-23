@@ -800,6 +800,32 @@ test('listingConsistency: size mismatch, static "animated" claim, no listing', (
   );
 });
 
+test('listingConsistency: variation numbers are not item counts; frame claims checked', () => {
+  // the live false positive: "4 frames" on an 8-item pack must not be an item claim
+  assert.deepEqual(
+    listingConsistency(
+      { title: 'Magic Projectile & Impact FX Pack 16x16', description: '8 items, 4 frames each' },
+      packMeta8,
+    ),
+    [],
+  );
+  // dirs / variants / colours are variation descriptions, not counts
+  assert.deepEqual(
+    listingConsistency(
+      { title: 'Spell FX 8-dir 16x16', description: '6 material variants, 16 colours, animated' },
+      packMeta8,
+    ),
+    [],
+  );
+  // but an over-claimed frame count still fails
+  assert.ok(
+    listingConsistency(
+      { title: 'Spell FX 16x16', description: '8 items with 12 frames of animation' },
+      packMeta8,
+    ).some((i) => /12 frames?.*at most 4 frames/i.test(i)),
+  );
+});
+
 test('shipEligibility: score, packs-only, daily limit, already shipped, ok path', () => {
   assert.ok(!shipEligibility(shipAsset({ inspection: { verdict: 'PASS', score: 5, notes: '' } }), packMeta8, GCFG, 0).ok);
   assert.ok(shipEligibility(shipAsset({ kind: 'sprite', items: undefined }), packMeta8, GCFG, 0).issues.some((i) => /packs-only/.test(i)));
