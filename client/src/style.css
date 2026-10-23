@@ -189,7 +189,67 @@ body.no-crt #crt > div { display: none; }
   font-size: 12px;
   color: var(--phos);
   z-index: 20;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  /* never scrolls horizontally and never wraps — overflow is prevented by
+     moving the system group + readouts into the ⚙ panel below */
+  overflow-x: clip;
+  overflow-y: visible;
+}
+.hud-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.hud-group + .hud-group { margin-left: 10px; }
+.hud-group[data-group="views"] { margin-left: auto; }
+.hud-group-label { display: none; }
+
+/* ⚙ settings panel (desktop): system controls + secondary readouts live in
+   a fixed dropdown so the bar itself never overflows. Same groups render
+   inside the ≡ sheet on phones via display:contents. */
+#hud-gear-panel { display: none; }
+@media (min-width: 761px) {
+  #hud.gear-open #hud-gear-panel {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    top: 32px;
+    right: 8px;
+    width: 300px;
+    padding: 6px 10px 10px;
+    background: var(--ink);
+    background-image: repeating-linear-gradient(
+      to bottom, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px);
+    border: 1px solid var(--phos-dim);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.75), 0 0 18px rgba(92, 242, 200, 0.12);
+    z-index: 23;
+  }
+  #hud-gear-panel .hud-group {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+    padding: 8px 0 4px;
+  }
+  #hud-gear-panel .hud-group + .hud-group { border-top: 1px solid rgba(92, 242, 200, 0.15); }
+  #hud-gear-panel .hud-group-label {
+    display: block;
+    font-size: 9px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--phos-dim);
+    border-bottom: 1px solid rgba(92, 242, 200, 0.15);
+    padding-bottom: 3px;
+  }
+  #hud-gear-panel .btn { text-align: left; padding: 6px 10px; }
+  /* pills in the panel are readouts, not buttons */
+  #hud-gear-panel .hud-pill {
+    border-color: transparent;
+    background: transparent;
+    padding: 2px 0;
+    text-transform: none;
+  }
 }
 .hud-pill {
   background: rgba(92, 242, 200, 0.06);
@@ -204,7 +264,16 @@ body.no-crt #crt > div { display: none; }
 .hud-pill.shift-running { color: var(--phos); }
 .hud-pill.shift-paused { color: var(--amber); }
 .hud-pill.shift-stopped { color: var(--phos-dim); }
-.hud-sep { width: 1px; height: 16px; background: rgba(92, 242, 200, 0.3); }
+#hud-rev { cursor: pointer; }
+
+/* mid-width desktops: tighter spacing/type so the row always fits */
+@media (min-width: 761px) and (max-width: 1100px) {
+  #hud { gap: 4px; padding: 4px 6px; font-size: 11px; }
+  .hud-group { gap: 4px; }
+  .hud-group + .hud-group { margin-left: 6px; }
+  #hud .btn { padding: 2px 5px; letter-spacing: 0.5px; font-size: 10px; }
+  #hud .hud-pill { padding: 2px 6px; font-size: 10px; }
+}
 #hud select, .gfilter {
   font-family: inherit;
   font-size: 11px;
@@ -229,17 +298,24 @@ body.no-crt #crt > div { display: none; }
   padding: 2px 8px;
   cursor: pointer;
 }
-.btn:hover {
-  background: var(--phos);
-  color: var(--ink);
-  text-shadow: none;
-  box-shadow: 0 0 12px rgba(92, 242, 200, 0.55);
+/* hover styles only where hover exists — touch taps must not leave a
+   "stuck" highlighted button behind */
+@media (hover: hover) {
+  .btn:hover {
+    background: var(--phos);
+    color: var(--ink);
+    text-shadow: none;
+    box-shadow: 0 0 12px rgba(92, 242, 200, 0.55);
+  }
+  .btn:disabled:hover { background: transparent; color: var(--phos); box-shadow: none; }
+  .btn.danger:hover { background: var(--err); color: var(--ink); box-shadow: 0 0 12px rgba(255, 95, 110, 0.5); }
+  .gcell:hover { border-color: var(--phos); box-shadow: 0 0 10px rgba(92, 242, 200, 0.3); }
+  .mlink:hover, .tick-link:hover { color: var(--amber); }
+  .tick-link:hover { border-left-color: var(--amber); }
 }
 .btn:disabled { opacity: 0.4; cursor: default; }
-.btn:disabled:hover { background: transparent; color: var(--phos); box-shadow: none; }
 .btn.primary { border-color: var(--phos); }
 .btn.danger { color: var(--err); border-color: rgba(255, 95, 110, 0.5); }
-.btn.danger:hover { background: var(--err); color: var(--ink); box-shadow: 0 0 12px rgba(255, 95, 110, 0.5); }
 
 /* ---- event ticker ---- */
 #ticker {
@@ -264,7 +340,6 @@ body.no-crt #crt > div { display: none; }
 }
 .tick::before { content: '> '; }
 .tick-link { cursor: pointer; pointer-events: auto; }
-.tick-link:hover { color: var(--amber); border-left-color: var(--amber); }
 
 /* ---- nameplates ---- */
 #labels { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
@@ -509,7 +584,6 @@ details pre {
 .mtag-bar .off { color: rgba(92, 242, 200, 0.22); }
 .spark { display: block; width: 100%; height: 40px; border: 1px solid rgba(92, 242, 200, 0.3); margin: 8px 0; }
 .mlink { cursor: pointer; }
-.mlink:hover { color: var(--amber); }
 
 .gfilter {
   width: 100%;
@@ -525,7 +599,6 @@ details pre {
   cursor: pointer;
   text-align: center;
 }
-.gcell:hover { border-color: var(--phos); box-shadow: 0 0 10px rgba(92, 242, 200, 0.3); }
 .gcell .athumb { margin: 0 auto; display: block; }
 .gcap { font-size: 10px; color: var(--phos); margin-top: 4px; }
 .gstat { font-size: 9px; color: var(--phos-dim); }
@@ -547,14 +620,16 @@ details pre {
 /* ---- touch ---- */
 #screen { touch-action: manipulation; }
 #hud-menu { display: none; }
+#hud-tabs { display: none; }
 
 /* ---- phones / narrow screens ---- */
 @media (max-width: 760px) {
   html, body { justify-content: flex-start; align-items: stretch; }
   body { flex-direction: column; }
-  /* slimmer bezel, canvas fills the width under the HUD */
+  /* slimmer bezel, canvas fills the width under the HUD — the page is
+     pushed below the fixed bar by body padding-top (set in fit()) */
   #bezel {
-    margin: calc(34px + env(safe-area-inset-top)) 4px 0;
+    margin: 0 4px;
     border-radius: 10px;
     padding: 6px 7px 7px;
     align-self: center;
@@ -564,34 +639,143 @@ details pre {
   #bezel-label { font-size: 8px; letter-spacing: 2px; }
   #bezel-bottom { padding-top: 4px; }
 
-  /* compact HUD: status/live + rev|scan + [ ≡ ] stay; the rest is a menu */
+  /* compact top bar: live dot + shift + primary action + gumroad rev + [ ≡ ].
+     Groups flatten into the row (display: contents); .hud-x marks what only
+     lives inside the menu. The ⚙ panel's groups join the sheet the same way. */
   #hud {
     padding: calc(4px + env(safe-area-inset-top)) 6px 4px;
     gap: 5px;
     font-size: 11px;
     flex-wrap: nowrap;
-    overflow-x: auto;
-  }
-  #hud .hud-x { display: none; }
-  #hud-menu { display: inline-block; margin-left: auto; flex-shrink: 0; }
-  #hud.menu-open {
-    flex-wrap: wrap;
-    flex-direction: column;
-    align-items: stretch;
-    max-height: 78vh;
-    overflow-y: auto;
     overflow-x: hidden;
   }
-  #hud.menu-open .hud-x { display: inline-block; align-self: flex-start; }
-  #hud.menu-open select.hud-x { display: block; width: 100%; max-width: none; }
-  #hud.menu-open .hud-sep { display: none; }
-  #hud.menu-open #hud-menu { position: absolute; top: calc(4px + env(safe-area-inset-top)); right: 6px; }
+  .hud-group, #hud-gear-panel { display: contents; }
+  .hud-group + .hud-group { margin-left: 0; }
+  #hud .hud-x { display: none; }
+  /* !important: must beat the `#hud.menu-open .btn { display:flex }` rule */
+  #hud-gear { display: none !important; }
+  #hud-menu { display: inline-block; margin-left: auto; flex-shrink: 0; min-height: 30px; }
 
-  /* bigger tap targets */
-  #hud .btn, #hud .hud-pill, #hud select { min-height: 34px; padding: 6px 10px; }
+  /* dim the page behind the open sheet */
+  #hud-scrim {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(2, 5, 9, 0.72);
+    z-index: 19;
+  }
+
+  /* the open menu is an opaque sheet under the bar */
+  #hud.menu-open {
+    flex-direction: column;
+    align-items: stretch;
+    max-height: 80vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    overscroll-behavior: contain;
+    background: var(--ink);
+    background-image: repeating-linear-gradient(
+      to bottom, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px);
+  }
+  /* header spacer so the absolute-positioned [ × ] never covers a label */
+  #hud.menu-open::before { content: ''; height: 34px; flex-shrink: 0; }
+  #hud.menu-open .hud-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    padding: 10px 0 4px;
+    border-top: 1px solid rgba(92, 242, 200, 0.15);
+  }
+  #hud.menu-open .hud-group[data-group="status"] {
+    display: flex;
+    flex-wrap: wrap;
+    border-top: none;
+    order: 0;
+  }
+  /* sheet section order: status → store (+gear-store as a seamless
+     continuation) → system (devin pill first) → views last */
+  #hud.menu-open .hud-group[data-group="store"] { order: 1; }
+  #hud.menu-open .hud-group[data-group="gear-store"] {
+    order: 2;
+    border-top: none;
+    padding-top: 0;
+  }
+  #hud.menu-open .hud-group[data-group="gear-store"] .hud-group-label { display: none; }
+  #hud.menu-open .hud-group[data-group="system"] { order: 3; }
+  #hud.menu-open .hud-group[data-group="system"] #hud-devin { grid-column: 1 / -1; }
+  #hud.menu-open .hud-group[data-group="views"] { order: 4; }
+  #hud.menu-open .hud-group-label {
+    display: block;
+    grid-column: 1 / -1;
+    font-size: 9px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--phos-dim);
+    border-bottom: 1px solid rgba(92, 242, 200, 0.15);
+    padding-bottom: 3px;
+  }
+  #hud.menu-open .hud-x { display: inline-block; }
+  #hud.menu-open select.hud-x { display: block; width: 100%; max-width: none; }
+  /* the four views are already one tap away in the bottom tab bar —
+     keep only [ models ] in the sheet */
+  #hud.menu-open .hud-group[data-group="views"] .btn:not(#hud-models) { display: none; }
+  #hud.menu-open #hud-menu {
+    position: absolute;
+    top: calc(4px + env(safe-area-inset-top));
+    right: 6px;
+    margin-left: 0;
+  }
+
+  /* tap targets: only real buttons/selects look tappable */
+  #hud.menu-open .btn, #hud.menu-open select {
+    min-height: 44px;
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+  /* pills are readouts, not buttons: no border, left-aligned */
+  #hud.menu-open .hud-pill {
+    border-color: transparent;
+    background: transparent;
+    min-height: 32px;
+    padding: 6px 8px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    text-align: left;
+    text-transform: uppercase;
+  }
+  #hud.menu-open #hud-devin { justify-content: flex-start; }
   #drawer .btn, #drawer select, #drawer .gfilter, .gcell, .tick-link { min-height: 40px; }
   #drawer .btn { padding: 10px 14px; }
   .dclose { font-size: 16px; min-width: 44px; }
+
+  /* bottom tab bar: the four most-used views, hidden while a drawer is open */
+  #hud-tabs {
+    display: flex;
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    gap: 6px;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+    background: var(--glass);
+    background-image: repeating-linear-gradient(
+      to bottom, rgba(0,0,0,0.18) 0px, rgba(0,0,0,0.18) 1px, transparent 1px, transparent 3px);
+    border-top: 1px solid var(--phos-dim);
+    z-index: 24;
+  }
+  #hud-tabs .btn {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    padding: 10px 2px;
+    white-space: nowrap;
+    letter-spacing: 0;
+    font-size: 10px;
+  }
+  body.drawer-open #hud-tabs { display: none; }
 
   /* drawers become bottom sheets */
   #drawer {
@@ -603,8 +787,8 @@ details pre {
     padding-bottom: env(safe-area-inset-bottom);
   }
 
-  /* ticker flows below the canvas */
-  #ticker { position: static; margin: 6px 8px calc(8px + env(safe-area-inset-bottom)); }
+  /* ticker flows below the canvas — clear of the bottom tab bar */
+  #ticker { position: static; margin: 6px 8px calc(64px + env(safe-area-inset-bottom)); }
   .tick { max-width: none; font-size: 10px; }
   #toast { top: auto; bottom: 20%; width: 88vw; text-align: center; }
 }

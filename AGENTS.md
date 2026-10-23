@@ -63,7 +63,9 @@ client/               # Vite + TS, zero runtime deps
   src/aliens.ts       # alien sprites usage + cosmetic movement (waypoints)
   src/assets.ts       # /files sheet.png + meta.json cache, animated frames
   src/sprites.ts      # procedural sprites: aliens, overlord, bubbles, crates
-  src/hud.ts          # top bar (shift controls, revenue, models) + ticker
+  src/hud.ts          # top bar (status/store/views/system groups, contextual
+                      # shift controls, live gumroad revenue) + ticker; phones
+                      # get a [ ≡ ] group sheet + bottom view tab bar
   src/drawers.ts      # right-side drawer: overlord/alien/asset/market/gallery
   src/demo.ts         # ?demo — fake animated state, no server needed
   src/pix.ts          # pixel buffer painter (mulberry32, hashString, Sprite)
@@ -109,6 +111,11 @@ client/               # Vite + TS, zero runtime deps
   SHOP also offers `[ clear ]` (drops a FAILED local record only — never
   deletes anything on Gumroad, and refuses records with a productId) and
   `[ refresh ]` (re-polls live draft/published status via GET /products).
+  One GET /products also refreshes store-wide `GumroadStats`
+  (`channels.gumroad.stats`) — auto-polled ~5 s after boot and every 15 min
+  while a token is set. The HUD revenue pill shows these live totals
+  (mock revenue is no longer on the HUD; `salesCount`/`revenueUsdCents`
+  are null — never guessed — when the token lacks `view_sales`).
   No other marketplace/upload code may be added without an explicit
   future decision — and never to itch.io (research stays read-only).
 

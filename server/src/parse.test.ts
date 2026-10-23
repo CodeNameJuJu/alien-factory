@@ -30,7 +30,7 @@ import type { Asset, GumroadConfig, ItchItem, ItchSnapshot } from '../../shared/
 import { canClearGumroad, countClaims, listingConsistency, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import { crc32, decodePng, encodePng } from './png.js';
 import { buildKit, drawCover, kitSubtitle, zipFiles, type KitItem, type KitSpec } from './kit.js';
-import { publishGumroad, shipGumroad, attachGumroadImages, refreshGumroadStatus } from './channels/gumroad.js';
+import { applyGumroadProduct, fetchGumroadStore, publishGumroad, shipGumroad, attachGumroadImages, refreshGumroadStatus } from './channels/gumroad.js';
 import { encodeGif } from './gif.js';
 import { execSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, existsSync } from 'node:fs';
@@ -1317,6 +1317,65 @@ test('refreshGumroadStatus: published/draft/deleted/404/no-productId', async () 
   );
   assert.match(boom.error!, /refresh failed: .*429.*rate limited/);
   assert.equal(boom.status, 'draft');
+});
+
+test('fetchGumroadStore: store totals, skips deleted, numeric strings, hidden sales', async () => {
+  process.env.GUMROAD_ACCESS_TOKEN = 'TESTTOKEN-should-never-leak';
+  const get = (body: Record<string, unknown>, status = 200) =>
+    (() => Promise.resolve({
+      ok: status < 400, status, headers: { get: () => null },
+      json: () => Promise.resolve(body),
+    })) as never;
+
+  // sums count/cents across non-deleted products; numeric strings parse
+  const r1 = await fetchGumroadStore({
+    fetchImpl: get({
+      success: true,
+      products: [
+        { id: 'p1', published: true, price: 299, sales_count: 3, sales_usd_cents: 897 },
+        { id: 'p2', published: false, price: '499', sales_count: '2', sales_usd_cents: '998' },
+        { id: 'p3', published: true, deleted: true, sales_count: 99, sales_usd_cents: 9900 },
+      ],
+    }),
+  });
+  assert.equal(r1.stats.products, 2);
+  assert.equal(r1.stats.published, 1);
+  assert.equal(r1.stats.salesCount, 5);
+  assert.equal(r1.stats.revenueUsdCents, 1895);
+  assert.equal(r1.products.length, 3); // raw list keeps deleted for callers
+
+  // any product missing sales fields → totals are null, never 0
+  const r2 = await fetchGumroadStore({
+    fetchImpl: get({ success: true, products: [{ id: 'p1', published: true, price: 299 }] }),
+  });
+  assert.equal(r2.stats.salesCount, null);
+  assert.equal(r2.stats.revenueUsdCents, null);
+
+  // success:false → throws
+  await assert.rejects(
+    () => fetchGumroadStore({ fetchImpl: get({ success: false, message: 'nope' }) }),
+    /gumroad GET \/products/,
+  );
+});
+
+test('applyGumroadProduct: status, price, sales, clears error', () => {
+  const ship = applyGumroadProduct(
+    { status: 'draft', productId: 'p1', error: 'stale' },
+    { published: true, price: 299, formatted_price: '$2.99', sales_count: 4, sales_usd_cents: '1196', short_url: 'https://gum.co/x' },
+  );
+  assert.equal(ship.status, 'published');
+  assert.equal(ship.priceCents, 299);
+  assert.equal(ship.formattedPrice, '$2.99');
+  assert.equal(ship.salesCount, 4);
+  assert.equal(ship.salesUsdCents, 1196);
+  assert.equal(ship.shortUrl, 'https://gum.co/x');
+  assert.equal(ship.error, undefined);
+  // absent sales fields (no view_sales) → undefined, never 0
+  const hidden = applyGumroadProduct({ status: 'published', productId: 'p1', salesCount: 9 }, { published: false, price: 'nope' });
+  assert.equal(hidden.status, 'draft');
+  assert.equal(hidden.salesCount, undefined);
+  assert.equal(hidden.salesUsdCents, undefined);
+  assert.equal(hidden.priceCents, undefined);
 });
 
 test('gumroad dry-run: plan includes the rich_content PUT step', async () => {

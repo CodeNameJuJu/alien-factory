@@ -150,7 +150,7 @@ path-checked and is allowed (see AGENTS.md).
 ## Config & data
 
 `~/.alien-factory/config.json` — models, smith count, turn/order/batch
-limits, `usdToZar` for the mock revenue display, `mode`, `marketSource`,
+limits, `usdToZar` for the revenue display, `mode`, `marketSource`,
 `itchScanMinutes`, `itchFeeds`. State lives in
 `~/.alien-factory/state.json`; the factory sandbox (assets, reports, the
 `pix.mjs` lib, `STYLE.md`) in `~/.alien-factory/factory`.

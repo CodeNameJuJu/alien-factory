@@ -22,7 +22,7 @@ import { FACTORY_DIR } from '../config.js';
 import { buildKit, type BuiltKit } from '../kit.js';
 import { relayHttpBase, signKitUrl } from '../link.js';
 import { shipEligibility, type ShipMeta } from '../../../shared/shop.js';
-import type { Asset, GumroadConfig, GumroadShip } from '../../../shared/protocol.js';
+import type { Asset, GumroadConfig, GumroadShip, GumroadStats } from '../../../shared/protocol.js';
 
 export { shipEligibility, listingConsistency } from '../../../shared/shop.js';
 export type { ShipMeta };
@@ -485,6 +485,30 @@ export async function publishGumroad(
   }
 }
 
+const numOr = (v: unknown): number | undefined => {
+  // null / '' / booleans would coerce to 0/1 — absent, not zero
+  if (typeof v !== 'number' && (typeof v !== 'string' || v.trim() === '')) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+};
+
+/// Fold one /v2/products product object into the local ship record:
+/// live status + price + (with the view_sales scope) sales. Unparsable or
+/// absent fields are dropped — never guessed, never 0.
+export function applyGumroadProduct(ship: GumroadShip, p: Record<string, unknown>): GumroadShip {
+  const out: GumroadShip = {
+    ...ship,
+    status: p.published === true ? 'published' : 'draft',
+    shortUrl: typeof p.short_url === 'string' ? p.short_url : ship.shortUrl,
+    priceCents: numOr(p.price),
+    formattedPrice: typeof p.formatted_price === 'string' ? p.formatted_price : undefined,
+    salesCount: numOr(p.sales_count),
+    salesUsdCents: numOr(p.sales_usd_cents),
+  };
+  delete out.error;
+  return out;
+}
+
 /// Re-poll a product's live status (GET /v2/products/:id). Local record is
 /// updated in place by the caller — a missing/deleted product is flagged
 /// as an error, never auto-cleared.
@@ -499,23 +523,54 @@ export async function refreshGumroadStatus(
   const f = opts.fetchImpl ?? realFetch;
   try {
     const j = await apiGet(f, `/products/${encodeURIComponent(ship.productId)}`);
-    const p = (j.product ?? j) as { published?: boolean; deleted?: boolean; short_url?: string };
+    const p = (j.product ?? j) as Record<string, unknown>;
     if (p.deleted === true) {
       return { ...ship, error: 'product not found on gumroad — deleted there?' };
     }
-    const out: GumroadShip = {
-      ...ship,
-      status: p.published ? 'published' : 'draft',
-      shortUrl: typeof p.short_url === 'string' ? p.short_url : ship.shortUrl,
-    };
-    delete out.error;
-    return out;
+    return applyGumroadProduct(ship, p);
   } catch (err) {
     if ((err as GumroadError).status === 404) {
       return { ...ship, error: 'product not found on gumroad — deleted there?' };
     }
     return { ...ship, error: `refresh failed: ${(err as Error).message.slice(0, 200)}` };
   }
+}
+
+/// One GET /v2/products → store-wide stats + the raw product list (so the
+/// caller can also fold each product into its local ship record). Deleted
+/// products are skipped; if ANY live product lacks sales fields (token has
+/// no view_sales scope) the totals come back null — never guessed.
+/// Throws on API errors; the caller decides what to tell the user.
+export async function fetchGumroadStore(
+  opts: { fetchImpl?: FetchLike } = {},
+): Promise<{ stats: GumroadStats; products: Record<string, unknown>[] }> {
+  if (!gumroadToken()) throw new GumroadError('GUMROAD_ACCESS_TOKEN not set');
+  const f = opts.fetchImpl ?? realFetch;
+  const j = await apiGet(f, '/products');
+  const products = (Array.isArray(j.products) ? j.products : []) as Record<string, unknown>[];
+  const live = products.filter((p) => p.deleted !== true);
+  let salesCount = 0;
+  let revenueUsdCents = 0;
+  let countKnown = true;
+  let revenueKnown = true;
+  for (const p of live) {
+    const sc = numOr(p.sales_count);
+    const su = numOr(p.sales_usd_cents);
+    if (sc === undefined) countKnown = false;
+    else salesCount += sc;
+    if (su === undefined) revenueKnown = false;
+    else revenueUsdCents += su;
+  }
+  return {
+    stats: {
+      at: Date.now(),
+      products: live.length,
+      published: live.filter((p) => p.published === true).length,
+      salesCount: countKnown ? salesCount : null,
+      revenueUsdCents: revenueKnown ? revenueUsdCents : null,
+    },
+    products,
+  };
 }
 
 export function assetDirExists(sku: string): boolean {

@@ -177,14 +177,22 @@ window.addEventListener('keydown', (e) => {
 });
 
 function fit(): void {
-  // reserve space for the compact HUD + ticker on small screens
-  const narrow = window.innerWidth < 760;
-  const reserve = narrow ? 130 : 0;
+  // the HUD is fixed — push the page content below it at every width, and
+  // reserve its measured height (+ the phone tab bar) for the canvas
+  const hudH = document.getElementById('hud')?.offsetHeight ?? 0;
+  document.body.style.paddingTop = `${hudH}px`;
+  const narrow = window.innerWidth <= 760;
+  const tabH = narrow ? (document.getElementById('hud-tabs')?.offsetHeight ?? 0) : 0;
+  // bezel chrome around the canvas (label + padding) — without reserving it
+  // the bezel overflows the viewport and slides under the fixed HUD
+  const chrome = Math.max(0, (document.getElementById('bezel')?.offsetHeight ?? 0) - canvas.offsetHeight);
+  const reserve = hudH + tabH + chrome + (narrow ? 40 : 0);
   const s = Math.min(window.innerWidth / W, (window.innerHeight - reserve) / H);
   canvas.style.width = `${Math.floor(W * s)}px`;
   canvas.style.height = `${Math.floor(H * s)}px`;
 }
 window.addEventListener('resize', fit);
+new ResizeObserver(fit).observe(document.getElementById('hud')!);
 fit();
 
 // ---- loop ------------------------------------------------------------------------

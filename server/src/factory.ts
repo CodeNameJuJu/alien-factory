@@ -29,7 +29,7 @@ import {
   urlsAllowed,
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
-import { attachGumroadImages as gumroadAttach, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, refreshGumroadStatus as gumroadRefresh, shipGumroad as gumroadShip } from './channels/gumroad.js';
+import { applyGumroadProduct, attachGumroadImages as gumroadAttach, fetchGumroadStore, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
 import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import {
   analyseSnapshot,
@@ -50,6 +50,7 @@ import type {
   Decision,
   FactoryConfig,
   FactoryEvent,
+  GumroadStats,
   ItchAnalysis,
   ItchState,
   Job,
@@ -68,6 +69,8 @@ const EVENTS_CAP = 100;
 const SAVE_DEBOUNCE_MS = 400;
 const DISPATCH_MS = 2_000;
 const HOUR_MS = 3_600_000;
+/// live Gumroad store stats — polled once at boot, then every 15 min
+const GUMROAD_REFRESH_MS = 15 * 60_000;
 /// Re-scout when the last trend report is older than this many market ticks.
 const SCOUT_STALE_TICKS = 10;
 
@@ -161,6 +164,7 @@ interface PersistedState {
   itch?: { lastScanAt?: number | null; analysis?: ItchState['analysis'] };
   usage?: UsageState;
   lastScoutAt?: number;
+  gumroadStats?: GumroadStats | null;
 }
 
 export class FactoryManager extends EventEmitter {
@@ -184,6 +188,8 @@ export class FactoryManager extends EventEmitter {
   lastScoutAt = 0;
   /// shift auto-paused by a daily token cap
   tokenCapHit = false;
+  /// live Gumroad store totals from the last refresh (null until one lands)
+  gumroadStats: GumroadStats | null = null;
 
   /// Set by main.ts when a relay link is configured — true while the worker
   /// is linked (or was within the last 2h). A linked worker never scans
@@ -196,6 +202,8 @@ export class FactoryManager extends EventEmitter {
   private saveTimer: NodeJS.Timeout | null = null;
   private dispatchTimer: NodeJS.Timeout | null = null;
   private marketTimer: NodeJS.Timeout | null = null;
+  private gumroadTimer: NodeJS.Timeout | null = null;
+  private gumroadRefreshing = false;
   private overlordBusy = false;
   private overlordNudged = false;
 
@@ -227,6 +235,10 @@ export class FactoryManager extends EventEmitter {
     this.ensureRoster();
     this.dispatchTimer = setInterval(() => this.dispatch(), DISPATCH_MS);
     this.marketTimer = setInterval(() => this.marketTick(), TICK_MS);
+    if (process.env.GUMROAD_ACCESS_TOKEN) {
+      setTimeout(() => void this.refreshGumroad({ silent: true }), 5_000);
+      this.gumroadTimer = setInterval(() => void this.refreshGumroad({ silent: true }), GUMROAD_REFRESH_MS);
+    }
   }
 
   // ---- infra ---------------------------------------------------------------
@@ -259,6 +271,7 @@ export class FactoryManager extends EventEmitter {
         itch: { lastScanAt: this.itch.lastScanAt, analysis: this.itch.analysis },
         usage: this.usage,
         lastScoutAt: this.lastScoutAt,
+        gumroadStats: this.gumroadStats,
         market: this.market.serialize(),
       };
       writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -302,6 +315,7 @@ export class FactoryManager extends EventEmitter {
     if (this.itch.lastScanAt) setLastScanAt(this.itch.lastScanAt);
     if (raw.usage?.byRole && raw.usage?.byModel) this.usage = raw.usage;
     this.lastScoutAt = raw.lastScoutAt ?? 0;
+    this.gumroadStats = raw.gumroadStats ?? null;
     this.market.restore(raw.market);
     // no session/load on restart — drop sessions, requeue active jobs
     this.shift = 'stopped';
@@ -1139,7 +1153,13 @@ export class FactoryManager extends EventEmitter {
       usage: this.usage,
       tokenCapHit: this.tokenCapHit,
       // the token never leaves the process — clients only get a boolean
-      channels: { gumroad: { configured: !!process.env.GUMROAD_ACCESS_TOKEN, bulkRunning: this.gumroadBulkRunning } },
+      channels: {
+        gumroad: {
+          configured: !!process.env.GUMROAD_ACCESS_TOKEN,
+          bulkRunning: this.gumroadBulkRunning,
+          stats: this.gumroadStats,
+        },
+      },
     };
   }
 
@@ -1324,19 +1344,60 @@ export class FactoryManager extends EventEmitter {
     this.changed();
   }
 
-  /// Re-poll every shipped product's live draft/published status.
-  private async refreshGumroad(): Promise<void> {
-    const shipped = this.assets.filter((a) => a.channels?.gumroad?.productId);
-    let published = 0;
-    let draft = 0;
-    for (const a of shipped) {
-      const ship = await gumroadRefresh(a.channels!.gumroad!);
-      a.channels = { ...(a.channels ?? {}), gumroad: ship };
-      if (ship.status === 'published') published++;
-      else if (ship.status === 'draft') draft++;
+  /// One GET /v2/products → refresh store stats + every shipped product's
+  /// live status/price/sales in a single call. `silent` (the periodic run)
+  /// skips the summary event unless something failed or the sales moved.
+  private async refreshGumroad(opts: { silent?: boolean } = {}): Promise<void> {
+    if (this.gumroadRefreshing) return;
+    this.gumroadRefreshing = true;
+    try {
+      const { stats, products } = await fetchGumroadStore();
+      const prev = this.gumroadStats;
+      this.gumroadStats = stats;
+      const byId = new Map<string, Record<string, unknown>>();
+      for (const p of products) {
+        const id = p.id == null ? '' : String(p.id);
+        if (id) byId.set(id, p);
+      }
+      let published = 0;
+      let draft = 0;
+      let shipped = 0;
+      for (const a of this.assets) {
+        const ship = a.channels?.gumroad;
+        if (!ship?.productId) continue;
+        shipped++;
+        const p = byId.get(ship.productId);
+        if (!p || p.deleted === true) {
+          a.channels!.gumroad = { ...ship, error: 'product not found on gumroad — deleted there?' };
+          continue;
+        }
+        const next = applyGumroadProduct(ship, p);
+        a.channels!.gumroad = next;
+        if (next.status === 'published') published++;
+        else if (next.status === 'draft') draft++;
+      }
+      const salesChanged =
+        stats.salesCount !== (prev?.salesCount ?? null) ||
+        stats.revenueUsdCents !== (prev?.revenueUsdCents ?? null);
+      if (!opts.silent || salesChanged) {
+        const rev = stats.revenueUsdCents;
+        this.event(
+          `gumroad refreshed: ${shipped} product(s) — ${published} published, ${draft} draft` +
+            (rev != null ? ` · $${(rev / 100).toFixed(2)} total` : ''),
+        );
+      }
+      this.changed();
+    } catch (err) {
+      const msg = (err as Error).message.slice(0, 200);
+      // keep the last good numbers, flag the refresh problem on them
+      this.gumroadStats = this.gumroadStats
+        ? { ...this.gumroadStats, error: msg }
+        : { at: Date.now(), products: 0, published: 0, salesCount: null, revenueUsdCents: null, error: msg };
+      this.event(`gumroad refresh failed: ${msg}`);
+      this.changed();
+    } finally {
+      this.gumroadRefreshing = false;
     }
-    this.event(`gumroad refreshed: ${shipped.length} product(s) — ${published} published, ${draft} draft`);
-    this.changed();
   }
 
   /// One bulk ship/publish at a time — exposed to the client as

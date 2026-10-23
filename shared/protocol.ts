@@ -130,6 +130,12 @@ export interface GumroadShip {
   editUrl?: string;
   shortUrl?: string;
   at?: number;
+  /// live values from the last /v2/products refresh
+  priceCents?: number;
+  formattedPrice?: string;
+  /// only present when the token has the view_sales scope
+  salesCount?: number;
+  salesUsdCents?: number;
   /// last error (NEVER contains the token)
   error?: string;
   /// covers/thumbnail attach result via signed public relay URLs
@@ -138,6 +144,19 @@ export interface GumroadShip {
   imagesError?: string;
   /// dry-run request plan (endpoints + non-secret params), for inspection
   plan?: unknown;
+}
+
+/// Store-wide totals from one GET /v2/products refresh — what the HUD
+/// revenue pill shows. products/published count every non-deleted product
+/// in the store (not only factory-made ones). salesCount/revenueUsdCents
+/// are null when the token lacks the view_sales scope — never faked.
+export interface GumroadStats {
+  at: number;
+  products: number;
+  published: number;
+  salesCount: number | null;
+  revenueUsdCents: number | null;
+  error?: string;
 }
 
 export interface GumroadConfig {
@@ -448,7 +467,14 @@ export interface StateMessage {
   /// shift was auto-paused because a daily token cap was exceeded
   tokenCapHit: boolean;
   /// sales channels — only booleans, no secrets
-  channels: { gumroad: { configured: boolean; bulkRunning?: boolean } };
+  channels: {
+    gumroad: {
+      configured: boolean;
+      bulkRunning?: boolean;
+      /// live store totals — null until the first successful refresh
+      stats?: GumroadStats | null;
+    };
+  };
 }
 
 export interface ErrorMessage {

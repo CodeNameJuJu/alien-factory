@@ -75,6 +75,7 @@ export class Drawers {
     this.el.style.display = 'flex';
     this.el.classList.remove('crt-out');
     this.el.classList.add('crt-in');
+    document.body.classList.add('drawer-open'); // hides the mobile tab bar
     this.render();
   }
 
@@ -82,6 +83,7 @@ export class Drawers {
     this.sel = null;
     this.el.classList.remove('crt-in');
     this.el.classList.add('crt-out');
+    document.body.classList.remove('drawer-open');
     this.closeTimer = setTimeout(() => {
       this.el.style.display = 'none';
       this.el.classList.remove('crt-out');
@@ -532,13 +534,30 @@ export class Drawers {
     if (a.checks) this.kv(b, 'checks', a.checks.passed ? 'passed' : `FAILED: ${a.checks.issues.join('; ')}`);
     if (a.inspection) this.kv(b, 'inspection', `${a.inspection.verdict} ${a.inspection.score}/10 — ${a.inspection.notes}`);
     if (a.listing) {
-      this.kv(b, 'listing', `${a.listing.title} — $${a.listing.priceUsd.toFixed(2)}`);
+      const gs = a.channels?.gumroad;
+      const livePrice =
+        gs?.priceCents != null ? gs.formattedPrice ?? `$${(gs.priceCents / 100).toFixed(2)}` : null;
+      this.kv(
+        b,
+        'listing',
+        `${a.listing.title} — ${livePrice ? `${livePrice} (gumroad)` : `$${a.listing.priceUsd.toFixed(2)}`}`,
+      );
       const d = document.createElement('div');
       d.className = 'note';
       d.textContent = a.listing.description;
       b.appendChild(d);
     }
-    this.kv(b, 'sales', `${a.sales.views} views · ${a.sales.units} units · $${a.sales.revenueUsd.toFixed(2)} · R${(a.sales.revenueUsd * s.config.usdToZar).toFixed(2)}`);
+    // real gumroad sales if the token can see them; mock sim only in full mode
+    const gship = a.channels?.gumroad;
+    if (gship?.salesCount != null) {
+      const usd = (gship.salesUsdCents ?? 0) / 100;
+      this.kv(b, 'gumroad', `${gship.salesCount} sales · $${usd.toFixed(2)} · R${(usd * s.config.usdToZar).toFixed(2)}`);
+    } else if (gship?.productId) {
+      this.kv(b, 'gumroad', 'sales hidden (needs view_sales)');
+    }
+    if (s.config.mode === 'full') {
+      this.kv(b, 'mock sales', `${a.sales.views} views · ${a.sales.units} units · $${a.sales.revenueUsd.toFixed(2)} · R${(a.sales.revenueUsd * s.config.usdToZar).toFixed(2)}`);
+    }
     this.renderShopSection(b, a, s, meta);
     // fetch meta/atlas only when missing — otherwise the resolved microtask
     // would re-render this drawer forever (the freeze bug)
@@ -1233,6 +1252,22 @@ export class Drawers {
     refresh.addEventListener('click', () => this.net.send({ type: 'refreshGumroad' }));
     h.appendChild(refresh);
     b.appendChild(h);
+    // one-line live store summary (whole store, not only factory-made)
+    const gst = s.channels?.gumroad?.stats;
+    if (gst) {
+      const d = new Date(gst.at);
+      const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+      const sum = document.createElement('div');
+      sum.className = 'note';
+      sum.textContent =
+        `store: ${gst.published} published / ${gst.products} products` +
+        (gst.salesCount != null
+          ? ` · ${gst.salesCount} sales · $${((gst.revenueUsdCents ?? 0) / 100).toFixed(2)}`
+          : ' · sales hidden (token needs view_sales)') +
+        ` · refreshed ${hhmm}` +
+        (gst.error ? ` · ⚠ ${gst.error}` : '');
+      b.appendChild(sum);
+    }
     if (!live.length) {
       const none = document.createElement('div');
       none.className = 'note';
