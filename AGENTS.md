@@ -14,10 +14,11 @@ A Factorio-style, top-down pixel-art factory rendered in the browser. The
 small aliens on the floor are real Devin CLI agent sessions (`devin acp`,
 Agent Client Protocol — JSON-RPC 2.0, one message per line over stdio) that
 produce 2D pixel-game assets: each asset is a code-generated PNG sprite
-sheet written by a "smith" agent, checked by the server, QA'd by an
-"inspector" agent, approved or rejected by the big "Overlord" on the dais,
-packaged by a "packer" and then sold on a MOCK market (pure code, seeded —
-no real money, no real storefront).
+sheet — or a multi-sprite **pack** (4–48 items, each 1–8 frames at one
+shared 16/32 size) — written by a "smith" agent, checked by the server,
+QA'd by an "inspector" agent, approved or rejected by the big "Overlord"
+on the dais, packaged by a "packer" and then sold on a MOCK market (pure
+code, seeded — no real money, no real storefront).
 
 The player is a factory manager: start/pause/stop the shift, send directives
 to the Overlord, inspect assets, browse the gallery and watch the market.
@@ -43,7 +44,8 @@ server/               # tsx (dev) / tsx watch (dev:watch), node:http + ws :4790
                       # parser, permission path guard, meta.json checks
   src/prompts.ts      # every agent prompt template (structured block at the end)
   src/seed.ts         # creates ~/.alien-factory/factory: lib/pix.mjs, STYLE.md,
-                      # three starter assets (gen.mjs run at seed time)
+                      # starter assets + the examples/potion-pack reference
+                      # (gen.mjs run at seed time; pix.mjs re-written on diff)
   src/config.ts       # ~/.alien-factory/config.json + paths
   src/parse.test.ts   # node:test suite → npm test -w server
   src/main.ts         # http + ws, /files static serving, broadcast throttle
@@ -60,10 +62,16 @@ client/               # Vite + TS, zero runtime deps
   src/md.ts           # tiny safe markdown renderer (transcript log)
   src/net.ts          # reconnecting WebSocket
 ~/.alien-factory/factory/   # the sandbox agents actually work in
-  lib/pix.mjs         # zero-dep ESM pixel canvas + PNG emitter (seeded)
+  lib/pix.mjs         # zero-dep ESM pixel canvas + PNG emitter (seeded,
+                      # re-written whenever the embedded lib changes).
+                      # emit() = one sprite; emitPack() = a 4–48-item pack:
+                      # items/<name>.png strips + sheet.png atlas (one row
+                      # per item) + atlas.json + preview.png contact sheet
+                      # + meta.json {kind:'pack', perItem, duplicateItems}
   STYLE.md            # house rules handed to every prompt
   assets/<sku>/       # gen.mjs + sheet.png + preview.png + meta.json + listing.json
-  examples/<name>/    # 3 seeded reference generators (slime, carrot, potion)
+  examples/<name>/    # seeded references: slime, carrot, potion + potion-pack
+                      # (the PARAMETRIC pack reference — palette + param loop)
   reports/            # market-latest.md, trends-<n>.md (written by the scout)
 ```
 
@@ -96,19 +104,24 @@ no publishing code exists.
    the last trend report is >10 market ticks old AND no candidates pending).
 2. Scout reads `reports/market-latest.md`, writes `reports/trends-<n>.md`,
    and ends with `## Demand` + a fenced json array of 3-6 proposals
-   `{title, tags, size, frames, why, demand, variantOf?}` — these become
-   `pending` **candidates** (`c1`, `c2`, …).
+   `{title, kind?, items?, itemNames?, tags, size, frames, why, demand,
+   variantOf?}` — `kind:'pack'` + `items` 4–48 proposes a multi-sprite pack;
+   these become `pending` **candidates** (`c1`, `c2`, …).
 3. The Overlord takes a turn when candidates are pending or a player
    directive arrives — rate-limited to `maxOverlordTurnsPerHour`. It ends
    with `## Decisions` + fenced json
-   `[{id, approve, reason, smith, brief}]`, one per pending candidate.
+   `[{id, approve, reason, smith, brief, kind?, items?, itemNames?}]`, one
+   per pending candidate (it may re-scope sprite↔pack and item counts;
+   orders >48 items must be split into volumes or declined).
    Approvals are capped at `maxApprovalsPerTurn` (extras → declined "over
    capacity"); a missing/invalid `smith` falls back to the smith with the
    shortest forge queue. Approving creates the **asset** (`queued`) and a
    forge job **pinned** to that smith.
 4. The smith writes `assets/<sku>/gen.mjs`; the server re-runs it and
-   checks meta.json (size, frames, ≤16 colours, opaqueRatio, no
-   empty/identical frames). One in-session retry, then `failed`.
+   checks meta.json (sprites: size, frames, ≤16 colours, opaqueRatio, no
+   empty/identical frames; packs: `kind:'pack'`, ≥90% of ordered items and
+   ≤48, per-item 1–8 frames + opaqueRatio, ≤32 colours pack-wide, no
+   empty/duplicate items). One in-session retry, then `failed`.
 5. Inspector looks at `preview.png`, ends with `## Inspection` /
    `Verdict: PASS|FAIL` / `Score:` / `Notes:`. PASS → `on_conveyor` + pack
    job. FAIL once → back to `queued` + a forge job pinned to the SAME
@@ -118,8 +131,9 @@ no publishing code exists.
 
 Asset statuses: `queued → forging → inspecting → on_conveyor → packing →
 listed` (plus `scrapped`/`failed`). The output conveyor only ever carries
-`on_conveyor`+`packing` items. `examples/` holds the three starter
-generators (style references, not catalog items); `stateVersion: 2` wipes
+`on_conveyor`+`packing` items. `examples/` holds the starter
+generators (style references, not catalog items — `potion-pack` is the
+pack reference); `stateVersion: 2` wipes
 pipeline data from the old design on load.
 
 ## Conventions

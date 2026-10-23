@@ -58,6 +58,27 @@ The Overlord's turns are rate-limited (`maxOverlordTurnsPerHour`), approve
 at most `maxApprovalsPerTurn` candidates each, and fire whenever proposals
 are pending or the player sends a directive.
 
+### Sprites and packs
+
+An order is either a single **sprite** (16×16 or 32×32, 1–8 frames, ≤16
+colours — `emit()` writes `sheet.png`/`preview.png`/`meta.json`) or a
+**pack**: 4–48 small sprites in one asset (`kind: "pack"`, `items`, optional
+`itemNames`), each item 1–8 frames at one shared size, ≤32 colours
+pack-wide. `emitPack()` writes:
+
+- `items/<name>.png` — one horizontal strip per item
+- `sheet.png` — the atlas (one row per item, frames left→right)
+- `atlas.json` — `{ size, fps, items: [{ name, x, y, w, h, frames }] }`
+- `preview.png` — a contact sheet of every item's first frame
+- `meta.json` — `kind: "pack"` + per-item stats (`perItem`, `emptyItems`,
+  `duplicateItems`)
+
+Orders bigger than 48 items are split into themed volumes (or declined) by
+the Overlord. `examples/potion-pack/` is the seeded reference generator —
+12 potions from one palette + a parametric loop; smiths are pointed at it.
+On the floor, pack crates wear a `×N` badge and flip through their items;
+the asset drawer shows the full item grid.
+
 ## Autonomy & safety
 
 Tool-call permission requests are auto-approved **only** when every path the

@@ -525,6 +525,17 @@ details pre {
 .gstat.st-failed, .gstat.st-scrapped { color: var(--err); }
 .gstat.st-on_conveyor, .gstat.st-packing { color: var(--amber); }
 
+/* ---- pack item grid (asset drawer) ---- */
+.packgrid { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.packcell {
+  background: rgba(92, 242, 200, 0.05);
+  border: 1px solid rgba(92, 242, 200, 0.2);
+  padding: 4px;
+  text-align: center;
+}
+.packcell canvas { display: block; margin: 0 auto; image-rendering: pixelated; }
+.packname { font-size: 8px; color: var(--phos-dim); margin-top: 2px; max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---- touch ---- */
 #screen { touch-action: manipulation; }
 #hud-menu { display: none; }

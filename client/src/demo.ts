@@ -1,7 +1,8 @@
 // ?demo — a fully client-side fake factory running the new pipeline:
 // scout proposes → overlord decides & assigns smiths → forge → inspect →
 // conveyor → packer → portal → listed. Starts from an empty conveyor.
-import { registerDemoSheet } from './assets';
+import { registerDemoPack, registerDemoSheet } from './assets';
+import type { AtlasItem } from './assets';
 import { Sprite, mulberry32, hashString } from './pix';
 import type { Agent, Asset, Candidate, StateMessage } from '../../shared/protocol';
 
@@ -29,6 +30,44 @@ function demoSheet(sku: string, hue: [number, number, number]): void {
   registerDemoSheet(sku, sheet, { w: 16, h: 16, frames: 4, fps: 4 });
 }
 
+/// A fake 8-item pack: one atlas image (4 frames per item) + atlas.json.
+function demoPack(sku: string, count = 8): void {
+  const frames = 2;
+  const atlasImg = document.createElement('canvas');
+  atlasImg.width = 16 * frames;
+  atlasImg.height = 16 * count;
+  const sc = atlasImg.getContext('2d')!;
+  const names: string[] = [];
+  const items: AtlasItem[] = [];
+  const rnd = mulberry32(hashString(sku));
+  for (let i = 0; i < count; i++) {
+    const name = `item-${i + 1}`;
+    names.push(name);
+    const r = 90 + Math.floor(rnd() * 160);
+    const g = 60 + Math.floor(rnd() * 160);
+    const b = 90 + Math.floor(rnd() * 160);
+    for (let f = 0; f < frames; f++) {
+      const sp = new Sprite(16, 16);
+      const rr = 4 + ((i + f) % 3);
+      for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 16; x++) {
+          const dx = x - 8, dy = y - 9;
+          if (dx * dx + dy * dy <= rr * rr) sp.px(x, y, [r, g, b]);
+        }
+      }
+      sp.rect(7, 1, 2, 4, [200, 190, 160]);
+      sc.drawImage(sp.toCanvas(), f * 16, i * 16);
+    }
+    items.push({ name, x: 0, y: i * 16, w: 16, h: 16, frames });
+  }
+  registerDemoPack(
+    sku,
+    atlasImg,
+    { kind: 'pack', w: 16, h: 16, items: count, frames: count * frames, fps: 4, perItem: [], emptyItems: 0, duplicateItems: 0 },
+    { size: 16, fps: 4, items },
+  );
+}
+
 function mkAgent(id: string, kind: Agent['kind'], name: string, model: string): Agent {
   return {
     id, kind, name, model, modelName: model, sessionId: 'demo',
@@ -37,9 +76,10 @@ function mkAgent(id: string, kind: Agent['kind'], name: string, model: string): 
   };
 }
 
-function mkAsset(sku: string, status: Asset['status'], tag: string, smith?: string): Asset {
+function mkAsset(sku: string, status: Asset['status'], tag: string, smith?: string, packItems = 0): Asset {
   return {
     sku, title: sku, tags: [tag], size: 16, frames: 4,
+    ...(packItems ? { kind: 'pack' as const, items: packItems, itemNames: Array.from({ length: packItems }, (_, i) => `item-${i + 1}`) } : {}),
     orderBrief: `A ${tag} sprite.`,
     candidateId: 'c1', smith,
     status, attempts: 1,
@@ -61,6 +101,7 @@ export function startDemo(apply: (s: StateMessage) => void): void {
   demoSheet('slime-red', [220, 70, 70]);
   demoSheet('potion-purple', [160, 90, 220]);
   demoSheet('tile-moss', [90, 160, 90]);
+  demoPack('potion-shelf-8', 8);
 
   const ev = (text: string, sku?: string) => state.events.push({ at: Date.now(), text, sku });
   const agent = (id: string) => state.agents.find((a) => a.id === id)!;
@@ -204,7 +245,11 @@ export function startDemo(apply: (s: StateMessage) => void): void {
 
   // scripted pipeline
   const script: (() => void)[] = [
-    () => { job('j-scout', 'scout', 'scout'); ev('scout dispatched to read the market'); },
+    () => {
+      job('j-scout', 'scout', 'scout'); ev('scout dispatched to read the market');
+      // a pack already riding the belt → shows the ×N badge + flip-through
+      push(mkAsset('potion-shelf-8', 'on_conveyor', 'potions', 'smith-1', 8));
+    },
     () => {
       doneJob('j-scout');
       state.latestTrendReport = '- **slime** — still trending; variants sell\n- **weapons** — rising\n- **potions** — steady';

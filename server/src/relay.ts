@@ -108,9 +108,11 @@ export class Relay extends EventEmitter {
     mkdirSync(dir, { recursive: true });
     const hashes = (this.assetHashes[sku] ??= {});
     for (const [name, bytes] of Object.entries(files)) {
-      const tmp = join(dir, `.${name}.tmp`);
+      const target = join(dir, name);
+      mkdirSync(join(target, '..'), { recursive: true }); // items/ subdir (packs)
+      const tmp = join(dir, `.${name.replace(/\//g, '_')}.tmp`);
       writeFileSync(tmp, bytes);
-      renameSync(tmp, join(dir, name));
+      renameSync(tmp, target);
       hashes[name] = fileHash(bytes);
     }
     this.emit('change');

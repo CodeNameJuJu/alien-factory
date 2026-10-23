@@ -3,7 +3,7 @@
 // packer ships into the portal on the right).
 import type { Asset, MarketState } from '../../shared/protocol';
 import { crateSprite } from './sprites';
-import { drawAssetFrame } from './assets';
+import { drawAssetFrame, drawPackBadge } from './assets';
 
 export const W = 480;
 export const H = 270;
@@ -343,6 +343,7 @@ function drawCrate(
     if (a) {
       const w = a.size * scale;
       drawAssetFrame(ctx, a, Math.round(x - w / 2), Math.round(y - 11 - w + 4), scale, t);
+      if (a.kind === 'pack') drawPackBadge(ctx, a.items ?? 1, Math.round(x + w / 2 + 4), Math.round(y - 11));
     }
   }
   ctx.restore();

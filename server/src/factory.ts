@@ -12,6 +12,7 @@ import {
   applyApprovalCap,
   capExceeded,
   checkMeta,
+  clampPackItems,
   decidePermission,
   extractReport,
   inspectingRecoverySkus,
@@ -585,6 +586,9 @@ export class FactoryManager extends EventEmitter {
       why: p.why,
       demand: p.demand,
       variantOf: p.variantOf,
+      kind: p.kind,
+      items: p.items,
+      itemNames: p.itemNames,
       evidence: p.evidence,
       priceBand: p.priceBand,
     }));
@@ -608,6 +612,9 @@ export class FactoryManager extends EventEmitter {
           why: p.why,
           demand: p.demand,
           variantOf: p.variantOf,
+          kind: p.kind ?? 'sprite',
+          items: p.kind === 'pack' ? clampPackItems(p.items) : undefined,
+          itemNames: p.itemNames,
           reportN: this.market.tick,
           status: 'pending',
           createdAt: Date.now(),
@@ -653,6 +660,9 @@ export class FactoryManager extends EventEmitter {
       tags: asset.tags,
       size: asset.size,
       frames: asset.frames,
+      kind: asset.kind ?? 'sprite',
+      items: asset.items,
+      itemNames: asset.itemNames,
       variantOf: asset.variantOf,
       brief: asset.orderBrief,
     };
@@ -814,6 +824,11 @@ export class FactoryManager extends EventEmitter {
         smithQueues,
         pendingDirectives: directives,
         maxApprovals: this.config.maxApprovalsPerTurn,
+        // everything already approved/forging/on the line/listed — the
+        // overlord must decline duplicates of these
+        inProgress: this.assets
+          .filter((a) => a.status !== 'failed' && a.status !== 'scrapped')
+          .map((a) => a.title),
       });
       let text = await this.turn(overlord, promptText);
       let decisions = parseDecisions(text);
@@ -837,12 +852,22 @@ export class FactoryManager extends EventEmitter {
           const queueLengths = Object.fromEntries(smithQueues.map((s) => [s.id, s.queue]));
           const smithId = pickSmith(d.smith, smithIds, queueLengths);
           const sku = this.uniqueSku(slugify(c.title));
+          // the overlord may re-scope kind/items/itemNames on approval
+          const kind = d.kind ?? c.kind ?? 'sprite';
+          const items = kind === 'pack' ? clampPackItems(d.items ?? c.items) : undefined;
+          const itemNames = kind === 'pack' ? d.itemNames ?? c.itemNames : undefined;
+          c.kind = kind;
+          c.items = items;
+          c.itemNames = itemNames;
           const asset: Asset = {
             sku,
             title: c.title,
             tags: c.tags,
             size: c.size,
             frames: c.frames,
+            kind,
+            items,
+            itemNames,
             variantOf: c.variantOf && this.asset(c.variantOf) ? c.variantOf : undefined,
             orderBrief: d.brief || c.why,
             candidateId: c.id,

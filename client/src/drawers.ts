@@ -2,7 +2,8 @@
 // detail, market report and the gallery.
 import type { Net } from './net';
 import { renderMd } from './md';
-import { drawAssetFrame, fetchMeta, metaFor } from './assets';
+import { atlasFor, drawAssetFrame, drawAtlasItem, fetchAtlas, fetchMeta, metaFor } from './assets';
+import type { AtlasItem } from './assets';
 import { fmtTokens } from './hud';
 import type { Agent, AgentKind, Asset, StateMessage, UsageCounts } from '../../shared/protocol';
 
@@ -28,7 +29,7 @@ export class Drawers {
   private el: HTMLDivElement;
   private sel: Selection | null = null;
   private state: StateMessage | null = null;
-  private animCanvases: { c: HTMLCanvasElement; asset: Asset; scale: number }[] = [];
+  private animCanvases: { c: HTMLCanvasElement; asset: Asset; scale: number; item?: AtlasItem }[] = [];
   private galleryFilter = '';
   private overlordTab = 'proposals';
   private lastKey = '';
@@ -133,11 +134,12 @@ export class Drawers {
 
   /// called every frame — animates asset previews in the open drawer
   tick(t: number): void {
-    for (const { c, asset, scale } of this.animCanvases) {
+    for (const { c, asset, scale, item } of this.animCanvases) {
       const ctx = c.getContext('2d')!;
       ctx.imageSmoothingEnabled = false;
       ctx.clearRect(0, 0, c.width, c.height);
-      drawAssetFrame(ctx, asset, 0, 0, scale, t);
+      if (item) drawAtlasItem(ctx, asset.sku, item, 0, 0, scale, t);
+      else drawAssetFrame(ctx, asset, 0, 0, scale, t);
     }
   }
 
@@ -285,7 +287,8 @@ export class Drawers {
         info.innerHTML = `<b></b> <span class="dim"></span><div class="note"></div>`;
         info.querySelector('b')!.textContent = `${c.id} · ${c.title}`;
         (info.querySelector('.dim') as HTMLElement).textContent =
-          ` ${c.tags.join(', ')} · ${c.size}px×${c.frames}f · demand ${c.demand}/10`;
+          ` ${c.tags.join(', ')} · ${c.size}px×${c.frames}f · demand ${c.demand}/10` +
+          (c.kind === 'pack' ? ` · pack ×${c.items ?? '?'}` : '');
         (info.querySelector('.note') as HTMLElement).textContent =
           c.why + (c.variantOf ? ` · variant of ${c.variantOf}` : '');
         row.appendChild(info);
@@ -303,7 +306,7 @@ export class Drawers {
           if (a) this.thumb(row, a, 3);
           const info = document.createElement('div');
           info.innerHTML = `<span class="${c.status === 'approved' ? 'v-pass' : 'v-fail'} verdict">${c.status === 'approved' ? '✓' : '✗'}</span> <b></b><div class="note"></div>`;
-          info.querySelector('b')!.textContent = `${c.id} · ${c.title}`;
+          info.querySelector('b')!.textContent = `${c.id} · ${c.title}${c.kind === 'pack' ? ` ×${c.items ?? '?'}` : ''}`;
           (info.querySelector('.note') as HTMLElement).textContent =
             `${c.reason ?? ''}${c.smith ? ` · → ${c.smith}` : ''}${c.sku ? ` · ${c.sku}` : ''}`;
           row.appendChild(info);
@@ -366,7 +369,10 @@ export class Drawers {
     if (job) {
       this.kv(b, 'current job', `${job.kind} ${job.sku ?? ''}${job.pinnedTo ? ' (pinned)' : ''}`);
       const asset = job.sku ? s.assets.find((x) => x.sku === job.sku) : undefined;
-      if (asset) this.thumb(b, asset, 5);
+      if (asset) {
+        if (asset.kind === 'pack') this.kv(b, 'pack', `×${asset.items ?? '?'} items`);
+        this.thumb(b, asset, 5);
+      }
     }
     const cancel = document.createElement('button');
     cancel.className = 'btn danger';
@@ -404,25 +410,69 @@ export class Drawers {
   // ---- asset ------------------------------------------------------------------
 
   private renderAsset(a: Asset, s: StateMessage): void {
-    this.head(a.sku, a.status, { label: '[ show in finder ]', fn: () => reveal({ sku: a.sku }) });
+    const isPack = a.kind === 'pack';
+    this.head(a.sku, `${a.status}${isPack ? ` · pack ×${a.items ?? '?'}` : ''}`, { label: '[ show in finder ]', fn: () => reveal({ sku: a.sku }) });
     const b = this.body();
-    const big = document.createElement('canvas');
     const meta = metaFor(a.sku);
     const w = meta?.w ?? a.size;
+    const big = document.createElement('canvas');
     big.width = w * 8;
     big.height = w * 8;
     big.className = 'abig';
     b.appendChild(big);
     this.animCanvases.push({ c: big, asset: a, scale: 8 });
-    const sheet = document.createElement('img');
-    sheet.src = `/files/assets/${a.sku}/sheet.png`;
-    sheet.className = 'asheet';
-    sheet.onerror = () => (sheet.style.display = 'none');
-    b.appendChild(sheet);
+    if (isPack) {
+      // grid of every item, each animated from the atlas
+      const atlas = atlasFor(a.sku);
+      const cellScale = w <= 16 ? 3 : 2;
+      const grid = document.createElement('div');
+      grid.className = 'packgrid';
+      if (atlas) {
+        for (const it of atlas.items) {
+          const cell = document.createElement('div');
+          cell.className = 'packcell';
+          cell.title = it.name;
+          const c = document.createElement('canvas');
+          c.width = it.w * cellScale;
+          c.height = it.h * cellScale;
+          cell.appendChild(c);
+          const nm = document.createElement('div');
+          nm.className = 'packname';
+          nm.textContent = it.name;
+          cell.appendChild(nm);
+          grid.appendChild(cell);
+          this.animCanvases.push({ c, asset: a, scale: cellScale, item: it });
+        }
+      } else {
+        grid.className = 'note';
+        grid.textContent = '(atlas loading…)';
+      }
+      b.appendChild(grid);
+      const links = document.createElement('div');
+      links.className = 'note';
+      links.append(document.createTextNode('files: '));
+      for (const f of ['sheet.png', 'atlas.json', 'preview.png']) {
+        const l = document.createElement('a');
+        l.href = `/files/assets/${a.sku}/${f}`;
+        l.target = '_blank';
+        l.rel = 'noopener';
+        l.textContent = f;
+        links.append(l, document.createTextNode(' '));
+      }
+      b.appendChild(links);
+    } else {
+      const sheet = document.createElement('img');
+      sheet.src = `/files/assets/${a.sku}/sheet.png`;
+      sheet.className = 'asheet';
+      sheet.onerror = () => (sheet.style.display = 'none');
+      b.appendChild(sheet);
+    }
 
     this.kv(b, 'title', a.title);
     this.kv(b, 'tags', a.tags.join(', '));
-    this.kv(b, 'size', `${a.size}×${a.size} × ${a.frames}f`);
+    this.kv(b, 'kind', isPack ? `pack ×${a.items ?? '?'}` : 'sprite');
+    this.kv(b, 'size', `${a.size}×${a.size} × ${a.frames}f${isPack ? ' / item' : ''}`);
+    if (isPack && a.itemNames?.length) this.kv(b, 'items', a.itemNames.slice(0, 12).join(', ') + (a.itemNames.length > 12 ? '…' : ''));
     const cand = a.candidateId ? s.candidates.find((x) => x.id === a.candidateId) : undefined;
     if (cand) {
       this.kv(b, 'proposal', `${cand.id} · demand ${cand.demand}/10 — ${cand.why}`);
@@ -454,11 +504,16 @@ export class Drawers {
       b.appendChild(d);
     }
     this.kv(b, 'sales', `${a.sales.views} views · ${a.sales.units} units · $${a.sales.revenueUsd.toFixed(2)} · R${(a.sales.revenueUsd * s.config.usdToZar).toFixed(2)}`);
-    // fetch meta only when missing — otherwise the resolved microtask would
-    // re-render this drawer forever (the freeze bug)
+    // fetch meta/atlas only when missing — otherwise the resolved microtask
+    // would re-render this drawer forever (the freeze bug)
     if (!meta) {
       void fetchMeta(a.sku).then((m) => {
         if (m && this.sel?.type === 'asset' && this.sel.id === a.sku) this.render();
+      });
+    }
+    if (isPack && !atlasFor(a.sku)) {
+      void fetchAtlas(a.sku).then((at) => {
+        if (at && this.sel?.type === 'asset' && this.sel.id === a.sku) this.render();
       });
     }
   }
@@ -814,7 +869,8 @@ export class Drawers {
         info.innerHTML = `<b></b> <span class="dim"></span><div class="note"></div>`;
         info.querySelector('b')!.textContent = o.title;
         (info.querySelector('.dim') as HTMLElement).textContent =
-          ` ${o.tags.join(', ')} · ${o.size}px×${o.frames}f · demand ${o.demand}/10${o.priceBand ? ` · ${o.priceBand}` : ''}`;
+          ` ${o.tags.join(', ')} · ${o.size}px×${o.frames}f · demand ${o.demand}/10${o.priceBand ? ` · ${o.priceBand}` : ''}` +
+          (o.kind === 'pack' ? ` · pack ×${o.items ?? '?'}` : '');
         const note = info.querySelector('.note') as HTMLElement;
         note.textContent = o.why;
         for (const u of o.evidence ?? []) {
@@ -862,7 +918,7 @@ export class Drawers {
       this.thumb(cell, a, 4);
       const cap = document.createElement('div');
       cap.className = 'gcap';
-      cap.textContent = a.sku;
+      cap.textContent = a.kind === 'pack' ? `${a.sku} ×${a.items ?? '?'}` : a.sku;
       const st = document.createElement('div');
       st.className = `gstat st-${a.status}`;
       st.textContent = a.status;

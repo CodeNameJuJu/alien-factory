@@ -625,3 +625,118 @@ test('resolveModel: wanted id wins, else session default flagged as mismatch', a
     id: 'also-gone', name: 'also-gone', mismatch: true,
   });
 });
+
+// ---- multi-sprite packs ----------------------------------------------------------
+
+test('parseDemand reads pack fields and clamps items 4-48', () => {
+  const text = `## Demand\n\`\`\`json\n[
+    {"title":"RPG Icons Vol.1","kind":"pack","items":600,"itemNames":["sword","shield"],"tags":["icons"],"size":16,"frames":4,"why":"packs sell","demand":9},
+    {"title":"One Slime","kind":"pack","items":2,"tags":["slime"],"why":"x","demand":5},
+    {"title":"Plain","kind":"mystery","items":20,"tags":["x"],"why":"y","demand":5}
+  ]\n\`\`\``;
+  const p = parseDemand(text);
+  assert.equal(p.length, 3);
+  assert.equal(p[0].kind, 'pack');
+  assert.equal(p[0].items, 48);          // clamped down
+  assert.deepEqual(p[0].itemNames, ['sword', 'shield']);
+  assert.equal(p[1].kind, 'pack');
+  assert.equal(p[1].items, 4);           // clamped up
+  assert.equal(p[2].kind, 'sprite');     // unknown kind → sprite
+  assert.equal(p[2].items, undefined);   // sprites carry no item count
+});
+
+test('parseDecisions reads pack re-scoping fields', () => {
+  const text = `## Decisions\n\`\`\`json\n[
+    {"id":"c1","approve":true,"reason":"go","smith":"smith-1","kind":"pack","items":24,"itemNames":["a","b"]},
+    {"id":"c2","approve":true,"reason":"ok","kind":"sprite","items":30},
+    {"id":"c3","approve":false,"reason":"no"}
+  ]\n\`\`\``;
+  const d = parseDecisions(text);
+  assert.equal(d[0].kind, 'pack');
+  assert.equal(d[0].items, 24);
+  assert.deepEqual(d[0].itemNames, ['a', 'b']);
+  assert.equal(d[1].kind, 'sprite');
+  assert.equal(d[1].items, undefined);   // items only meaningful on packs
+  assert.equal(d[2].kind, undefined);
+});
+
+const packMeta = (n: number, over: Record<string, unknown> = {}, perItem: unknown[] = []) => ({
+  kind: 'pack',
+  w: 16,
+  h: 16,
+  items: n,
+  frames: n * 4,
+  fps: 4,
+  colors: ['#111', '#222'],
+  perItem: perItem as import('./parse.js').MetaPackItem[],
+  emptyItems: 0,
+  duplicateItems: 0,
+  ...over,
+});
+
+const packItem = (name: string, over: Record<string, unknown> = {}) => ({
+  name, frames: 4, colors: ['#1'], opaqueRatio: 0.4, emptyFrames: 0, identicalFrames: 1, ...over,
+});
+
+test('checkMeta: valid pack passes for a 12-item order', () => {
+  const perItem = Array.from({ length: 12 }, (_, i) => packItem(`item-${i}`));
+  const r = checkMeta(packMeta(12, { perItem }), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.equal(r.passed, true);
+  assert.deepEqual(r.issues, []);
+});
+
+test('checkMeta: pack with too few items fails naming the window', () => {
+  const r = checkMeta(packMeta(3), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.equal(r.passed, false);
+  assert.ok(r.issues.some((i) => /only 3 items/.test(i)));
+});
+
+test('checkMeta: bad items are named (list capped at 5 + …)', () => {
+  const perItem = Array.from({ length: 12 }, (_, i) =>
+    packItem(`item-${i}`, i < 7 ? { frames: 12 } : {}));
+  const r = checkMeta(packMeta(12, { perItem }), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.equal(r.passed, false);
+  const msg = r.issues.find((i) => /frames out of range/.test(i))!;
+  assert.match(msg, /item-0, item-1, item-2, item-3, item-4…/);
+  const r2 = checkMeta(
+    packMeta(12, { perItem: [packItem('x', { opaqueRatio: 0.01 }), ...perItem.slice(1)] }),
+    { size: 16, frames: 4, kind: 'pack', items: 12 },
+  );
+  assert.ok(r2.issues.some((i) => /opaqueRatio.*x/.test(i)));
+});
+
+test('checkMeta: duplicate items, colour cap and non-pack meta fail', () => {
+  const r = checkMeta(packMeta(12, { duplicateItems: 2 }), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.ok(r.issues.some((i) => /2 duplicate/.test(i)));
+  const r2 = checkMeta(packMeta(12, { colors: Array(33).fill('#x') }), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.ok(r2.issues.some((i) => /33 colours/.test(i)));
+  const r3 = checkMeta(packMeta(12, { kind: undefined }), { size: 16, frames: 4, kind: 'pack', items: 12 });
+  assert.ok(r3.issues.some((i) => /kind/.test(i)));
+  // packs may carry way more than 8 total frames — that's per item
+  const r4 = checkMeta(packMeta(48, { frames: 48 * 8 }), { size: 16, frames: 8, kind: 'pack', items: 48 });
+  assert.ok(!r4.issues.some((i) => /out of range 1-8$/.test(i)));
+});
+
+test('opportunitiesToCandidates carries pack fields through', () => {
+  const cs = opportunitiesToCandidates(
+    [
+      { title: 'Icon Pack', tags: ['ui'], size: 16, frames: 4, why: 'w', demand: 8, kind: 'pack', items: 500, itemNames: ['a'] },
+      { title: 'Single', tags: ['ui'], size: 16, frames: 2, why: 'w', demand: 5 },
+    ],
+    { startCounter: 0, reportN: 1, now: 1 },
+  );
+  assert.equal(cs[0].kind, 'pack');
+  assert.equal(cs[0].items, 48);
+  assert.deepEqual(cs[0].itemNames, ['a']);
+  assert.equal(cs[1].kind, 'sprite');
+  assert.equal(cs[1].items, undefined);
+});
+
+test('writeIfDiffers rewrites lib when content changes, skips identical', async () => {
+  const { writeIfDiffers } = await import('./seed.js');
+  const p = `/tmp/af-wid-${Date.now()}/lib/pix.mjs`;
+  assert.equal(writeIfDiffers(p, 'v1'), true);   // missing → write
+  assert.equal(writeIfDiffers(p, 'v1'), false);  // identical → skip
+  assert.equal(writeIfDiffers(p, 'v2'), true);   // differs → update
+  assert.equal(readFileSync(p, 'utf8'), 'v2');
+});

@@ -4,6 +4,7 @@ import { resolve, sep } from 'node:path';
 import type {
   AgentKind,
   AssetInspection,
+  AssetKind,
   Candidate,
   DailyTokenCaps,
   JobKind,
@@ -64,7 +65,23 @@ export interface OverlordDecision {
   reason: string;
   smith?: string;
   brief?: string;
+  /// the overlord may re-scope an order: sprite↔pack, item count, names
+  kind?: AssetKind;
+  items?: number;
+  itemNames?: string[];
 }
+
+/// Pack item count bounds + the slug the emit layer enforces.
+export const PACK_MIN_ITEMS = 4;
+export const PACK_MAX_ITEMS = 48;
+export const clampPackItems = (n: unknown): number =>
+  Math.min(PACK_MAX_ITEMS, Math.max(PACK_MIN_ITEMS, Math.round(Number(n) || PACK_MIN_ITEMS)));
+
+const validKind = (k: unknown): AssetKind | undefined =>
+  k === 'pack' || k === 'sprite' ? k : undefined;
+
+const validItemNames = (v: unknown): string[] | undefined =>
+  Array.isArray(v) ? (v.filter((n: Json) => typeof n === 'string' && n.trim()).slice(0, PACK_MAX_ITEMS) as string[]) : undefined;
 
 export function parseDecisions(text: string): OverlordDecision[] {
   const raw = fencedJson(section(text, 'Decisions'));
@@ -72,12 +89,16 @@ export function parseDecisions(text: string): OverlordDecision[] {
   const out: OverlordDecision[] = [];
   for (const d of raw) {
     if (typeof d?.id !== 'string') continue;
+    const kind = validKind(d.kind);
     out.push({
       id: d.id,
       approve: d.approve === true || d.approve === 'true',
       reason: String(d.reason ?? ''),
       smith: typeof d.smith === 'string' && d.smith ? d.smith : undefined,
       brief: typeof d.brief === 'string' && d.brief ? d.brief : undefined,
+      kind,
+      items: kind === 'pack' ? clampPackItems(d.items) : undefined,
+      itemNames: validItemNames(d.itemNames),
     });
   }
   return out;
@@ -129,6 +150,9 @@ export function parseDemand(text: string): DemandProposal[] {
       tags: Array.isArray(o.tags) ? o.tags.filter((t: Json) => typeof t === 'string') : [],
       size: o.size === 32 ? 32 : 16,
       frames: Math.min(8, Math.max(1, Math.round(Number(o.frames) || 1))),
+      kind: validKind(o.kind) ?? 'sprite',
+      items: validKind(o.kind) === 'pack' ? clampPackItems(o.items) : undefined,
+      itemNames: validItemNames(o.itemNames),
       variantOf: typeof o.variantOf === 'string' && o.variantOf ? o.variantOf : undefined,
       brief: String(o.brief ?? ''),
       why: String(o.why ?? o.brief ?? ''),
@@ -281,17 +305,35 @@ export interface MetaJson {
   opaqueRatio?: number;
   emptyFrames?: number;
   identicalFrames?: number;
+  /// emitPack assets only:
+  kind?: string;
+  items?: number;
+  perItem?: MetaPackItem[];
+  emptyItems?: number;
+  duplicateItems?: number;
+}
+
+export interface MetaPackItem {
+  name: string;
+  frames: number;
+  colors: string[];
+  opaqueRatio: number;
+  emptyFrames: number;
+  identicalFrames: number;
 }
 
 export interface OrderLike {
   size: number;
   frames: number;
+  kind?: string;
+  items?: number;
 }
 
 /// Pure check of a generated asset's meta.json against the order.
 export function checkMeta(meta: MetaJson | null, order: OrderLike): { passed: boolean; issues: string[] } {
   const issues: string[] = [];
   if (!meta) return { passed: false, issues: ['no meta.json — did gen.mjs call emit()?'] };
+  if (order.kind === 'pack') return checkPackMeta(meta, order);
   if (meta.w !== order.size || meta.h !== order.size) {
     issues.push(`frame size ${meta.w}x${meta.h} — expected ${order.size}x${order.size}`);
   }
@@ -310,6 +352,47 @@ export function checkMeta(meta: MetaJson | null, order: OrderLike): { passed: bo
   if ((meta.frames ?? 0) > 1 && meta.identicalFrames === meta.frames) {
     issues.push('all frames are identical — animate it');
   }
+  return { passed: issues.length === 0, issues };
+}
+
+const capList = (names: string[]): string =>
+  names.length > 5 ? `${names.slice(0, 5).join(', ')}…` : names.join(', ');
+
+/// Pack checks: one item = one small sprite; sprite rules apply per item,
+/// pack-wide rules on top (kind marker, item count window, ≤32 colours, no
+/// duplicates). Offending items are named (≤5 names + "…").
+export function checkPackMeta(meta: MetaJson, order: OrderLike): { passed: boolean; issues: string[] } {
+  const issues: string[] = [];
+  if (meta.kind !== 'pack') issues.push(`meta kind "${meta.kind ?? '?'}" — emitPack writes kind:"pack"`);
+  if (meta.w !== order.size || meta.h !== order.size) {
+    issues.push(`frame size ${meta.w}x${meta.h} — expected ${order.size}x${order.size}`);
+  }
+  const want = Math.round(Number(order.items) || PACK_MIN_ITEMS);
+  const minItems = Math.max(PACK_MIN_ITEMS, Math.floor(0.9 * want));
+  const got = Number(meta.items ?? 0);
+  if (got < minItems) issues.push(`only ${got} items — order wants ~${want} (min ${minItems})`);
+  if (got > PACK_MAX_ITEMS) issues.push(`${got} items > ${PACK_MAX_ITEMS} — split into volumes`);
+  const perItem = Array.isArray(meta.perItem) ? meta.perItem : [];
+  const framesBad: string[] = [];
+  const ratioBad: string[] = [];
+  const emptyBad: string[] = [];
+  const staticBad: string[] = [];
+  for (const it of perItem) {
+    if (typeof it.frames !== 'number' || it.frames < 1 || it.frames > 8) framesBad.push(it.name);
+    const r = it.opaqueRatio;
+    if (typeof r !== 'number' || r < 0.08 || r > 0.9) ratioBad.push(it.name);
+    if (it.emptyFrames) emptyBad.push(it.name);
+    if ((it.frames ?? 0) > 1 && it.identicalFrames === it.frames) staticBad.push(it.name);
+  }
+  if (framesBad.length) issues.push(`items with frames out of range 1-8: ${capList(framesBad)}`);
+  if (ratioBad.length) issues.push(`items with opaqueRatio outside 0.08-0.9: ${capList(ratioBad)}`);
+  if (emptyBad.length) issues.push(`items with empty frames: ${capList(emptyBad)}`);
+  if (staticBad.length) issues.push(`items with all-identical frames: ${capList(staticBad)}`);
+  if (Array.isArray(meta.colors) && meta.colors.length > 32) {
+    issues.push(`${meta.colors.length} colours across the pack — limit is 32`);
+  }
+  if (meta.emptyItems) issues.push(`${meta.emptyItems} item(s) fully transparent`);
+  if (meta.duplicateItems) issues.push(`${meta.duplicateItems} duplicate item(s) — every item must be distinct`);
   return { passed: issues.length === 0, issues };
 }
 
@@ -381,6 +464,9 @@ export function opportunitiesToCandidates(
     tags: o.tags,
     size: o.size >= 32 ? 32 : 16,
     frames: Math.min(8, Math.max(1, o.frames | 0)),
+    kind: validKind(o.kind) ?? 'sprite',
+    items: validKind(o.kind) === 'pack' ? clampPackItems(o.items) : undefined,
+    itemNames: validItemNames(o.itemNames),
     why: o.why,
     demand: Math.min(10, Math.max(1, o.demand | 0)),
     variantOf: o.variantOf,

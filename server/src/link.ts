@@ -6,8 +6,11 @@ import type {
 } from '../../shared/protocol.js';
 
 export const SKU_RE = /^[a-z0-9-]{1,60}$/;
-/// files a worker may push for an asset — nothing else is ever written
-export const ASSET_FILES = new Set(['sheet.png', 'preview.png', 'meta.json', 'listing.json', 'gen.mjs']);
+/// files a worker may push for an asset — nothing else is ever written.
+/// `atlas.json` is the pack layout; `items/<slug>.png` are pack strips.
+export const ASSET_FILES = new Set(['sheet.png', 'preview.png', 'meta.json', 'atlas.json', 'listing.json', 'gen.mjs']);
+export const ASSET_ITEM_RE = /^items\/[a-z0-9-]{1,40}\.png$/;
+export const assetFileOk = (name: string): boolean => ASSET_FILES.has(name) || ASSET_ITEM_RE.test(name);
 export const MAX_LINK_MSG = 4 * 1024 * 1024;
 export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -35,7 +38,7 @@ export function parseAssetMsg(raw: unknown): { sku: string; files: Record<string
   if (typeof m.files !== 'object' || m.files === null) return null;
   const files: Record<string, Buffer> = {};
   for (const [name, b64] of Object.entries(m.files as Record<string, unknown>)) {
-    if (!ASSET_FILES.has(name) || typeof b64 !== 'string') return null;
+    if (!assetFileOk(name) || typeof b64 !== 'string') return null;
     const bytes = Buffer.from(b64, 'base64');
     if (bytes.length === 0 || bytes.length > MAX_FILE_BYTES) return null;
     files[name] = bytes;

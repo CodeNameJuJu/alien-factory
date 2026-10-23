@@ -132,7 +132,9 @@ export class Market {
       const demand = a.tags.reduce((s, t) => s + (this.tagDemand.get(t) ?? 0.2), 0);
       const age = Math.max(0, this.tick - (this.listedAt.get(a.sku) ?? this.tick));
       const novelty = Math.pow(0.5, age / NOVELTY_HALFLIFE_TICKS) * 0.8 + 0.2;
-      const views = Math.round(demand * 40 * novelty * (0.5 + rnd()));
+      // packs browse better: buyers flip through items → views bonus
+      const packBoost = a.kind === 'pack' ? 1 + Math.log2(Math.max(1, a.items ?? 1)) / 4 : 1;
+      const views = Math.round(demand * 40 * novelty * packBoost * (0.5 + rnd()));
       const q = this.quality.get(a.sku) ?? 5;
       const price = a.listing?.priceUsd ?? 4.99;
       // cheap + high quality converts; expensive + low quality doesn't

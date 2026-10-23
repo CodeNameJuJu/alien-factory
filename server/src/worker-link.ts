@@ -1,11 +1,11 @@
 // Worker side of the worker ⇄ relay link (the Mac running the agents).
 // Opens an OUTBOUND ws to the relay — nothing inbound is ever accepted.
 import { EventEmitter } from 'node:events';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { FACTORY_DIR } from './config.js';
-import { ASSET_FILES, fileHash } from './link.js';
+import { ASSET_FILES, ASSET_ITEM_RE, fileHash } from './link.js';
 import { LINK_PROTOCOL } from '../../shared/protocol.js';
 import type { FactoryManager } from './factory.js';
 import type {
@@ -176,7 +176,16 @@ export class WorkerLink extends EventEmitter {
       if (!existsSync(dir)) continue;
       const sent = (this.sentHashes[asset.sku] ??= {});
       const files: Record<string, string> = {};
-      for (const name of ASSET_FILES) {
+      // packs add items/<name>.png strips on top of the fixed file list
+      const names = [...ASSET_FILES];
+      try {
+        for (const n of readdirSync(join(dir, 'items'))) {
+          if (ASSET_ITEM_RE.test(`items/${n}`)) names.push(`items/${n}`);
+        }
+      } catch {
+        /* no items dir → single sprite */
+      }
+      for (const name of names) {
         const p = join(dir, name);
         if (!existsSync(p)) continue;
         const bytes = readFileSync(p);

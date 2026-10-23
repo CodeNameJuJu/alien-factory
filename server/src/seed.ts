@@ -4,7 +4,7 @@
 // runs when its sheet.png is absent. Starters that were seeded into
 // assets/ by the old design are moved to examples/ once.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { FACTORY_DIR } from './config.js';
 
@@ -227,6 +227,110 @@ export function emit(outDir, { frames, fps = 4 }) {
   writeFileSync(join(outDir, 'meta.json'), JSON.stringify(meta, null, 2));
   return meta;
 }
+
+/// Write a multi-sprite PACK: items/<name>.png per item, sheet.png atlas
+/// (one row per item, frames left→right), atlas.json, preview.png contact
+/// sheet (first frame of each item) and a pack-shaped meta.json.
+export function emitPack(outDir, { items, fps = 4 }) {
+  if (!items || !items.length) throw new Error('emitPack needs at least one item');
+  mkdirSync(outDir, { recursive: true });
+  const norm = [];
+  const seen = new Set();
+  for (const it of items) {
+    const name = String(it.name || '')
+      .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    if (!name) throw new Error('item name must slugify to [a-z0-9-]: ' + it.name);
+    if (seen.has(name)) throw new Error('duplicate item name: ' + name);
+    seen.add(name);
+    if (!it.frames || !it.frames.length) throw new Error('item ' + name + ' has no frames');
+    norm.push({ name, frames: it.frames });
+  }
+  const size = norm[0].frames[0].w;
+  for (const it of norm) {
+    for (const f of it.frames) {
+      if (f.w !== size || f.h !== size) throw new Error('all pack frames must be ' + size + 'x' + size);
+    }
+  }
+  mkdirSync(join(outDir, 'items'), { recursive: true });
+
+  const maxFrames = Math.max(...norm.map((it) => it.frames.length));
+  const atlas = new Canvas(size * maxFrames, size * norm.length);
+  const atlasItems = [];
+  const colors = new Set();
+  const perItem = [];
+  let emptyItems = 0;
+  let duplicateItems = 0;
+  const firstFrames = [];
+  norm.forEach((it, row) => {
+    const strip = sheetRgba(it.frames);
+    writeFileSync(join(outDir, 'items', it.name + '.png'), encodePng(strip.w, strip.h, strip.data));
+    for (let f = 0; f < it.frames.length; f++) {
+      const fr = it.frames[f];
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) atlas.px(f * size + x, row * size + y, fr.get(x, y));
+    }
+    atlasItems.push({ name: it.name, x: 0, y: row * size, w: size, h: size, frames: it.frames.length });
+    // per-item stats
+    const icolors = new Set();
+    let opaque = 0, emptyFrames = 0, identicalFrames = 0, totalPx = 0;
+    for (const fr of it.frames) {
+      let fo = 0;
+      for (let i = 0; i < fr.data.length; i += 4) {
+        if (fr.data[i + 3]) {
+          fo++;
+          icolors.add(hex(fr.data[i], fr.data[i + 1], fr.data[i + 2]));
+          colors.add(hex(fr.data[i], fr.data[i + 1], fr.data[i + 2]));
+        }
+      }
+      if (!fo) emptyFrames++;
+      if (Buffer.from(fr.data.buffer).equals(Buffer.from(it.frames[0].data.buffer))) identicalFrames++;
+      opaque += fo;
+      totalPx += size * size;
+    }
+    perItem.push({
+      name: it.name,
+      frames: it.frames.length,
+      colors: [...icolors],
+      opaqueRatio: +(opaque / totalPx).toFixed(3),
+      emptyFrames,
+      identicalFrames,
+    });
+    if (!opaque) emptyItems++;
+    if (firstFrames.some((ff) => Buffer.from(ff.data.buffer).equals(Buffer.from(it.frames[0].data.buffer)))) {
+      duplicateItems++;
+    }
+    firstFrames.push(it.frames[0]);
+  });
+  writeFileSync(join(outDir, 'sheet.png'), encodePng(atlas.w, atlas.h, atlas.data));
+  writeFileSync(join(outDir, 'atlas.json'), JSON.stringify({ size, fps, items: atlasItems }, null, 2));
+
+  // contact sheet: first frame of each item in a grid
+  const cols = Math.min(8, Math.ceil(Math.sqrt(norm.length)));
+  const rows = Math.ceil(norm.length / cols);
+  const grid = new Canvas(cols * size, rows * size);
+  norm.forEach((it, i) => {
+    const gx = (i % cols) * size, gy = Math.floor(i / cols) * size;
+    const fr = it.frames[0];
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) grid.px(gx + x, gy + y, fr.get(x, y));
+  });
+  const k = cols * size * 4 > 1024 ? 2 : 4;
+  const prev = scaleRgba(grid, k);
+  writeFileSync(join(outDir, 'preview.png'), encodePng(prev.w, prev.h, prev.data));
+
+  const meta = {
+    kind: 'pack',
+    w: size,
+    h: size,
+    items: norm.length,
+    frames: norm.reduce((s, it) => s + it.frames.length, 0),
+    fps,
+    colors: [...colors],
+    perItem,
+    emptyItems,
+    duplicateItems,
+  };
+  writeFileSync(join(outDir, 'meta.json'), JSON.stringify(meta, null, 2));
+  return meta;
+}
 `;
 
 const STYLE_MD = `# STYLE.md — Alien Factory house rules
@@ -240,12 +344,16 @@ Every asset is a small sprite sheet produced by code, not by hand-drawing.
   \`emit(new URL('.', import.meta.url).pathname, { frames, fps })\`
 - \`emit\` writes \`sheet.png\` (frames side by side), \`preview.png\`
   (sheet scaled x4) and \`meta.json\` (stats). You never write PNGs yourself.
+- Multi-sprite PACKS use \`emitPack(outDir, { items: [{ name, frames }], fps })\`
+  instead: it writes \`items/<name>.png\` per item, a \`sheet.png\` atlas
+  (one row per item), \`atlas.json\`, a \`preview.png\` contact sheet and a
+  \`meta.json\` with \`kind: 'pack'\`.
 
 ## Look
 
 - Frame size 16x16 or 32x32 (must match the order).
 - 1-8 frames, \`fps\` 2-8.
-- 16 distinct opaque colours max, transparent background.
+- 16 distinct opaque colours max per SPRITE, 32 across a whole PACK.
 - 1px dark outline around the silhouette (\`c.outline('#...')\` last).
 - Readable silhouette: it must read at 16x16, not just at x4 zoom.
 - Deterministic: seed every random choice with
@@ -259,6 +367,9 @@ Every asset is a small sprite sheet produced by code, not by hand-drawing.
 
 \`examples/slime-green\`, \`examples/crop-carrot\` and \`examples/potion-red\`
 are complete working generators — study them before writing your own.
+\`examples/potion-pack\` is the reference PACK generator (12 potions with a
+shared palette and per-item parameters — packs of 4-48 items are written
+as loops, not as hand-drawn one-offs).
 `;
 
 interface StarterAsset {
@@ -433,10 +544,92 @@ emit(new URL('.', import.meta.url).pathname, { frames, fps: 4 });
 void rnd;
 `;
 
+const POTION_PACK_GEN = `// potion-pack — the reference PACK generator: 12 potion sprites sharing
+// one palette, driven by per-item parameters (shape × liquid × stopper)
+// in a loop. 4-frame shimmer per item. This is how big packs stay
+// manageable: parameters + a loop, never 12 hand-drawn one-offs.
+import { Canvas, emitPack, mulberry32, hashString } from '../../lib/pix.mjs';
+
+const rnd = mulberry32(hashString('potion-pack'));
+
+const LIQUIDS = [
+  { name: 'red',    liq: '#d8344a', dark: '#a02038', lite: '#ff9aa8' },
+  { name: 'blue',   liq: '#3a78d8', dark: '#24508f', lite: '#7ab0ff' },
+  { name: 'green',  liq: '#3ad87a', dark: '#20905a', lite: '#8affba' },
+  { name: 'purple', liq: '#9a5ae0', dark: '#6a38a0', lite: '#c99aff' },
+];
+const SHAPES = ['flask', 'square', 'vial'];
+const STOPPERS = [
+  { name: 'cork', col: '#b08454', w: 4 },
+  { name: 'cap',  col: '#d8b84a', w: 5 },
+  { name: 'wax',  col: '#8a2a3a', w: 5 },
+];
+const GLASS = '#9fc8d8';
+const SHINE = '#fff0f0';
+const OUTLINE = '#1c2530';
+
+function body(c, shape) {
+  if (shape === 'flask') { c.rect(7, 2, 2, 4, GLASS); c.circle(8, 10, 5, GLASS); }
+  else if (shape === 'square') { c.rect(6, 3, 4, 2, GLASS); c.rect(4, 5, 8, 9, GLASS); }
+  else { c.rect(6, 2, 4, 12, GLASS); } // vial
+}
+
+function potion(shape, liquid, stopper, f) {
+  const c = new Canvas(16, 16);
+  body(c, shape);
+  // stopper: cork / metal cap / wax seal (wax drips a pixel)
+  const sw = stopper.w;
+  c.rect(8 - Math.floor(sw / 2), 0, sw, 2, stopper.col);
+  if (stopper.name === 'wax') c.rect(8 - Math.floor(sw / 2), 2, 1, 2, stopper.col);
+  if (stopper.name === 'cap') c.px(8 - Math.floor(sw / 2), 0, SHINE);
+  // liquid fill: everything inside the glass below the (wobbling) level
+  const base = { flask: 9, square: 9, vial: 7 }[shape];
+  const level = base + (f % 2);
+  for (let y = level; y < 15; y++) {
+    for (let x = 0; x < 16; x++) {
+      if (c.get(x, y)[3]) c.px(x, y, y === level ? liquid.lite : liquid.liq);
+    }
+  }
+  // sediment at the bottom of the glass
+  c.rect(6, 13, 4, 1, liquid.dark);
+  // rising bubbles
+  const by = 12 - (f % 3);
+  c.px(7, by, liquid.lite);
+  c.px(9, by - 2, liquid.lite);
+  // glass shine
+  c.px(5, 8, SHINE); c.px(5, 9, SHINE);
+  if (shape === 'vial') c.px(6, 3, SHINE);
+  // sparkle drifts around the bottle
+  const spots = [[12, 4], [3, 6], [13, 11], [4, 13]];
+  const [sx, sy] = spots[f % 4];
+  c.px(sx, sy, SHINE); c.px(sx - 1, sy, SHINE); c.px(sx + 1, sy, SHINE);
+  c.px(sx, sy - 1, SHINE); c.px(sx, sy + 1, SHINE);
+  c.outline(OUTLINE);
+  return c;
+}
+
+// 12 items: 4 liquids × 3 shapes, stopper cycles per item
+const items = [];
+let i = 0;
+for (const liquid of LIQUIDS) {
+  for (const shape of SHAPES) {
+    const stopper = STOPPERS[i % STOPPERS.length];
+    const name = shape + '-' + liquid.name;
+    const frames = [0, 1, 2, 3].map((f) => potion(shape, liquid, stopper, f));
+    items.push({ name, frames });
+    i++;
+  }
+}
+
+emitPack(new URL('.', import.meta.url).pathname, { items, fps: 4 });
+void rnd;
+`;
+
 const STARTERS: StarterAsset[] = [
   { sku: 'slime-green', gen: SLIME_GEN },
   { sku: 'crop-carrot', gen: CARROT_GEN },
   { sku: 'potion-red', gen: POTION_GEN },
+  { sku: 'potion-pack', gen: POTION_PACK_GEN },
 ];
 
 function writeIfMissing(path: string, content: string): boolean {
@@ -446,11 +639,25 @@ function writeIfMissing(path: string, content: string): boolean {
   return true;
 }
 
+/// Write when absent OR content differs — used for lib/pix.mjs so library
+/// updates (e.g. emitPack) reach existing factory dirs. Returns true when
+/// it wrote.
+export function writeIfDiffers(path: string, content: string): boolean {
+  try {
+    if (existsSync(path) && readFileSync(path, 'utf8') === content) return false;
+  } catch {
+    /* unreadable → rewrite */
+  }
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(path, content);
+  return true;
+}
+
 /// Creates the factory tree. Examples are style references only — the
 /// catalog and the conveyor start empty.
 export function seedFactory(): void {
   mkdirSync(FACTORY_DIR, { recursive: true });
-  writeIfMissing(join(FACTORY_DIR, 'lib/pix.mjs'), PIX_LIB);
+  writeIfDiffers(join(FACTORY_DIR, 'lib/pix.mjs'), PIX_LIB);
   writeIfMissing(join(FACTORY_DIR, 'STYLE.md'), STYLE_MD);
   mkdirSync(join(FACTORY_DIR, 'reports'), { recursive: true });
 

@@ -18,6 +18,10 @@ export interface AcpStatus {
 
 export type AgentKind = 'overlord' | 'scout' | 'smith' | 'inspector' | 'packer';
 
+/// 'sprite' = one animated sprite (≤8 frames); 'pack' = a multi-sprite pack
+/// (4–48 items, each its own animation, emitted via lib/pix.mjs emitPack).
+export type AssetKind = 'sprite' | 'pack';
+
 export type AgentState = 'offline' | 'idle' | 'working' | 'error';
 
 export interface TranscriptEntry {
@@ -54,6 +58,10 @@ export interface Candidate {
   tags: string[];
   size: 16 | 32;
   frames: number;
+  /// absent = 'sprite' (old data); packs carry the requested item count
+  kind?: AssetKind;
+  items?: number;
+  itemNames?: string[];
   /// scout's pitch — why it will sell
   why: string;
   /// scout-estimated demand, 1-10
@@ -120,6 +128,10 @@ export interface Asset {
   /// the smith (agent id) the overlord assigned it to
   smith?: string;
   status: AssetStatus;
+  /// absent = 'sprite' (old data); packs carry the produced item count
+  kind?: AssetKind;
+  items?: number;
+  itemNames?: string[];
   attempts: number;
   checks?: AssetChecks;
   inspection?: AssetInspection;
@@ -165,6 +177,11 @@ export interface OrderSpec {
   tags: string[];
   size: number;
   frames: number;
+  /// absent = 'sprite'
+  kind?: AssetKind;
+  /// pack orders only: requested item count (4-48) + optional name list
+  items?: number;
+  itemNames?: string[];
   variantOf?: string;
   brief: string;
 }
@@ -274,6 +291,9 @@ export interface Opportunity {
   why: string;
   demand: number;
   variantOf?: string;
+  kind?: AssetKind;
+  items?: number;
+  itemNames?: string[];
   /// itch.io listing urls cited as evidence
   evidence?: string[];
   priceBand?: string;
