@@ -16,7 +16,7 @@ export interface AcpStatus {
 
 // ---- agents ---------------------------------------------------------------
 
-export type AgentKind = 'overlord' | 'scout' | 'smith' | 'inspector' | 'packer';
+export type AgentKind = 'overlord' | 'scout' | 'smith' | 'inspector' | 'packer' | 'merchandiser';
 
 /// 'sprite' = one animated sprite (≤8 frames); 'pack' = a multi-sprite pack
 /// (4–48 items, each its own animation, emitted via lib/pix.mjs emitPack).
@@ -67,6 +67,16 @@ export interface Candidate {
   /// scout-estimated demand, 1-10
   demand: number;
   variantOf?: string;
+  /// etsy flow fields (proposed by the analyst, assessed by the merchandiser)
+  format?: string;
+  keywords?: string[];
+  priceUsd?: number;
+  competition?: number;
+  evidence?: string[];
+  /// merchandiser's "will it sell" verdict — the overlord only sees merch'd
+  merch?: MerchAssessment;
+  /// last failed merchandiser assessment (cooldown before re-asking)
+  assessFailedAt?: number;
   /// which trends-<n>.md report proposed it
   reportN: number;
   status: 'pending' | 'approved' | 'declined';
@@ -79,12 +89,26 @@ export interface Candidate {
   decidedAt?: number;
 }
 
+/// The merchandiser's candidate gate (etsy flow): verdict + sell score,
+/// a concrete angle and a suggested price — attached to the candidate and
+/// copied onto the asset on approval.
+export interface MerchAssessment {
+  verdict: 'go' | 'no';
+  sell: number;
+  priceUsd: number;
+  angle: string;
+  risks: string;
+  at: number;
+}
+
 // ---- assets ---------------------------------------------------------------
 
 export type AssetStatus =
   | 'queued'
   | 'forging'
   | 'inspecting'
+  /// etsy flow: passed the inspector, at the merchandiser's sell review
+  | 'reviewing'
   | 'on_conveyor'
   | 'packing'
   | 'listed'
@@ -107,6 +131,9 @@ export interface AssetListing {
   description: string;
   tags: string[];
   priceUsd: number;
+  /// etsy listings only: category path ("A > B > C") + shop section name
+  taxonomy?: string;
+  section?: string;
 }
 
 // ---- sales channels (Gumroad) ------------------------------------------------
@@ -195,6 +222,8 @@ export interface EtsyShip {
   error?: string;
   /// dry-run request plan (endpoints + non-secret params)
   plan?: unknown;
+  /// activation attempts on an existing draft (publish queue, ≤3)
+  publishAttempts?: number;
 }
 
 export interface EtsyConfig {
@@ -207,6 +236,14 @@ export interface EtsyConfig {
   /// price bounds enforced at validate time
   minPriceUsd: number;
   maxPriceUsd: number;
+  /// consecutive approved listings before publishing goes autonomous
+  trustThreshold: number;
+  /// assess gate: merchandiser sell score needed for "go"
+  minSell: number;
+  /// sell-review gate: score needed for LIST
+  minSellScore: number;
+  /// keywords the etsy researcher searches each scan
+  researchKeywords: string[];
 }
 
 export interface AssetSales {
@@ -227,6 +264,13 @@ export interface Asset {
   candidateId?: string;
   /// the smith (agent id) the overlord assigned it to
   smith?: string;
+  /// etsy flow: buyer search phrases + the merchandiser's assessment
+  keywords?: string[];
+  merch?: MerchAssessment;
+  /// etsy flow: the merchandiser's pre-listing sell review
+  sellReview?: { verdict: 'LIST' | 'REWORK' | 'DROP'; score: number; priceUsd: number; notes: string };
+  /// etsy flow: human/auto approval before a real publish happens
+  approval?: { state: 'pending' | 'approved' | 'rejected' | 'auto'; at: number; edited?: boolean; reason?: string };
   status: AssetStatus;
   /// absent = 'sprite' (old data); packs carry the produced item count
   kind?: AssetKind;
@@ -246,7 +290,7 @@ export interface Asset {
 
 // ---- jobs -----------------------------------------------------------------
 
-export type JobKind = 'scout' | 'forge' | 'inspect' | 'pack';
+export type JobKind = 'scout' | 'forge' | 'inspect' | 'pack' | 'assess' | 'review';
 
 export interface Job {
   id: string;
@@ -396,9 +440,14 @@ export interface Opportunity {
   kind?: AssetKind;
   items?: number;
   itemNames?: string[];
-  /// itch.io listing urls cited as evidence
+  /// itch.io/etsy listing urls cited as evidence
   evidence?: string[];
   priceBand?: string;
+  /// etsy analyst fields (carried onto the promoted candidate)
+  format?: string;
+  keywords?: string[];
+  priceUsd?: number;
+  competition?: number;
 }
 
 export interface TrendReport {
@@ -456,7 +505,7 @@ export interface FactoryConfig {
   maxOverlordTurnsPerHour: number;
   maxApprovalsPerTurn: number;
   /// fresh session after N jobs per worker role (overlord keeps its session)
-  sessionJobLimit: Record<'scout' | 'smith' | 'inspector' | 'packer', number>;
+  sessionJobLimit: Record<'scout' | 'smith' | 'inspector' | 'packer' | 'merchandiser', number>;
   /// full-mode rescout cadence when the current analysis is already covered
   rescoutHours: number;
   usdToZar: number;
@@ -466,8 +515,8 @@ export interface FactoryConfig {
   dailyTokenCaps: DailyTokenCaps | null;
   /// research = scout analyses itch.io only; full = produce+sell on the mock market
   mode: 'research' | 'full';
-  /// which market data the scout reads (mock stays the only sales target)
-  marketSource: 'itch' | 'mock';
+  /// which market data the scout reads ('etsy' = the real Etsy pipeline)
+  marketSource: 'itch' | 'mock' | 'etsy';
   /// Gumroad channel gates (token itself is env-only, never here)
   gumroad: GumroadConfig;
   /// Etsy channel gates (api key/secret + oauth tokens are env/file-only)
@@ -526,6 +575,14 @@ export interface StateMessage {
       monthSpendUsd: number;
       listingsToday: number;
       error?: string;
+      /// approval-ramp state (threshold echoes config.etsy.trustThreshold)
+      trust?: { streak: number; autonomous: boolean; threshold: number };
+      /// skus waiting for / being published, in order
+      publishQueue?: string[];
+      /// the etsy search research state
+      research?: { lastScanAt: number | null; scanning: boolean; error: string | null };
+      /// cached shop section titles
+      sections?: string[];
     };
   };
 }
@@ -577,7 +634,7 @@ export type ClientMessage =
   | { type: 'cancelAgent'; agentId: string }
   | { type: 'signIn' }
   | { type: 'setMode'; mode: 'research' | 'full' }
-  | { type: 'setMarketSource'; source: 'itch' | 'mock' }
+  | { type: 'setMarketSource'; source: 'itch' | 'mock' | 'etsy' }
   | { type: 'scanNow' }
   /// Gumroad channel — dryRun returns the request plan without uploading
   | { type: 'shipGumroad'; sku: string; dryRun?: boolean }
@@ -605,4 +662,14 @@ export type ClientMessage =
   | { type: 'etsyDisconnect' }
   /// re-check getMe/getShop + ledger totals
   | { type: 'refreshEtsy' }
-  | { type: 'setEtsyConfig'; config: Partial<EtsyConfig> };
+  | { type: 'setEtsyConfig'; config: Partial<EtsyConfig> }
+  /// approve a pending listing (optional edits) and enqueue its publish
+  | { type: 'approveEtsy'; sku: string; edits?: { title?: string; description?: string; tags?: string[]; priceUsd?: number } }
+  /// reject it — resets the trust streak and archives the asset locally
+  | { type: 'rejectEtsy'; sku: string; reason?: string }
+  /// drop autonomous publishing back to approval mode
+  | { type: 'revokeEtsyAutonomy' }
+  /// build the publish spec + request plan without sending anything
+  | { type: 'etsyDryRun'; sku: string }
+  /// run the etsy search research scan (30-min manual cooldown)
+  | { type: 'scanEtsy' };

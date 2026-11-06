@@ -9,7 +9,7 @@ import type { Agent, AgentKind, Asset, ClientMessage, StateMessage, UsageCounts 
 import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop';
 
 /// statuses where an agent/pipeline still owns the asset — never archive
-const IN_PIPELINE = new Set(['queued', 'forging', 'inspecting', 'on_conveyor', 'packing']);
+const IN_PIPELINE = new Set(['queued', 'forging', 'inspecting', 'reviewing', 'on_conveyor', 'packing']);
 
 /// Assets the bulk archive would take — mirrors factory.archiveUnshippable.
 function unshippableAssets(s: StateMessage): Asset[] {
@@ -149,7 +149,7 @@ export class Drawers {
           s.channels?.gumroad,
           s.config.etsy,
           s.channels?.etsy,
-          s.assets.map((a) => a.channels?.gumroad),
+          s.assets.map((a) => [a.channels?.gumroad, a.channels?.etsy, a.approval]),
         ]);
       case 'gallery':
         return this.galleryFilter + JSON.stringify(s.assets.map((a) => [a.sku, a.status]));
@@ -1418,6 +1418,177 @@ export class Drawers {
     spend.className = 'note';
     spend.textContent = `$${(e?.monthSpendUsd ?? 0).toFixed(2)} / $${cfg.monthlySpendCapUsd.toFixed(2)} this month · ${e?.listingsToday ?? 0}/${cfg.maxListingsPerDay} today`;
     card.appendChild(spend);
+
+    // trust meter + research line
+    const trust = e?.trust;
+    const tline = document.createElement('div');
+    tline.className = 'note';
+    if (trust?.autonomous) {
+      tline.textContent = 'AUTONOMOUS — listings publish without approval';
+      tline.style.color = 'var(--amber)';
+      const rev = document.createElement('button');
+      rev.className = 'btn';
+      rev.textContent = '[ revoke autonomy ]';
+      rev.addEventListener('click', () => {
+        if (confirm('revoke etsy autonomy? listings will need approval again')) this.net.send({ type: 'revokeEtsyAutonomy' });
+      });
+      tline.appendChild(rev);
+    } else {
+      tline.textContent = `trust ${trust?.streak ?? 0}/${trust?.threshold ?? cfg.trustThreshold} · approval mode`;
+    }
+    card.appendChild(tline);
+    const rline = document.createElement('div');
+    rline.className = 'note';
+    const last = e?.research?.lastScanAt;
+    rline.textContent = `research: ${last ? new Date(last).toLocaleString() : 'never scanned'}${e?.research?.error ? ` · ⚠ ${e.research.error}` : ''} `;
+    const scan = document.createElement('button');
+    scan.className = 'btn';
+    scan.textContent = e?.research?.scanning ? '[ scanning… ]' : '[ scan etsy ]';
+    scan.disabled = !e?.configured || e?.research?.scanning === true;
+    scan.addEventListener('click', () => this.net.send({ type: 'scanEtsy' }));
+    rline.appendChild(scan);
+    card.appendChild(rline);
+    if (e?.publishQueue?.length) {
+      const q = document.createElement('div');
+      q.className = 'note';
+      q.textContent = `publish queue: ${e.publishQueue.join(', ')}`;
+      card.appendChild(q);
+    }
+    b.appendChild(card);
+
+    // APPROVALS — pending listings with editable fields
+    const pending = s.assets.filter((a) => a.approval?.state === 'pending');
+    if (pending.length) {
+      const ah = document.createElement('div');
+      ah.className = 'sec';
+      ah.textContent = `approvals (${pending.length})`;
+      b.appendChild(ah);
+      for (const a of pending) this.renderEtsyApproval(b, a, s);
+    }
+
+    // published — anything that has an etsy listing record
+    const shipped = s.assets.filter((a) => a.channels?.etsy?.listingId);
+    if (shipped.length) {
+      const ph = document.createElement('div');
+      ph.className = 'sec';
+      ph.textContent = `on etsy (${shipped.length})`;
+      b.appendChild(ph);
+      for (const a of shipped) {
+        const row = document.createElement('div');
+        row.className = 'kv';
+        const k = document.createElement('a');
+        k.textContent = a.sku;
+        k.href = '#';
+        k.addEventListener('click', (ev2) => {
+          ev2.preventDefault();
+          this.open({ type: 'asset', id: a.sku });
+        });
+        const v = document.createElement('span');
+        const ship = a.channels!.etsy!;
+        v.textContent = `${ship.status} · #${ship.listingId}${ship.error ? ` — ${ship.error.slice(0, 50)}` : ''}`;
+        if (ship.url?.startsWith('https://www.etsy.com/')) {
+          const l = document.createElement('a');
+          l.href = ship.url;
+          l.target = '_blank';
+          l.rel = 'noopener';
+          l.textContent = ' ↗';
+          v.appendChild(l);
+        } else if (ship.url) {
+          v.textContent += ` ${ship.url}`;
+        }
+        row.append(k, v);
+        b.appendChild(row);
+      }
+    }
+  }
+
+  /// One pending etsy listing: preview, merch/sell scores, editable fields,
+  /// approve / dry run / reject.
+  private renderEtsyApproval(b: HTMLElement, a: Asset, _s: StateMessage): void {
+    const card = document.createElement('div');
+    card.className = 'acard v';
+    const head = document.createElement('div');
+    head.className = 'kv';
+    const t = document.createElement('b');
+    t.textContent = a.sku;
+    head.appendChild(t);
+    this.thumb(head, a, 3);
+    card.appendChild(head);
+    const info = document.createElement('div');
+    info.className = 'note';
+    const bits: string[] = [];
+    if (a.merch) bits.push(`sell ${a.merch.sell}/10 — ${a.merch.angle}`);
+    if (a.sellReview) bits.push(`review ${a.sellReview.score}/10 — ${a.sellReview.notes}`);
+    info.textContent = bits.join('\n');
+    card.appendChild(info);
+    if (a.approval?.reason) {
+      const r = document.createElement('div');
+      r.className = 'note';
+      r.style.color = 'var(--amber)';
+      r.textContent = `⚠ ${a.approval.reason}`;
+      card.appendChild(r);
+    }
+
+    const listing = a.listing!;
+    const fields: Record<string, HTMLInputElement | HTMLTextAreaElement> = {};
+    const field = (label: string, key: string, val: string, area = false): void => {
+      const row = document.createElement('div');
+      row.className = 'kv';
+      const k = document.createElement('span');
+      k.textContent = label;
+      const inp = document.createElement(area ? 'textarea' : 'input') as HTMLInputElement;
+      inp.value = val;
+      if (area) {
+        (inp as unknown as HTMLTextAreaElement).rows = 4;
+        inp.style.width = '70%';
+      } else {
+        inp.style.width = '70%';
+      }
+      fields[key] = inp;
+      row.append(k, inp);
+      card.appendChild(row);
+    };
+    field('title', 'title', listing.title);
+    field('description', 'description', listing.description, true);
+    field('tags (13, comma-sep)', 'tags', listing.tags.join(', '));
+    field('price usd', 'price', String(listing.priceUsd));
+    const row = document.createElement('div');
+    row.className = 'btnrow';
+    const approve = document.createElement('button');
+    approve.className = 'btn go';
+    approve.textContent = '[ approve & publish ]';
+    approve.addEventListener('click', () => {
+      const edits = {
+        title: fields.title.value,
+        description: fields.description.value,
+        tags: fields.tags.value.split(',').map((x) => x.trim()).filter(Boolean),
+        priceUsd: Number(fields.price.value) || undefined,
+      };
+      this.net.send({ type: 'approveEtsy', sku: a.sku, edits });
+    });
+    const dry = document.createElement('button');
+    dry.className = 'btn';
+    dry.textContent = '[ dry run ]';
+    dry.addEventListener('click', () => this.net.send({ type: 'etsyDryRun', sku: a.sku }));
+    const reject = document.createElement('button');
+    reject.className = 'btn';
+    reject.textContent = '[ reject ]';
+    reject.addEventListener('click', () => {
+      const reason = prompt('reject reason (resets the trust streak):') ?? '';
+      this.net.send({ type: 'rejectEtsy', sku: a.sku, reason });
+    });
+    row.append(approve, dry, reject);
+    card.appendChild(row);
+    const plan = a.channels?.etsy?.plan;
+    if (plan) {
+      const det = document.createElement('details');
+      const sum = document.createElement('summary');
+      sum.textContent = 'last dry-run request plan';
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(plan, null, 2);
+      det.append(sum, pre);
+      card.appendChild(det);
+    }
     b.appendChild(card);
   }
 
@@ -1441,7 +1612,7 @@ export class Drawers {
     const b = this.body();
     const sel = document.createElement('select');
     sel.className = 'gfilter';
-    for (const f of ['', 'queued', 'forging', 'inspecting', 'on_conveyor', 'packing', 'listed', 'scrapped', 'failed']) {
+    for (const f of ['', 'queued', 'forging', 'inspecting', 'reviewing', 'on_conveyor', 'packing', 'listed', 'scrapped', 'failed']) {
       const o = document.createElement('option');
       o.value = f;
       o.textContent = f || 'all statuses';

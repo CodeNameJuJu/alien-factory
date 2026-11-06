@@ -24,7 +24,7 @@ export class Hud {
   private crewKey = '';
   private crewThumbs: { c: HTMLCanvasElement; asset: Asset }[] = [];
   private lastMode: 'research' | 'full' = 'research';
-  private lastSource: 'itch' | 'mock' = 'itch';
+  private lastSource: 'itch' | 'mock' | 'etsy' = 'itch';
 
   constructor(private net: Net, private hooks: HudHooks) {
     this.bar = document.createElement('div');
@@ -107,7 +107,7 @@ export class Hud {
       else if ((e.target as HTMLElement).id === 'hud-signin') this.net.send({ type: 'signIn' });
       else if ((e.target as HTMLElement).id === 'hud-crt') this.toggleCrt();
       else if ((e.target as HTMLElement).id === 'hud-mode') this.net.send({ type: 'setMode', mode: this.lastMode === 'research' ? 'full' : 'research' });
-      else if ((e.target as HTMLElement).id === 'hud-src') this.net.send({ type: 'setMarketSource', source: this.lastSource === 'itch' ? 'mock' : 'itch' });
+      else if ((e.target as HTMLElement).id === 'hud-src') this.net.send({ type: 'setMarketSource', source: this.lastSource === 'itch' ? 'mock' : this.lastSource === 'mock' ? 'etsy' : 'itch' });
       else if ((e.target as HTMLElement).id === 'hud-trends') this.hooks.onSelect({ type: 'trends' });
       else if ((e.target as HTMLElement).id === 'hud-scannow') this.net.send({ type: 'scanNow' });
       else if ((e.target as HTMLElement).id === 'hud-gallery') this.hooks.onSelect({ type: 'gallery' });

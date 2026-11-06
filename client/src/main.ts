@@ -25,14 +25,14 @@ const empty: StateMessage = {
   events: [],
   market: { tick: 0, tags: [], competitors: [], revenueHistory: [], totals: { views: 0, units: 0, revenueUsd: 0 } },
   config: {
-    models: { overlord: '', scout: '', smith: '', inspector: '', packer: '' },
+    models: { overlord: '', scout: '', smith: '', inspector: '', packer: '', merchandiser: '' },
     smiths: 3, maxOverlordTurnsPerHour: 6,
     maxApprovalsPerTurn: 4,
-    sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6 },
+    sessionJobLimit: { scout: 1, smith: 1, inspector: 4, packer: 6, merchandiser: 3 },
     rescoutHours: 6, usdToZar: 18.5, prices: {}, dailyTokenCaps: null,
     mode: 'research', marketSource: 'itch', itchScanMinutes: 60, itchFeeds: [],
     gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
-    etsy: { monthlySpendCapUsd: 5, maxListingsPerDay: 3, autoRenew: false, minPriceUsd: 1.5, maxPriceUsd: 60 },
+    etsy: { monthlySpendCapUsd: 5, maxListingsPerDay: 3, autoRenew: false, minPriceUsd: 1.5, maxPriceUsd: 60, trustThreshold: 10, minSell: 6, minSellScore: 7, researchKeywords: [] },
     autoArchiveFailed: true,
   },
   channels: {

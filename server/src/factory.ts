@@ -20,7 +20,10 @@ import {
   localDayKey,
   parseDecisions,
   parseDemand,
+  parseAssessment,
+  parseEtsyListingJson,
   parseInspection,
+  parseSellReview,
   pickSmith,
   opportunitiesToCandidates,
   recordUsage,
@@ -28,16 +31,41 @@ import {
   shouldQueueScout,
   urlsAllowed,
 } from './parse.js';
-import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
+import {
+  copywriterPrompt,
+  forgePrompt,
+  inspectPrompt,
+  merchAssessPrompt,
+  merchReviewPrompt,
+  overlordPrompt,
+  packPrompt,
+  scoutPrompt,
+  scoutPromptEtsy,
+  scoutPromptItch,
+} from './prompts.js';
 import { applyGumroadProduct, attachGumroadImages as gumroadAttach, fetchGumroadStore, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
 import {
+  buildEtsySpec,
   completeEtsyAuth,
+  activateEtsyDraft,
+  ETSY_LISTING_FEE_USD,
   deleteEtsyTokens,
   EtsyClient,
   EtsyLedger,
   etsyConfigured,
+  publishEtsyListing,
   startEtsyAuth,
 } from './channels/etsy.js';
+import {
+  analyseEtsyResults,
+  etsyScanAllowed,
+  noteEtsyScanAttempt,
+  scanEtsyKeywords,
+  setEtsyLastScanAt,
+  writeEtsyReport,
+} from './etsy-research.js';
+import { loadTaxonomy, resolveTaxonomy } from './etsy-taxonomy.js';
+import { applyTrustEvent, emptyTrust, hasApprovalEvent, type EtsyTrust } from '../../shared/trust.js';
 import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import {
   analyseSnapshot,
@@ -67,6 +95,7 @@ import type {
   OrderSpec,
   ShiftState,
   TranscriptEntry,
+  MerchAssessment,
   TrendReport,
   UsageState,
 } from '../../shared/protocol.js';
@@ -81,6 +110,14 @@ const HOUR_MS = 3_600_000;
 const GUMROAD_REFRESH_MS = 15 * 60_000;
 /// Re-scout when the last trend report is older than this many market ticks.
 const SCOUT_STALE_TICKS = 10;
+/// assess jobs don't re-ask about candidates whose last attempt failed <30m ago
+const ASSET_RETRY_MS = 30 * 60_000;
+/// publish-queue retries (budget caps / no connection) at most every 10 min
+const PUBLISH_RETRY_MS = 10 * 60_000;
+/// what the analyst is allowed to propose — feeds scoutPromptEtsy's formats arg
+const PRODUCIBLE_FORMATS =
+  '- pack: 4-48 themed pixel-art game sprites at 16x16 or 32x32 px, each 1-8 animation frames, delivered as PNG strips + a sprite-sheet atlas (atlas.json), zipped\n' +
+  '- sprite: one animated pixel-art sprite, 16x16 or 32x32 px, 1-8 frames, PNG sprite sheet';
 
 type Json = any;
 
@@ -109,17 +146,19 @@ export function moveToArchive(factoryDir: string, sku: string, record: Record<st
 export function findOrphans(
   assets: { sku: string; status: Asset['status'] }[],
   jobs: Pick<Job, 'sku' | 'status'>[],
-): { sku: string; kind: 'forge' | 'inspect' | 'pack' }[] {
-  const implies: Record<string, 'forge' | 'inspect' | 'pack'> = {
+): { sku: string; kind: 'forge' | 'inspect' | 'pack' | 'review' }[] {
+  const implies: Record<string, 'forge' | 'inspect' | 'pack' | 'review'> = {
     forging: 'forge',
     inspecting: 'inspect',
+    /// etsy flow: waiting at the merchandiser's sell review
+    reviewing: 'review',
     packing: 'pack',
     on_conveyor: 'pack',
   };
   const live = new Set(
     jobs.filter((j) => j.status === 'queued' || j.status === 'active').map((j) => j.sku),
   );
-  const out: { sku: string; kind: 'forge' | 'inspect' | 'pack' }[] = [];
+  const out: { sku: string; kind: 'forge' | 'inspect' | 'pack' | 'review' }[] = [];
   for (const a of assets) {
     const kind = implies[a.status];
     if (kind && !live.has(a.sku)) out.push({ sku: a.sku, kind });
@@ -173,6 +212,10 @@ interface PersistedState {
   usage?: UsageState;
   lastScoutAt?: number;
   gumroadStats?: GumroadStats | null;
+  etsyTrust?: EtsyTrust;
+  etsyPublishQueue?: string[];
+  etsySections?: { shop_section_id: number; title: string }[];
+  etsyLastScanAt?: number | null;
 }
 
 export class FactoryManager extends EventEmitter {
@@ -198,6 +241,18 @@ export class FactoryManager extends EventEmitter {
   tokenCapHit = false;
   /// live Gumroad store totals from the last refresh (null until one lands)
   gumroadStats: GumroadStats | null = null;
+  /// etsy approval ramp — persisted
+  etsyTrust: EtsyTrust = emptyTrust();
+  /// skus waiting for a publish slot (serial, persisted)
+  etsyPublishQueue: string[] = [];
+  /// cached shop sections (id + title) — refreshed on connect/refresh
+  etsySections: { shop_section_id: number; title: string }[] = [];
+  /// the etsy search research state (scanning/error are session-only)
+  etsyResearch: { lastScanAt: number | null; scanning: boolean; error: string | null } = {
+    lastScanAt: null,
+    scanning: false,
+    error: null,
+  };
 
   /// Set by main.ts when a relay link is configured — true while the worker
   /// is linked (or was within the last 2h). A linked worker never scans
@@ -205,6 +260,14 @@ export class FactoryManager extends EventEmitter {
   relayAvailable: () => boolean = () => false;
   market = new Market();
   acp: AcpClient;
+
+  /// the Etsy sales pipeline is active when the market source is 'etsy'
+  private get isEtsy(): boolean {
+    return this.config.marketSource === 'etsy';
+  }
+  /// ONE shared client — a second instance could double-refresh the
+  /// rotating oauth tokens
+  private etsyClient = new EtsyClient();
 
   private config: FactoryConfig;
   private saveTimer: NodeJS.Timeout | null = null;
@@ -280,6 +343,10 @@ export class FactoryManager extends EventEmitter {
         usage: this.usage,
         lastScoutAt: this.lastScoutAt,
         gumroadStats: this.gumroadStats,
+        etsyTrust: this.etsyTrust,
+        etsyPublishQueue: this.etsyPublishQueue,
+        etsySections: this.etsySections,
+        etsyLastScanAt: this.etsyResearch.lastScanAt,
         market: this.market.serialize(),
       };
       writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -324,6 +391,11 @@ export class FactoryManager extends EventEmitter {
     if (raw.usage?.byRole && raw.usage?.byModel) this.usage = raw.usage;
     this.lastScoutAt = raw.lastScoutAt ?? 0;
     this.gumroadStats = raw.gumroadStats ?? null;
+    this.etsyTrust = raw.etsyTrust ?? emptyTrust();
+    this.etsyPublishQueue = Array.isArray(raw.etsyPublishQueue) ? raw.etsyPublishQueue : [];
+    this.etsySections = Array.isArray(raw.etsySections) ? raw.etsySections : [];
+    this.etsyResearch.lastScanAt = raw.etsyLastScanAt ?? null;
+    if (this.etsyResearch.lastScanAt) setEtsyLastScanAt(this.etsyResearch.lastScanAt);
     this.market.restore(raw.market);
     // no session/load on restart — drop sessions, requeue active jobs
     this.shift = 'stopped';
@@ -369,6 +441,7 @@ export class FactoryManager extends EventEmitter {
       ['scout', 'scout', this.config.models.scout],
       ['inspector', 'inspector', this.config.models.inspector],
       ['packer', 'packer', this.config.models.packer],
+      ['merchandiser', 'merchandiser', this.config.models.merchandiser],
     ];
     for (let i = 1; i <= this.config.smiths; i++) {
       want.push([`smith-${i}`, 'smith', this.config.models.smith]);
@@ -455,14 +528,18 @@ export class FactoryManager extends EventEmitter {
 
   private dispatch(): void {
     if (this.shift !== 'running') return;
-    // research mode: rescan + rescout on the itchScanMinutes cadence
-    if (
-      this.config.mode === 'research' &&
-      !this.relayAvailable() && // linked worker: the relay scans, not us
-      !this.itch.scanning &&
-      Date.now() - (this.itch.lastScanAt ?? 0) >= this.config.itchScanMinutes * 60_000
-    ) {
-      void this.scanThenScout(false);
+    // research mode: rescan + rescout on the source's cadence
+    if (this.config.mode === 'research' && !this.relayAvailable()) {
+      if (this.isEtsy) {
+        if (!this.etsyResearch.scanning && Date.now() - (this.etsyResearch.lastScanAt ?? 0) >= 6 * HOUR_MS) {
+          void this.scanEtsy(false);
+        }
+      } else if (
+        !this.itch.scanning &&
+        Date.now() - (this.itch.lastScanAt ?? 0) >= this.config.itchScanMinutes * 60_000
+      ) {
+        void this.scanThenScout(false);
+      }
     }
     this.maybeScout();
     for (const j of this.jobs) {
@@ -483,6 +560,7 @@ export class FactoryManager extends EventEmitter {
       void this.runJob(agent, j);
     }
     if (this.config.mode === 'full') this.maybeOverlordTurn();
+    void this.processEtsyQueue();
     this.changed();
   }
 
@@ -518,6 +596,12 @@ export class FactoryManager extends EventEmitter {
           break;
         case 'pack':
           await this.jobPack(agent, job);
+          break;
+        case 'assess':
+          await this.jobAssess(agent, job);
+          break;
+        case 'review':
+          await this.jobReview(agent, job);
           break;
       }
     } catch (err) {
@@ -657,8 +741,14 @@ export class FactoryManager extends EventEmitter {
 
   private async jobScout(agent: Agent, job: Job): Promise<void> {
     agent.statusLine = 'reading the market report';
-    const useItch = this.config.mode === 'research' || this.config.marketSource === 'itch';
-    let text = await this.turn(agent, useItch ? scoutPromptItch(this.catalogSummary()) : scoutPrompt(this.catalogSummary()), job);
+    const nextReport = (this.trendReports[0]?.n ?? 0) + 1;
+    const prompt =
+      this.config.marketSource === 'etsy'
+        ? scoutPromptEtsy({ catalog: this.catalogSummary(), formats: PRODUCIBLE_FORMATS, nextReport })
+        : this.config.mode === 'research' || this.config.marketSource === 'itch'
+          ? scoutPromptItch(this.catalogSummary())
+          : scoutPrompt(this.catalogSummary());
+    let text = await this.turn(agent, prompt, job);
     let proposals = parseDemand(text);
     if (!proposals.length) {
       this.push(agent, 'system', 'no "## Demand" block — nudging');
@@ -691,6 +781,10 @@ export class FactoryManager extends EventEmitter {
       itemNames: p.itemNames,
       evidence: p.evidence,
       priceBand: p.priceBand,
+      format: p.format,
+      keywords: p.keywords,
+      priceUsd: p.priceUsd,
+      competition: p.competition,
     }));
     const n = (this.trendReports[0]?.n ?? 0) + 1;
     this.trendReports.unshift({
@@ -698,7 +792,7 @@ export class FactoryManager extends EventEmitter {
       at: Date.now(),
       markdown: this.latestTrendReport,
       opportunities,
-      scanAt: this.itch.lastScanAt ?? undefined,
+      scanAt: (this.isEtsy ? this.etsyResearch.lastScanAt : this.itch.lastScanAt) ?? undefined,
     });
     if (this.trendReports.length > 20) this.trendReports.length = 20;
     if (this.config.mode !== 'research') {
@@ -715,6 +809,11 @@ export class FactoryManager extends EventEmitter {
           kind: p.kind ?? 'sprite',
           items: p.kind === 'pack' ? clampPackItems(p.items) : undefined,
           itemNames: p.itemNames,
+          format: p.format,
+          keywords: p.keywords,
+          priceUsd: p.priceUsd,
+          competition: p.competition,
+          evidence: p.evidence,
           reportN: this.market.tick,
           status: 'pending',
           createdAt: Date.now(),
@@ -724,6 +823,86 @@ export class FactoryManager extends EventEmitter {
       }
     } else {
       this.event(`${agent.name} filed trend report #${n} (${proposals.length} opportunities)`, agent.id);
+    }
+    this.finishJob(job, true);
+    this.maybeQueueAssess();
+  }
+
+  /// Etsy flow: fresh candidates go to the merchandiser BEFORE the
+  /// overlord ever sees them — one assess job per batch of un-assessed
+  /// pending candidates.
+  private maybeQueueAssess(): void {
+    if (!this.isEtsy || this.config.mode !== 'full') return;
+    const fresh = this.candidates.filter(
+      (c) =>
+        c.status === 'pending' &&
+        !c.merch &&
+        (!c.assessFailedAt || Date.now() - c.assessFailedAt >= ASSET_RETRY_MS),
+    );
+    if (!fresh.length) return;
+    if (this.jobs.some((j) => j.kind === 'assess' && j.status !== 'done' && j.status !== 'failed')) return;
+    this.queueJob('assess');
+    this.event(`merchandiser assesses ${fresh.length} proposal(s)`);
+  }
+
+  /// Etsy flow: the merchandiser gates each pending candidate. "go" with
+  /// sell ≥ minSell attaches merch (the overlord only sees those);
+  /// anything else declines the candidate before it reaches the dais.
+  private async jobAssess(agent: Agent, job: Job): Promise<void> {
+    const pending = this.candidates.filter(
+      (c) =>
+        c.status === 'pending' &&
+        !c.merch &&
+        (!c.assessFailedAt || Date.now() - c.assessFailedAt >= ASSET_RETRY_MS),
+    );
+    if (!pending.length) return this.finishJob(job, true);
+    agent.statusLine = `assessing ${pending.length} proposal(s)`;
+    let text = await this.turn(
+      agent,
+      merchAssessPrompt({
+        candidates: pending,
+        catalog: this.catalogSummary(),
+        trendReport: this.latestTrendReport ?? '',
+        minSell: this.config.etsy.minSell,
+      }),
+      job,
+    );
+    let assessments = parseAssessment(text);
+    if (!assessments.length) {
+      this.push(agent, 'system', 'no "## Assessment" block — nudging');
+      text = await this.turn(
+        agent,
+        'End your reply with `## Assessment` followed by a ```json fenced array: [{"id","verdict":"go|no","sell":<1-10>,"priceUsd":<number>,"angle","risks"}] — one entry per proposal.',
+        job,
+      );
+      assessments = parseAssessment(text);
+    }
+    if (!assessments.length) {
+      const at = Date.now();
+      for (const c of pending) c.assessFailedAt = at;
+      this.event(`${agent.name}'s assessment had no structured block`, agent.id);
+      this.finishJob(job, false);
+      return;
+    }
+    const byId = new Map(assessments.map((a) => [a.id, a]));
+    const now = Date.now();
+    for (const c of pending) {
+      const a = byId.get(c.id);
+      if (!a) {
+        c.assessFailedAt = now; // absent from the block — retry next batch
+        continue;
+      }
+      if (a.verdict === 'go' && a.sell >= this.config.etsy.minSell) {
+        c.merch = { verdict: a.verdict, sell: a.sell, priceUsd: a.priceUsd, angle: a.angle, risks: a.risks, at: now } satisfies MerchAssessment;
+        c.decidedAt = undefined;
+        this.event(`merchandiser GO on ${c.title} (sell ${a.sell}/10, $${a.priceUsd.toFixed(2)})`, agent.id);
+      } else {
+        c.status = 'declined';
+        c.decidedAt = now;
+        c.reason = `merchandiser: ${a.angle || a.risks || `sell ${a.sell}/10 below the bar`}`;
+        this.decisions.push({ candidateId: c.id, title: c.title, approved: false, reason: c.reason, at: now });
+        this.event(`merchandiser NO on ${c.title} (sell ${a.sell}/10)`, agent.id);
+      }
     }
     this.finishJob(job, true);
   }
@@ -774,7 +953,11 @@ export class FactoryManager extends EventEmitter {
         order,
         variantSourcePath: variantPath && existsSync(join(FACTORY_DIR, variantPath)) ? variantPath : undefined,
         issues: job.note?.startsWith('checks:') ? JSON.parse(job.note.slice(7)) : undefined,
-        inspectNotes: job.note?.startsWith('inspect:') ? job.note.slice(8) : undefined,
+        inspectNotes: job.note?.startsWith('inspect:')
+          ? job.note.slice(8)
+          : job.note?.startsWith('review:')
+            ? `Merchandiser (will it sell): ${job.note.slice(7)}`
+            : undefined,
       }),
       job,
     );
@@ -838,9 +1021,17 @@ export class FactoryManager extends EventEmitter {
     }
     asset.inspection = ins;
     if (ins.verdict === 'PASS') {
-      this.setAssetStatus(asset.sku, 'on_conveyor');
-      this.queueJob('pack', asset.sku);
-      this.event(`Inspector ✓ ${asset.sku} (${ins.score}/10) — onto the conveyor`, agent.id, asset.sku);
+      if (this.isEtsy) {
+        // etsy flow: technical pass is not enough — the merchandiser
+        // reviews whether it will sell before it reaches the packer
+        this.setAssetStatus(asset.sku, 'reviewing');
+        this.queueJob('review', asset.sku);
+        this.event(`Inspector ✓ ${asset.sku} (${ins.score}/10) — to the merchandiser`, agent.id, asset.sku);
+      } else {
+        this.setAssetStatus(asset.sku, 'on_conveyor');
+        this.queueJob('pack', asset.sku);
+        this.event(`Inspector ✓ ${asset.sku} (${ins.score}/10) — onto the conveyor`, agent.id, asset.sku);
+      }
     } else if (asset.attempts < 2) {
       asset.attempts++;
       this.setAssetStatus(asset.sku, 'queued', `inspector FAIL (${ins.score}/10)`);
@@ -857,6 +1048,7 @@ export class FactoryManager extends EventEmitter {
   }
 
   private async jobPack(agent: Agent, job: Job): Promise<void> {
+    if (this.isEtsy) return this.jobPackEtsy(agent, job);
     const asset = job.sku ? this.asset(job.sku) : undefined;
     if (!asset) return this.finishJob(job, false);
     await this.turn(agent, packPrompt(asset), job);
@@ -900,6 +1092,125 @@ export class FactoryManager extends EventEmitter {
     this.finishJob(job, true);
   }
 
+  /// Etsy flow: the copywriter writes listing.json, we validate it against
+  /// Etsy's rules + the real meta.json, then park it for approval (or
+  /// auto-publish when trust is autonomous). Never touches the mock market.
+  private async jobPackEtsy(agent: Agent, job: Job): Promise<void> {
+    const asset = job.sku ? this.asset(job.sku) : undefined;
+    if (!asset) return this.finishJob(job, false);
+    // a listingId means a real Etsy draft/listing exists — repacking here
+    // (e.g. after an orphan heal) must not reset approval or re-publish
+    if (asset.channels?.etsy?.listingId) {
+      this.event(`${asset.sku}: already has an etsy listing (${asset.channels.etsy.listingId}) — keeping it`, agent.id, asset.sku);
+      this.finishJob(job, true);
+      return;
+    }
+    const promptArgs = {
+      asset,
+      keywords: asset.keywords ?? [],
+      angle: asset.merch?.angle,
+      priceUsd: asset.sellReview?.priceUsd ?? asset.merch?.priceUsd,
+      sections: this.etsySections.map((s2) => s2.title),
+      minPriceUsd: this.config.etsy.minPriceUsd,
+      maxPriceUsd: this.config.etsy.maxPriceUsd,
+    };
+    await this.turn(agent, copywriterPrompt(promptArgs), job);
+    const meta = loadShipMeta(asset.sku);
+    const merchPrice = asset.sellReview?.priceUsd ?? asset.merch?.priceUsd;
+    let parsed = this.readEtsyListing(asset.sku, meta, merchPrice);
+    if (parsed.issues.length) {
+      // one in-session retry — the copywriter fixes its own listing
+      await this.turn(
+        agent,
+        `Your listing.json was rejected — fix these:\n${parsed.issues.map((i) => `- ${i}`).join('\n')}`,
+        job,
+      );
+      parsed = this.readEtsyListing(asset.sku, meta, merchPrice);
+    }
+    if (!parsed.listing || parsed.issues.length) {
+      this.event(`${asset.sku}: etsy listing.json invalid (${parsed.issues[0] ?? 'unreadable'})`, agent.id, asset.sku);
+      this.finishJob(job, false);
+      this.setAssetStatus(asset.sku, 'failed', 'etsy listing.json invalid');
+      this.maybeArchiveFailed(asset.sku, 'failed: invalid etsy listing');
+      return;
+    }
+    asset.listing = parsed.listing;
+    asset.status = 'listed';
+    asset.updatedAt = Date.now();
+    const trust = this.etsyTrust;
+    asset.approval = trust.autonomous
+      ? { state: 'auto', at: Date.now() }
+      : { state: 'pending', at: Date.now() };
+    if (trust.autonomous) this.enqueueEtsyPublish(asset.sku);
+    this.event(
+      `${asset.sku} listing written — $${parsed.listing.priceUsd.toFixed(2)}` +
+        (trust.autonomous ? ', auto-queued for publish' : ', waiting for approval'),
+      agent.id,
+      asset.sku,
+    );
+    this.finishJob(job, true);
+  }
+
+  private readEtsyListing(
+    sku: string,
+    meta: ReturnType<typeof loadShipMeta>,
+    merchPriceUsd?: number,
+  ): { listing: Asset['listing'] | undefined; issues: string[] } {
+    try {
+      const raw = JSON.parse(readFileSync(join(FACTORY_DIR, 'assets', sku, 'listing.json'), 'utf8'));
+      return parseEtsyListingJson(raw, this.config.etsy, meta, merchPriceUsd);
+    } catch {
+      return { listing: undefined, issues: ['listing.json unreadable'] };
+    }
+  }
+
+  /// Etsy flow: the merchandiser's sell review — LIST sends the asset to
+  /// the conveyor, REWORK re-forges it (bounded by attempts), DROP scraps.
+  private async jobReview(agent: Agent, job: Job): Promise<void> {
+    const asset = job.sku ? this.asset(job.sku) : undefined;
+    if (!asset) return this.finishJob(job, false);
+    const text = await this.turn(
+      agent,
+      merchReviewPrompt({
+        asset,
+        angle: asset.merch?.angle,
+        priceUsd: asset.merch?.priceUsd,
+        minScore: this.config.etsy.minSellScore,
+      }),
+      job,
+    );
+    const rev = parseSellReview(text);
+    if (!rev) {
+      this.event(`sell review of ${asset.sku} had no verdict`, agent.id, asset.sku);
+      if (!job.note?.startsWith('retried')) {
+        this.requeueJob(job, agent, 'retried after: no sell-review verdict');
+      } else {
+        this.finishJob(job, false);
+        this.setAssetStatus(asset.sku, 'failed', 'sell review had no verdict twice');
+        this.maybeArchiveFailed(asset.sku, 'failed: no sell-review verdict');
+      }
+      return;
+    }
+    asset.sellReview = rev;
+    const listable = rev.verdict === 'LIST' && rev.score >= this.config.etsy.minSellScore;
+    if (listable) {
+      this.setAssetStatus(asset.sku, 'on_conveyor');
+      this.queueJob('pack', asset.sku);
+      this.event(`merchandiser LISTS ${asset.sku} (${rev.score}/10 at $${rev.priceUsd.toFixed(2)})`, agent.id, asset.sku);
+    } else if (rev.verdict === 'DROP' || asset.attempts >= 2) {
+      this.setAssetStatus(asset.sku, 'scrapped', `merchandiser ${rev.verdict} (${rev.score}/10)`);
+      this.event(`merchandiser ${rev.verdict === 'DROP' ? 'DROPS' : 'gives up on'} ${asset.sku} — scrapped`, agent.id, asset.sku);
+      this.maybeArchiveFailed(asset.sku, `scrapped: merch ${rev.verdict}`);
+    } else {
+      // REWORK, or LIST below the bar — back to the same smith with notes
+      asset.attempts++;
+      this.setAssetStatus(asset.sku, 'queued', `merch rework (${rev.score}/10)`);
+      this.queueJob('forge', asset.sku, `review:${rev.notes.slice(0, 300)}`, asset.smith);
+      this.event(`merchandiser sends ${asset.sku} back: ${rev.notes.slice(0, 80)}`, agent.id, asset.sku);
+    }
+    this.finishJob(job, true);
+  }
+
   // ---- the overlord ----------------------------------------------------------
 
   private overlordTurnsThisHour(): number {
@@ -913,10 +1224,16 @@ export class FactoryManager extends EventEmitter {
     const overlord = this.agent('overlord');
     if (!overlord || overlord.state === 'working' || overlord.state === 'error') return;
     const want =
-      this.candidates.some((c) => c.status === 'pending') || this.pendingDirectives.length > 0;
+      this.overlordCandidates().length > 0 || this.pendingDirectives.length > 0;
     if (!want) return;
     if (this.overlordTurnsThisHour() >= this.config.maxOverlordTurnsPerHour) return;
     void this.runOverlordTurn(overlord);
+  }
+
+  /// Candidates the overlord may decide on. Etsy flow: only proposals the
+  /// merchandiser already blessed (c.merch) — assess jobs gate the rest.
+  private overlordCandidates(): Candidate[] {
+    return this.candidates.filter((c) => c.status === 'pending' && (!this.isEtsy || !!c.merch));
   }
 
   private async runOverlordTurn(overlord: Agent): Promise<void> {
@@ -940,7 +1257,7 @@ export class FactoryManager extends EventEmitter {
       const promptText = overlordPrompt({
         trendReport: this.latestTrendReport ?? '',
         catalog: this.catalogSummary(),
-        candidates: this.candidates.filter((c) => c.status === 'pending'),
+        candidates: this.overlordCandidates(),
         smithQueues,
         pendingDirectives: directives,
         maxApprovals: this.config.maxApprovalsPerTurn,
@@ -989,6 +1306,8 @@ export class FactoryManager extends EventEmitter {
             items,
             itemNames,
             variantOf: c.variantOf && this.asset(c.variantOf) ? c.variantOf : undefined,
+            keywords: c.keywords,
+            merch: c.merch,
             orderBrief: d.brief || c.why,
             candidateId: c.id,
             smith: smithId,
@@ -1099,10 +1418,21 @@ export class FactoryManager extends EventEmitter {
   /// pushed from the relay, and a refused scan shouldn't stall the line).
   private maybeQueueScout(): void {
     if (DEVIN_DISABLED) return;
+    const analysisAt = this.isEtsy ? this.etsyResearch.lastScanAt : this.itch.lastScanAt;
+    // etsy mode: missing or >6h-old research data gets rescanned first —
+    // but ONLY when the gate allows; a refused/failed scan must scout on
+    // whatever data exists rather than looping into another scan
+    if (this.isEtsy && !this.etsyResearch.scanning) {
+      const stale = analysisAt == null || Date.now() - analysisAt >= 6 * HOUR_MS;
+      if (stale && etsyScanAllowed(false).ok) {
+        void this.scanEtsy(false);
+        return;
+      }
+    }
     if (
       shouldQueueScout({
         mode: this.config.mode,
-        analysisAt: this.itch.lastScanAt,
+        analysisAt,
         hasPendingCandidates: this.candidates.some((c) => c.status === 'pending'),
         hasScoutJob: this.jobs.some((j) => j.kind === 'scout' && j.status !== 'done' && j.status !== 'failed'),
         reportScanAts: this.trendReports.map((t) => t.scanAt),
@@ -1130,6 +1460,7 @@ export class FactoryManager extends EventEmitter {
     this.candidateCounter += news.length;
     this.candidates.push(...news);
     for (const c of news) this.event(`research opportunity promoted: ${c.title} (demand ${c.demand})`);
+    this.maybeQueueAssess();
     this.changed();
   }
 
@@ -1175,6 +1506,14 @@ export class FactoryManager extends EventEmitter {
           monthSpendUsd: this.etsyLedger.monthSpendUsd(),
           listingsToday: this.etsyLedger.listingsToday(),
           ...(this.etsyError ? { error: this.etsyError } : {}),
+          trust: {
+            streak: this.etsyTrust.streak,
+            autonomous: this.etsyTrust.autonomous,
+            threshold: this.config.etsy.trustThreshold,
+          },
+          publishQueue: this.etsyPublishQueue,
+          research: { ...this.etsyResearch },
+          sections: this.etsySections.map((s2) => s2.title),
         },
       },
     };
@@ -1277,6 +1616,21 @@ export class FactoryManager extends EventEmitter {
       case 'setEtsyConfig':
         this.setEtsyConfig(msg.config);
         return;
+      case 'scanEtsy':
+        await this.scanEtsy(true);
+        return;
+      case 'approveEtsy':
+        this.approveEtsyListing(msg.sku, msg.edits);
+        return;
+      case 'rejectEtsy':
+        this.rejectEtsyListing(msg.sku, msg.reason);
+        return;
+      case 'revokeEtsyAutonomy':
+        this.revokeEtsyAutonomy();
+        return;
+      case 'etsyDryRun':
+        await this.etsyDryRun(msg.sku);
+        return;
     }
   }
 
@@ -1326,8 +1680,15 @@ export class FactoryManager extends EventEmitter {
   /// rotated refresh token and shop info persist inside the token file.
   private async refreshEtsy(): Promise<void> {
     try {
-      const client = new EtsyClient();
-      await client.syncShopInfo();
+      await this.etsyClient.syncShopInfo();
+      const info0 = EtsyClient.info();
+      if (info0.shopId) {
+        const secs = await this.etsyClient.getShopSections(info0.shopId);
+        const results = Array.isArray(secs.results) ? secs.results : [];
+        this.etsySections = results
+          .map((r) => ({ shop_section_id: Number((r as { shop_section_id?: unknown }).shop_section_id) || 0, title: String((r as { title?: unknown }).title ?? '') }))
+          .filter((r) => r.shop_section_id > 0 && r.title);
+      }
       this.etsyError = null;
       const info = EtsyClient.info();
       this.event(
@@ -1348,12 +1709,319 @@ export class FactoryManager extends EventEmitter {
     if (typeof raw.minPriceUsd === 'number' && raw.minPriceUsd > 0) e.minPriceUsd = raw.minPriceUsd;
     if (typeof raw.maxPriceUsd === 'number' && raw.maxPriceUsd > 0) e.maxPriceUsd = raw.maxPriceUsd;
     if (e.minPriceUsd > e.maxPriceUsd) e.maxPriceUsd = e.minPriceUsd;
+    if (typeof raw.trustThreshold === 'number') e.trustThreshold = Math.min(50, Math.max(1, Math.round(raw.trustThreshold)));
+    if (typeof raw.minSell === 'number') e.minSell = Math.min(10, Math.max(1, Math.round(raw.minSell)));
+    if (typeof raw.minSellScore === 'number') e.minSellScore = Math.min(10, Math.max(1, Math.round(raw.minSellScore)));
+    if (Array.isArray(raw.researchKeywords)) {
+      e.researchKeywords = raw.researchKeywords.filter((k): k is string => typeof k === 'string' && !!k.trim()).slice(0, 30);
+    }
     this.config.etsy = e;
     saveConfig(this.config);
     this.event(
       `etsy config updated (≤$${e.monthlySpendCapUsd}/month, ${e.maxListingsPerDay}/day${e.autoRenew ? ', auto-renew' : ''}, $${e.minPriceUsd}–$${e.maxPriceUsd})`,
     );
     this.changed();
+  }
+
+  // ---- etsy publish queue ----------------------------------------------------
+
+  /// Queue a sku for a real Etsy publish (persisted, serial). Autonomous
+  /// trust calls this from jobPackEtsy; humans via approveEtsy.
+  private enqueueEtsyPublish(sku: string): void {
+    if (this.etsyPublishQueue.includes(sku)) return;
+    this.etsyPublishQueue.push(sku);
+    void this.processEtsyQueue();
+  }
+
+  private etsyPublishBusy = false;
+  private etsyPublishNextAt = 0;
+
+  /// One sku at a time. Budget caps and a missing connection leave the sku
+  /// queued and back the queue off ~10 min; hard failures dequeue with an
+  /// error record on the asset.
+  private async processEtsyQueue(): Promise<void> {
+    if (this.etsyPublishBusy || Date.now() < this.etsyPublishNextAt) return;
+    const sku = this.etsyPublishQueue[0];
+    if (!sku) return;
+    const asset = this.asset(sku);
+    if (!asset || asset.approval?.state === 'rejected' || (!asset.approval && !asset.channels?.etsy?.listingId)) {
+      this.etsyPublishQueue.shift();
+      return;
+    }
+    if (!etsyConfigured() || !EtsyClient.info().connected) {
+      this.etsyPublishNextAt = Date.now() + PUBLISH_RETRY_MS;
+      this.event('etsy publish queue: waiting for etsy connection', undefined, sku);
+      return;
+    }
+    this.etsyPublishBusy = true;
+    try {
+      const existing = asset.channels?.etsy;
+      // already live → nothing to do
+      if (existing?.status === 'active') {
+        this.etsyPublishQueue.shift();
+        return;
+      }
+      // a draft exists → activation path only. createDraftListing for the
+      // same sku twice would leave orphan drafts on the shop
+      if (existing?.listingId) {
+        const attempts = (existing.publishAttempts ?? 0) + 1;
+        const res = await activateEtsyDraft(existing.listingId, {
+          client: this.etsyClient,
+          cfg: this.config.etsy,
+          ledger: this.etsyLedger,
+        });
+        if (res.status === 'active') {
+          asset.channels!.etsy = { ...existing, status: 'active', at: Date.now() };
+          this.etsyPublishQueue.shift();
+          this.event(`${sku} LIVE on etsy — listing ${existing.listingId}`, undefined, sku);
+        } else if (res.error?.startsWith('activation refused')) {
+          // budget refusal: wait quietly, don't burn a retry
+          asset.channels!.etsy = { ...existing, error: res.error };
+          this.etsyPublishNextAt = Date.now() + PUBLISH_RETRY_MS;
+          this.event('etsy publish queue: waiting for budget', undefined, sku);
+        } else {
+          asset.channels!.etsy = { ...existing, error: res.error, publishAttempts: attempts };
+          if (attempts >= 3) {
+            this.etsyPublishQueue.shift();
+            this.event(`etsy activation failed ${attempts}x for ${sku} — dequeued (${res.error ?? 'unknown'})`, undefined, sku);
+          } else {
+            this.etsyPublishNextAt = Date.now() + PUBLISH_RETRY_MS;
+            this.event(`etsy activation failed for ${sku} (attempt ${attempts}/3): ${res.error ?? 'unknown'}`, undefined, sku);
+          }
+        }
+        this.changed();
+        return;
+      }
+      // pre-check the spend caps BEFORE a draft is created — a refused
+      // activation would leave a stray unactivated draft sitting on etsy
+      const cents = (usd: number): number => Math.round(usd * 100);
+      if (
+        cents(this.etsyLedger.monthSpendUsd()) + cents(ETSY_LISTING_FEE_USD) > cents(this.config.etsy.monthlySpendCapUsd) ||
+        this.etsyLedger.listingsToday() >= this.config.etsy.maxListingsPerDay
+      ) {
+        this.etsyPublishNextAt = Date.now() + PUBLISH_RETRY_MS;
+        this.event('etsy publish queue: waiting for budget (spend cap / daily limit)', undefined, sku);
+        return;
+      }
+      const info = EtsyClient.info();
+      const shopId = info.shopId;
+      if (!shopId) throw new Error('etsy connected but no shop found — run refresh');
+      if (!asset.listing) throw new Error('no listing.json — the copywriter has not run');
+      // taxonomy: the copywriter's path must resolve to a real taxonomy id
+      const nodes = await loadTaxonomy({ client: this.etsyClient });
+      const taxonomyId = resolveTaxonomy(asset.listing.taxonomy ?? '', nodes);
+      if (!taxonomyId) throw new Error(`taxonomy "${asset.listing.taxonomy ?? '?'}" could not be resolved`);
+      // shop section: reuse a cached one, create it when new (max 10)
+      let sectionId: number | undefined;
+      const want = asset.listing.section?.trim().toLowerCase();
+      if (want) {
+        const hit = this.etsySections.find((s2) => s2.title.trim().toLowerCase() === want);
+        if (hit) sectionId = hit.shop_section_id;
+        else if (this.etsySections.length < 10) {
+          const created = await this.etsyClient.createShopSection(shopId, asset.listing.section!);
+          const id = Number(created.shop_section_id) || undefined;
+          if (id) {
+            this.etsySections.push({ shop_section_id: id, title: asset.listing.section! });
+            sectionId = id;
+          }
+        }
+      }
+      const spec = buildEtsySpec(asset, join(FACTORY_DIR, 'assets', sku), taxonomyId, sectionId);
+      const ship = await publishEtsyListing(spec, {
+        client: this.etsyClient,
+        cfg: this.config.etsy,
+        ledger: this.etsyLedger,
+        activate: true,
+      });
+      asset.channels = { ...(asset.channels ?? {}), etsy: ship };
+      if (ship.status === 'active') {
+        this.etsyPublishQueue.shift();
+        this.event(`${sku} LIVE on etsy — listing ${ship.listingId}${ship.url ? ` ${ship.url}` : ''}`, undefined, sku);
+      } else if (ship.listingId) {
+        // a draft exists but didn't activate — stay queued; the next pass
+        // takes the activation path (never a second draft)
+        this.etsyPublishNextAt = Date.now() + PUBLISH_RETRY_MS;
+        this.event(`${sku} drafted on etsy (${ship.error ?? 'not activated'}) — retrying shortly`, undefined, sku);
+      } else {
+        this.etsyPublishQueue.shift();
+        // no listing ever existed — a human call, not a retry: back to
+        // the approvals list with the error visible
+        asset.approval = { state: 'pending', at: Date.now(), reason: ship.error };
+        this.event(`etsy publish failed for ${sku}: ${ship.error ?? 'unknown'} — back to approvals`, undefined, sku);
+      }
+      this.changed();
+    } catch (err) {
+      this.etsyPublishQueue.shift();
+      const msg = (err as Error).message.slice(0, 200);
+      asset.channels = { ...(asset.channels ?? {}), etsy: { status: 'error', error: msg } };
+      if (!asset.channels!.etsy!.listingId) {
+        asset.approval = { state: 'pending', at: Date.now(), reason: msg };
+      }
+      this.event(`etsy publish failed for ${sku}: ${msg}${asset.approval?.state === 'pending' ? ' — back to approvals' : ''}`, undefined, sku);
+      this.changed();
+    } finally {
+      this.etsyPublishBusy = false;
+    }
+  }
+
+  /// approveEtsy {sku, edits?} — apply edits, re-validate, trust event,
+  /// enqueue the publish. Refuses (with an event) when the edited listing
+  /// no longer validates.
+  private approveEtsyListing(sku: string, edits?: { title?: string; description?: string; tags?: string[]; priceUsd?: number }): void {
+    const asset = this.asset(sku);
+    if (!asset?.listing || asset.approval?.state !== 'pending') {
+      this.event(`etsy approve: ${sku} has no pending listing`, undefined, sku);
+      return;
+    }
+    const cur = asset.listing;
+    const next = {
+      ...cur,
+      title: edits?.title?.trim() || cur.title,
+      description: edits?.description?.trim() || cur.description,
+      tags: edits?.tags?.length ? edits.tags : cur.tags,
+      priceUsd: typeof edits?.priceUsd === 'number' && edits.priceUsd > 0 ? edits.priceUsd : cur.priceUsd,
+    };
+    const edited =
+      next.title !== cur.title ||
+      next.description !== cur.description ||
+      next.priceUsd !== cur.priceUsd ||
+      next.tags.join('\n') !== cur.tags.join('\n');
+    const meta = loadShipMeta(sku);
+    const { listing, issues } = parseEtsyListingJson(
+      next,
+      this.config.etsy,
+      meta,
+      asset.sellReview?.priceUsd ?? asset.merch?.priceUsd,
+    );
+    if (!listing || issues.length) {
+      this.event(`etsy approve refused for ${sku}: ${issues[0] ?? 'invalid listing'}`, undefined, sku);
+      return;
+    }
+    asset.listing = listing;
+    asset.approval = { state: 'approved', at: Date.now(), edited };
+    if (!hasApprovalEvent(this.etsyTrust, sku)) {
+      this.etsyTrust = applyTrustEvent(
+        this.etsyTrust,
+        { kind: edited ? 'edited' : 'approved', sku, at: Date.now() },
+        this.config.etsy.trustThreshold,
+      );
+    }
+    this.enqueueEtsyPublish(sku);
+    this.event(`${sku} approved${edited ? ' (with edits)' : ''} — queued for etsy publish`, undefined, sku);
+    this.changed();
+  }
+
+  /// rejectEtsy {sku, reason} — resets the streak, archives the asset locally.
+  private rejectEtsyListing(sku: string, reason?: string): void {
+    const asset = this.asset(sku);
+    if (!asset) return;
+    this.etsyTrust = applyTrustEvent(
+      this.etsyTrust,
+      { kind: 'rejected', sku, note: reason, at: Date.now() },
+      this.config.etsy.trustThreshold,
+    );
+    asset.approval = { state: 'rejected', at: Date.now(), reason };
+    this.etsyPublishQueue = this.etsyPublishQueue.filter((x) => x !== sku);
+    this.event(`${sku} rejected${reason ? `: ${reason}` : ''} — archived`, undefined, sku);
+    this.archiveAsset(sku, `etsy rejected${reason ? `: ${reason}` : ''}`);
+    this.changed();
+  }
+
+  /// revokeEtsyAutonomy — back to approval mode.
+  private revokeEtsyAutonomy(): void {
+    this.etsyTrust = applyTrustEvent(
+      this.etsyTrust,
+      { kind: 'revoked', at: Date.now() },
+      this.config.etsy.trustThreshold,
+    );
+    // auto-approved skus still waiting in the queue return to the human
+    let handed = 0;
+    this.etsyPublishQueue = this.etsyPublishQueue.filter((sku) => {
+      const a = this.asset(sku);
+      if (a?.approval?.state === 'auto' && !a.channels?.etsy?.listingId) {
+        a.approval = { state: 'pending', at: Date.now() };
+        handed++;
+        return false;
+      }
+      return true;
+    });
+    this.event(`etsy autonomy revoked — listings need approval again${handed ? ` (${handed} queued back to approvals)` : ''}`);
+    this.changed();
+  }
+
+  /// etsyDryRun {sku} — build the spec + plan without sending anything;
+  /// the plan lands on channels.etsy.plan for the drawer to show.
+  private async etsyDryRun(sku: string): Promise<void> {
+    const asset = this.asset(sku);
+    if (!asset?.listing) {
+      this.event(`etsy dry-run: ${sku} has no listing yet`, undefined, sku);
+      return;
+    }
+    try {
+      const nodes = await loadTaxonomy({ client: this.etsyClient });
+      const taxonomyId = resolveTaxonomy(asset.listing.taxonomy ?? '', nodes);
+      const spec = buildEtsySpec(
+        asset,
+        join(FACTORY_DIR, 'assets', sku),
+        taxonomyId ?? 0,
+        this.etsySections.find((s2) => s2.title.trim().toLowerCase() === asset.listing!.section?.trim().toLowerCase())
+          ?.shop_section_id,
+      );
+      const ship = await publishEtsyListing(spec, {
+        client: this.etsyClient,
+        cfg: this.config.etsy,
+        ledger: this.etsyLedger,
+        activate: true,
+        dryRun: true,
+      });
+      if (!taxonomyId) ship.error = `taxonomy "${asset.listing.taxonomy}" unresolved — publish would fail`;
+      asset.channels = { ...(asset.channels ?? {}), etsy: { ...asset.channels?.etsy, status: asset.channels?.etsy?.status ?? 'none', plan: ship.plan, error: ship.error } };
+      this.event(`etsy dry-run for ${sku} — request plan stored (nothing sent)`, undefined, sku);
+    } catch (err) {
+      asset.channels = { ...(asset.channels ?? {}), etsy: { status: 'error', error: (err as Error).message.slice(0, 200) } };
+      this.event(`etsy dry-run failed for ${sku}: ${(err as Error).message.slice(0, 120)}`, undefined, sku);
+    }
+    this.changed();
+  }
+
+  /// scanEtsy — keyword research scan (manual: 30-min floor, auto: 6h).
+  /// Uses the shared client; findAllListingsActive is api-key only.
+  async scanEtsy(manual = true): Promise<void> {
+    if (this.etsyResearch.scanning) return;
+    const gate = etsyScanAllowed(manual);
+    if (!gate.ok) {
+      this.etsyResearch.error = `next etsy scan allowed in ${Math.ceil(gate.retryAfterMs / 60_000)} min`;
+      this.event(`etsy scan refused: ${this.etsyResearch.error}`);
+      this.maybeQueueScout();
+      this.changed();
+      return;
+    }
+    if (!etsyConfigured()) {
+      this.etsyResearch.error = 'etsy not configured — set ETSY_API_KEY/ETSY_SHARED_SECRET/ETSY_REDIRECT_URI';
+      this.event(this.etsyResearch.error);
+      this.changed();
+      return;
+    }
+    this.etsyResearch.scanning = true;
+    this.etsyResearch.error = null;
+    noteEtsyScanAttempt(); // attempts rate-limit retries, success or failure
+    this.event('scanning etsy search…');
+    this.changed();
+    try {
+      const { byKeyword, at } = await scanEtsyKeywords(this.config.etsy.researchKeywords, { client: this.etsyClient });
+      const analysis = analyseEtsyResults(byKeyword, at);
+      writeEtsyReport(analysis, at);
+      this.etsyResearch.lastScanAt = at;
+      setEtsyLastScanAt(at);
+      this.event(`etsy scan done — ${byKeyword.length} keywords researched`);
+    } catch (err) {
+      this.etsyResearch.error = (err as Error).message.slice(0, 200);
+      this.event(`etsy scan failed: ${this.etsyResearch.error}`);
+    } finally {
+      this.etsyResearch.scanning = false;
+      this.maybeQueueScout();
+      this.changed();
+    }
   }
 
   // ---- gumroad channel --------------------------------------------------------
@@ -1681,6 +2349,7 @@ export class FactoryManager extends EventEmitter {
       // No production, no mock-market sales. A LINKED worker never scans
       // locally — it works from relay-pushed analysis.
       if (this.relayAvailable()) this.maybeQueueScout();
+      else if (this.isEtsy) void this.scanEtsy(false);
       else void this.scanThenScout(true);
     } else {
       this.market.writeReport(this.assets);
@@ -1706,8 +2375,8 @@ export class FactoryManager extends EventEmitter {
     this.changed();
   }
 
-  private setMarketSource(source: 'itch' | 'mock'): void {
-    if (source !== 'itch' && source !== 'mock') return;
+  private setMarketSource(source: 'itch' | 'mock' | 'etsy'): void {
+    if (source !== 'itch' && source !== 'mock' && source !== 'etsy') return;
     if (this.config.marketSource === source) return;
     this.config.marketSource = source;
     saveConfig(this.config);

@@ -3,10 +3,13 @@
 import { resolve, sep } from 'node:path';
 import type {
   AgentKind,
+  Asset,
   AssetInspection,
   AssetKind,
+  AssetListing,
   Candidate,
   DailyTokenCaps,
+  EtsyConfig,
   JobKind,
   ModelPrices,
   Opportunity,
@@ -15,6 +18,8 @@ import type {
   UsageState,
   UsageTotals,
 } from '../../shared/protocol.js';
+import { listingConsistency, type ShipMeta } from '../../shared/shop.js';
+import { ETSY_TAG_RE } from './channels/etsy.js';
 
 type Json = any;
 
@@ -133,9 +138,15 @@ export function pickSmith(
 export interface DemandProposal extends OrderSpec {
   why: string;
   demand: number;
-  /// itch.io urls the scout cites as evidence (itch market source)
+  /// itch.io/etsy urls the scout cites as evidence
   evidence?: string[];
   priceBand?: string;
+  /// etsy analyst fields
+  format?: string;
+  keywords?: string[];
+  priceUsd?: number;
+  /// 1-10, 10 = saturated
+  competition?: number;
 }
 
 /// The scout's `## Demand` block: a fenced json array of proposals.
@@ -162,9 +173,125 @@ export function parseDemand(text: string): DemandProposal[] {
       })(),
       evidence: Array.isArray(o.evidence) ? o.evidence.filter((u: Json) => typeof u === 'string').slice(0, 5) : undefined,
       priceBand: typeof o.priceBand === 'string' && o.priceBand ? o.priceBand : undefined,
+      format: typeof o.format === 'string' && o.format ? o.format : undefined,
+      keywords: Array.isArray(o.keywords)
+        ? (o.keywords.filter((k: Json) => typeof k === 'string' && k.trim()).slice(0, 10) as string[])
+        : undefined,
+      priceUsd: (() => {
+        const n = Number(o.priceUsd);
+        return Number.isFinite(n) && n > 0 ? n : undefined;
+      })(),
+      competition: (() => {
+        const n = Number(o.competition);
+        return Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : undefined;
+      })(),
     });
   }
   return out;
+}
+
+// ---- etsy sales team blocks --------------------------------------------------
+
+/// The merchandiser's `## Assessment` fenced json — one entry per
+/// candidate id. Bad verdicts are dropped, sell clamps to 1-10, priceUsd
+/// must be finite and positive or the entry is dropped.
+export function parseAssessment(text: string): { id: string; verdict: 'go' | 'no'; sell: number; priceUsd: number; angle: string; risks: string }[] {
+  const raw = fencedJson(section(text, 'Assessment'));
+  if (!Array.isArray(raw)) return [];
+  const out: { id: string; verdict: 'go' | 'no'; sell: number; priceUsd: number; angle: string; risks: string }[] = [];
+  for (const d of raw) {
+    if (typeof d?.id !== 'string' || !d.id.trim()) continue;
+    const verdict = d.verdict === 'go' ? 'go' : d.verdict === 'no' ? 'no' : null;
+    if (!verdict) continue;
+    const priceUsd = Number(d.priceUsd);
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) continue;
+    const sell = Math.min(10, Math.max(1, Math.round(Number(d.sell) || 1)));
+    out.push({
+      id: d.id,
+      verdict,
+      sell,
+      priceUsd,
+      angle: String(d.angle ?? ''),
+      risks: String(d.risks ?? ''),
+    });
+  }
+  return out;
+}
+
+/// The merchandiser's `## Sell review` — same shape as parseInspection:
+/// "Verdict: LIST|REWORK|DROP / Score: n / Price: $n.nn / Notes: ...".
+export function parseSellReview(text: string): Asset['sellReview'] | null {
+  const body = section(text, 'Sell review');
+  if (!body) return null;
+  const vm = /Verdict:\s*(LIST|REWORK|DROP)/i.exec(body);
+  if (!vm) return null;
+  const sm = /Score:\s*(\d+(?:\.\d+)?)/i.exec(body);
+  const pm = /Price:\s*\$?\s*(\d+(?:\.\d+)?)/i.exec(body);
+  const nm = /Notes:\s*([\s\S]*)$/i.exec(body);
+  return {
+    verdict: vm[1].toUpperCase() as 'LIST' | 'REWORK' | 'DROP',
+    score: Math.min(10, Math.max(1, Math.round(Number(sm?.[1] ?? 5)))),
+    priceUsd: Number(pm?.[1] ?? 0) || 0,
+    notes: (nm?.[1] ?? '').trim(),
+  };
+}
+
+/// Validate + normalise the copywriter's listing.json for Etsy.
+/// `{ listing, issues }` — listing is the sanitised value when it parses
+/// at all; issues is empty = publishable. When merchPriceUsd is known the
+/// price is CLAMPED to ±15% of it rather than failed.
+export function parseEtsyListingJson(
+  raw: Json,
+  cfg: EtsyConfig,
+  meta: ShipMeta | undefined,
+  merchPriceUsd?: number,
+): { listing: AssetListing | undefined; issues: string[] } {
+  const issues: string[] = [];
+  if (typeof raw !== 'object' || raw === null) {
+    return { listing: undefined, issues: ['listing.json is not an object'] };
+  }
+  const title = typeof raw.title === 'string' ? raw.title.trim() : '';
+  if (!title) issues.push('title is empty');
+  else if (title.length > 140) issues.push(`title too long (${title.length} > 140 chars)`);
+  const description = typeof raw.description === 'string' ? raw.description.trim().slice(0, 5000) : '';
+  if (!description) issues.push('description is empty');
+  const seen = new Set<string>();
+  const tags: string[] = [];
+  for (const t of Array.isArray(raw.tags) ? raw.tags : []) {
+    if (typeof t !== 'string') continue;
+    const tag = t.trim();
+    if (!tag || seen.has(tag.toLowerCase())) continue;
+    seen.add(tag.toLowerCase());
+    tags.push(tag);
+  }
+  if (tags.length < 10 || tags.length > 13) issues.push(`needs 10-13 tags (got ${tags.length})`);
+  for (const t of tags) {
+    if (t.length > 20) issues.push(`tag too long (${t.length} > 20 chars): "${t.slice(0, 24)}"`);
+    else if (!ETSY_TAG_RE.test(t)) issues.push(`tag has disallowed characters: "${t}"`);
+  }
+  let priceUsd = Number(raw.priceUsd);
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) {
+    issues.push('priceUsd missing or not positive');
+    priceUsd = 0;
+  } else if (merchPriceUsd && merchPriceUsd > 0) {
+    // within ±15% of the merchandiser's price — clamp, don't fail
+    priceUsd = Math.min(merchPriceUsd * 1.15, Math.max(merchPriceUsd * 0.85, priceUsd));
+  }
+  if (priceUsd > 0 && (priceUsd < cfg.minPriceUsd || priceUsd > cfg.maxPriceUsd)) {
+    issues.push(`price $${priceUsd.toFixed(2)} outside $${cfg.minPriceUsd}–$${cfg.maxPriceUsd}`);
+  }
+  const taxonomy = typeof raw.taxonomy === 'string' ? raw.taxonomy.trim() : '';
+  if (!taxonomy) issues.push('taxonomy missing');
+  const section = typeof raw.section === 'string' ? raw.section.trim() : '';
+  if (!section) issues.push('section missing');
+  else if (section.length > 24) issues.push(`section too long (${section.length} > 24 chars)`);
+  const listing: AssetListing | undefined =
+    title || description || tags.length
+      ? { title, description, tags, priceUsd, taxonomy, section }
+      : undefined;
+  // claims must match what the generator actually emitted
+  issues.push(...listingConsistency(listing, meta));
+  return { listing, issues };
 }
 
 /// The scout's report text = everything before `## Demand` (falls back to a
@@ -405,6 +532,9 @@ export const JOB_AGENT_KIND: Record<JobKind, AgentKind> = {
   forge: 'smith',
   inspect: 'inspector',
   pack: 'packer',
+  /// the merchandiser assesses candidates and reviews finished assets
+  assess: 'merchandiser',
+  review: 'merchandiser',
 };
 
 /// Skus whose forge job is done and whose inspect job is queued but whose
@@ -470,6 +600,11 @@ export function opportunitiesToCandidates(
     why: o.why,
     demand: Math.min(10, Math.max(1, o.demand | 0)),
     variantOf: o.variantOf,
+    format: o.format,
+    keywords: o.keywords,
+    priceUsd: o.priceUsd,
+    competition: o.competition,
+    evidence: o.evidence,
     reportN: opts.reportN,
     status: 'pending' as const,
     createdAt: opts.now,

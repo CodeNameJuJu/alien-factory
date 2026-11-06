@@ -29,6 +29,7 @@ export function stations(smithCount: number): Station[] {
     { id: 'overlord', x: DAIS.x, y: DAIS.y + 8 },
     { id: 'scout', x: 58, y: 112 },
     { id: 'inspector', x: 60, y: 198 },
+    { id: 'merchandiser', x: 240, y: 198 },
     { id: 'packer', x: 424, y: 198 },
   ];
   for (let i = 1; i <= smithCount; i++) {

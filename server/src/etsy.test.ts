@@ -34,6 +34,10 @@ const CFG: EtsyConfig = {
   autoRenew: false,
   minPriceUsd: 1.5,
   maxPriceUsd: 60,
+  trustThreshold: 10,
+  minSell: 6,
+  minSellScore: 7,
+  researchKeywords: ['pixel art sprites'],
 };
 
 let dir: string;

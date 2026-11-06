@@ -26,7 +26,8 @@ export const FORWARDABLE = new Set<ClientMessage['type']>([
   'clearGumroad', 'refreshGumroad', 'archiveAsset', 'archiveUnshippable',
   'shipAllGumroad', 'publishAllGumroad',
   'etsyAuthStart', 'etsyAuthComplete', 'etsyDisconnect', 'refreshEtsy',
-  'setEtsyConfig',
+  'setEtsyConfig', 'scanEtsy', 'approveEtsy', 'rejectEtsy',
+  'revokeEtsyAutonomy', 'etsyDryRun',
 ]);
 
 // ---- signed public kit image URLs ------------------------------------------

@@ -484,7 +484,14 @@ test('opportunitiesToCandidates: pending candidates with clamped fields', () => 
 
 test('JOB_AGENT_KIND maps every job kind to an agent kind', async () => {
   const { JOB_AGENT_KIND, inspectingRecoverySkus } = await import('./parse.js');
-  assert.deepEqual(JOB_AGENT_KIND, { scout: 'scout', forge: 'smith', inspect: 'inspector', pack: 'packer' });
+  assert.deepEqual(JOB_AGENT_KIND, {
+    scout: 'scout',
+    forge: 'smith',
+    inspect: 'inspector',
+    pack: 'packer',
+    assess: 'merchandiser',
+    review: 'merchandiser',
+  });
   // the old bug: job.kind === agent.kind — inspect/pack never matched
   const assets = [
     { sku: 'a1', status: 'forging' },
@@ -518,7 +525,7 @@ test('migrateConfig drops the old model keys and merges nested maps', async () =
   assert.equal(c.models.inspector, 'claude-haiku-5-5-low');
   assert.equal(c.models.packer, 'swe-1-6');
   assert.equal(c.models.smith, 'custom-smith'); // partial map merged
-  assert.deepEqual(c.sessionJobLimit, { scout: 1, smith: 1, inspector: 4, packer: 6 });
+  assert.deepEqual(c.sessionJobLimit, { scout: 1, smith: 1, inspector: 4, packer: 6, merchandiser: 3 });
   assert.equal(c.dailyTokenCaps, null);
   assert.equal('overlordModel' in c, false);
   assert.equal('workerSessionJobLimit' in c, false);

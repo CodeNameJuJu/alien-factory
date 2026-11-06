@@ -81,6 +81,9 @@ export function alienSprite(name: string, kind: AgentKind, frame: number, flip =
   } else if (kind === 'packer') {
     s.rect(9, 8 + bob, 3, 3, [160, 120, 70]); // little box
     px(s, 10, 8 + bob, [190, 150, 90]);
+  } else if (kind === 'merchandiser') {
+    s.rect(9, 7 + bob, 3, 3, [230, 200, 90]); // price tag
+    px(s, 10, 8 + bob, [80, 60, 20]);
   }
   outline(s, dark);
   const c = s.toCanvas();

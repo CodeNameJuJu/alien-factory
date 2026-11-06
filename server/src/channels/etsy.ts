@@ -25,12 +25,13 @@
 //   - 429s carry `retry-after` (seconds).
 //   - publish fee: $0.20 per listing activation (Etsy seller docs).
 // NEVER request listings_d — this channel never deletes listings.
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { DATA_DIR } from '../config.js';
-import type { EtsyConfig, EtsyShip } from '../../../shared/protocol.js';
+import type { Asset, EtsyConfig, EtsyShip } from '../../../shared/protocol.js';
 import type { FetchLike } from './gumroad.js';
+import { buildKit } from '../kit.js';
 
 const API = 'https://api.etsy.com/v3/application';
 const TOKEN_URL = 'https://api.etsy.com/v3/public/oauth/token';
@@ -355,21 +356,33 @@ export class EtsyClient {
 
   /// One api call (auto-refresh + throttle + 429 retries). `path` is
   /// absolute or relative to /v3/application. Every error is redacted.
+  /// `auth:false` sends only the api key — for endpoints the OAS marks
+  /// with no oauth security (search, taxonomy): no token file needed.
   private async request(
     method: string,
     path: string,
-    opts: { form?: FormBody; json?: unknown; multipart?: FormData; query?: Record<string, unknown> } = {},
+    opts: {
+      form?: FormBody;
+      json?: unknown;
+      multipart?: FormData;
+      query?: Record<string, unknown>;
+      auth?: boolean;
+    } = {},
   ): Promise<Record<string, unknown>> {
-    if (this.now() > this.ensureTokens().expiresAt - REFRESH_SLACK_MS) await this.refresh();
-    const t = this.ensureTokens();
+    const auth = opts.auth !== false;
+    let t: EtsyTokens | null = null;
+    if (auth) {
+      if (this.now() > this.ensureTokens().expiresAt - REFRESH_SLACK_MS) await this.refresh();
+      t = this.ensureTokens();
+    }
     const url = new URL(path.startsWith('http') ? path : `${API}${path}`);
     for (const [k, v] of Object.entries(opts.query ?? {})) {
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     }
     const headers: Record<string, string> = {
       'x-api-key': `${apiKey()}:${sharedSecret()}`,
-      authorization: `Bearer ${t.accessToken}`,
     };
+    if (t) headers.authorization = `Bearer ${t.accessToken}`;
     let body: unknown;
     if (opts.multipart) {
       body = opts.multipart;
@@ -446,7 +459,8 @@ export class EtsyClient {
     return this.request('PUT', `/shops/${shopId}`, { form: patch });
   }
 
-  /// GET /v3/application/listings/active
+  /// GET /v3/application/listings/active — api-key only (no oauth scope
+  /// in the OAS), used by the market researcher without a token file.
   findAllListingsActive(params: {
     keywords?: string;
     limit?: number;
@@ -454,7 +468,18 @@ export class EtsyClient {
     sort_on?: string;
     sort_order?: string;
   } = {}): Promise<Record<string, unknown>> {
-    return this.request('GET', '/listings/active', { query: { ...params } });
+    return this.request('GET', '/listings/active', { query: { ...params }, auth: false });
+  }
+
+  /// GET /v3/application/seller-taxonomy/nodes — api-key only per the OAS.
+  getSellerTaxonomyNodes(): Promise<Record<string, unknown>> {
+    return this.request('GET', '/seller-taxonomy/nodes', { auth: false });
+  }
+
+  /// GET /v3/application/shops/{shop_id}/sections — no oauth scope in the
+  /// OAS; sent with the bearer anyway (harmless, and the seller's own shop).
+  getShopSections(shopId: number): Promise<Record<string, unknown>> {
+    return this.request('GET', `/shops/${shopId}/sections`);
   }
 
   /// GET /v3/application/shops/{shop_id}/listings/active
@@ -568,8 +593,10 @@ const realStat: StatLike = (path) => {
   }
 };
 
-/// tags: letters/numbers (any script), spaces, - _ ' . — nothing else
-const TAG_RE = /^[\p{L}\p{N} '_\-.]+$/u;
+/// tags: letters/numbers, whitespace, - ' ™ © ® — per the OAS listing
+/// regex /[^\p{L}\p{Nd}\p{Zs}\-'™©®]/u (underscores and periods are NOT
+/// allowed, whatever seller folklore says). Shared with parse.ts.
+export const ETSY_TAG_RE = /^[\p{L}\p{Nd}\p{Zs}\-'™©®]+$/u;
 
 /// Pure validation — returns every problem found (empty = publishable).
 /// Sizes come from the injectable stat so tests never touch real paths.
@@ -584,7 +611,7 @@ export function validateEtsySpec(spec: EtsyListingSpec, cfg: EtsyConfig, stat: S
   for (const t of tags) {
     if (!t.trim()) issues.push('empty tag');
     else if (t.length > 20) issues.push(`tag too long (${t.length} > 20 chars): "${t.slice(0, 24)}"`);
-    else if (!TAG_RE.test(t)) issues.push(`tag has disallowed characters: "${t}"`);
+    else if (!ETSY_TAG_RE.test(t)) issues.push(`tag has disallowed characters: "${t}"`);
   }
   if (!(spec.priceUsd >= cfg.minPriceUsd && spec.priceUsd <= cfg.maxPriceUsd)) {
     issues.push(`price $${spec.priceUsd} outside $${cfg.minPriceUsd}–$${cfg.maxPriceUsd}`);
@@ -767,5 +794,82 @@ export async function publishEtsyListing(spec: EtsyListingSpec, opts: PublishEts
     const msg = (err as Error).message.slice(0, 300);
     if (listingId) return { status: 'draft', listingId, priceUsd: spec.priceUsd, at: Date.now(), error: msg };
     return { status: 'error', error: msg };
+  }
+}
+
+// ---- publish spec builder ------------------------------------------------------
+
+/// Appended once to every Etsy description — Etsy's seller policy wants
+/// AI-produced content disclosed. buildEtsySpec dedupes on a re-run.
+export const ETSY_DISCLOSURE =
+  'About this listing: designed by our shop with our own code-based generators. AI tools helped write the generator code and this description, and every item was reviewed before release.';
+
+/// Turn a listed asset into a publishable EtsyListingSpec: builds the kit
+/// (zip + cover/thumbnail/gallery), images in Etsy-rank order, the zip as
+/// the sole download file, disclosure appended exactly once.
+export function buildEtsySpec(asset: Asset, dir: string, taxonomyId: number, sectionId?: number): EtsyListingSpec {
+  const isPack = asset.kind === 'pack';
+  const itemNames =
+    asset.itemNames?.length
+      ? asset.itemNames
+      : [];
+  const kit = buildKit(dir, {
+    sku: asset.sku,
+    title: asset.listing?.title ?? asset.title,
+    isPack,
+    size: asset.size,
+    itemNames,
+    framesPerItem: isPack ? asset.frames : asset.frames,
+    fps: 4,
+  });
+  const images = ['cover.png', 'gallery-1.png', 'thumbnail.png']
+    .map((f) => join(kit.dir, f))
+    .filter((p) => existsSync(p));
+  const base = asset.listing?.description ?? asset.title;
+  const description = base.includes(ETSY_DISCLOSURE) ? base : `${base}\n\n${ETSY_DISCLOSURE}`;
+  return {
+    title: asset.listing?.title ?? asset.title,
+    description,
+    tags: asset.listing?.tags ?? asset.tags,
+    priceUsd: asset.listing?.priceUsd ?? 2.99,
+    taxonomyId,
+    images,
+    files: [join(kit.dir, kit.zipName)],
+    sectionId,
+  };
+}
+
+/// Activate an EXISTING draft listing — the only path once a listing_id
+/// exists; creating a second draft for the same sku is never allowed.
+/// Same cap/day checks as publishEtsyListing; the ledger entry is written
+/// only after a successful PATCH.
+export async function activateEtsyDraft(
+  listingId: number,
+  opts: { client: EtsyClient; cfg: EtsyConfig; ledger: EtsyLedger },
+): Promise<EtsyShip> {
+  const { client, cfg, ledger } = opts;
+  const shopId = client.shopId;
+  const ship: EtsyShip = { status: 'draft', listingId, at: Date.now() };
+  if (!shopId) {
+    ship.error = 'etsy connected but no shop found';
+    return ship;
+  }
+  const cents = (usd: number): number => Math.round(usd * 100);
+  if (cents(ledger.monthSpendUsd()) + cents(ETSY_LISTING_FEE_USD) > cents(cfg.monthlySpendCapUsd)) {
+    ship.error = `activation refused — monthly spend cap ($${ledger.monthSpendUsd().toFixed(2)} + $${ETSY_LISTING_FEE_USD.toFixed(2)} > $${cfg.monthlySpendCapUsd.toFixed(2)})`;
+    return ship;
+  }
+  if (ledger.listingsToday() >= cfg.maxListingsPerDay) {
+    ship.error = `activation refused — daily listing limit reached (${cfg.maxListingsPerDay}/day)`;
+    return ship;
+  }
+  try {
+    await client.updateListing(shopId, listingId, { state: 'active' });
+    ledger.append({ at: Date.now(), kind: 'listing', usd: ETSY_LISTING_FEE_USD, listingId });
+    ship.status = 'active';
+    return ship;
+  } catch (err) {
+    ship.error = (err as Error).message.slice(0, 300);
+    return ship;
   }
 }

@@ -104,7 +104,8 @@ client/               # Vite + TS, zero runtime deps
   rejects tool calls containing non-itch.io URLs in research mode.
 - **`mode: 'full'`** — the produce-and-sell pipeline below; with
   `marketSource: 'itch'` the scout reads `reports/itch-latest.md` instead
-  of the mock report. The packer "lists" on the in-memory mock market;
+  of the mock report; with `marketSource: 'etsy'` (the default for fresh
+  configs) the real Etsy sales pipeline below runs instead. The packer "lists" on the in-memory mock market;
   real publishing exists ONLY through the gated **Gumroad channel**
   (`server/src/channels/gumroad.ts`): explicit click in the SHOP section
   (per asset, or the bulk ship/publish buttons — each asset still passes
@@ -121,6 +122,44 @@ client/               # Vite + TS, zero runtime deps
   are null — never guessed — when the token lacks `view_sales`).
   No other marketplace/upload code may be added without an explicit
   future decision — and never to itch.io (research stays read-only).
+
+### The Etsy pipeline (`marketSource: 'etsy'`)
+
+analyst (scout) → merchandiser ASSESS → overlord → smith → inspector →
+merchandiser SELL REVIEW → copywriter (packer) → approval queue, or
+autonomous publish once trusted.
+
+- **Research** (`server/src/etsy-research.ts`): sequential
+  `findAllListingsActive` keyword scans (api-key only, ≥1 s apart, 50 per
+  keyword), raw JSON cached 6 h under `market/etsy/raw/`, 30 snapshots
+  under `market/etsy/snapshots/`, `reports/etsy-latest.md`. Auto scans ≥6 h,
+  `[ scan etsy ]` ≥30 min.
+- **Assess** (`job kind 'assess'`): `merchAssessPrompt` + `parseAssessment`.
+  `go` with sell ≥ `etsy.minSell` attaches `merch` to the candidate (the
+  overlord only sees merch'd candidates); anything else declines it
+  (`merchandiser: <reason>`). Missing block → one nudge, then
+  `assessFailedAt` and a 30-min cooldown.
+- **Sell review** (`'review'` job, status `reviewing`): `merchReviewPrompt`
+  + `parseSellReview`. LIST ≥ `etsy.minSellScore` → conveyor + pack job;
+  REWORK/low-LIST → forge job pinned to the same smith (`review:` note)
+  while `attempts < 2`; DROP → scrapped.
+- **Copywriter** (`jobPackEtsy`): `copywriterPrompt` → `listing.json`
+  validated by `parseEtsyListingJson` (title ≤140, 10-13 tags, ±15% of the
+  merch price clamped to cfg bounds, taxonomy path, section ≤24 chars,
+  listingConsistency vs meta.json). One in-session retry, then failed.
+- **Approval + trust** (`shared/trust.ts`): `approval.state` pending →
+  `approveEtsy` (optional edits, re-validated) / `rejectEtsy` (archives
+  locally). `trustThreshold` consecutive approvals → `autonomous` →
+  listings auto-queue for publish. Edits/rejects reset the streak;
+  `revokeEtsyAutonomy` drops it.
+- **Publish queue**: persisted, serial, one shared `EtsyClient`. Pre-checks
+  the ledger caps (cents comparison) BEFORE a draft exists — a cap or a
+  missing connection leaves the sku queued and retries ≥10 min. Sections
+  are cached (max 10, `createShopSection` when new); the taxonomy path
+  resolves via `etsy-taxonomy.ts` (7-day disk cache, Jaccard ≥0.5).
+- Config: `etsy.{monthlySpendCapUsd,maxListingsPerDay,autoRenew,
+  minPriceUsd,maxPriceUsd,trustThreshold,minSell,minSellScore,
+  researchKeywords}`; `models.merchandiser`, `sessionJobLimit.merchandiser`.
 
 itch.io politeness (itch.ts): feeds are `game-assets/{top-sellers|top-rated|
 new-and-popular|newest}[/tag-x]` (validated), sequential requests ≥1.5 s
@@ -225,8 +264,11 @@ defaults:
   "prices": {},
   "dailyTokenCaps": null,
   "mode": "research",
-  "marketSource": "itch",
+  "marketSource": "etsy",
   "gumroad": { "minScore": 7, "packsOnly": true, "maxDraftsPerDay": 3, "autoPublish": false },
+  "etsy": { "monthlySpendCapUsd": 5, "maxListingsPerDay": 3, "autoRenew": false,
+            "minPriceUsd": 1.5, "maxPriceUsd": 60, "trustThreshold": 10,
+            "minSell": 6, "minSellScore": 7, "researchKeywords": ["..."] },
   "autoArchiveFailed": true,
   "itchScanMinutes": 60,
   "itchFeeds": ["game-assets/top-sellers/tag-pixel-art:2", "..."]
