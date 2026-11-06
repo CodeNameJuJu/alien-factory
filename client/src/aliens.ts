@@ -3,7 +3,7 @@
 // carry a crate down to the output belt.
 import type { Agent } from '../../shared/protocol';
 import { DAIS, SCANNER, PORTAL, stations, type Station } from './floor';
-import { alienSprite, bubble, crateSprite, overlordSprite } from './sprites';
+import { alienEmissive, alienSprite, bubble, crateSprite, overlordEmissive, overlordSprite } from './sprites';
 import { mulberry32, hashString } from './pix';
 
 type Phase = 'idle' | 'toDais' | 'toStation' | 'work' | 'carry';
@@ -21,18 +21,18 @@ interface AlienView {
 }
 
 const views = new Map<string, AlienView>();
-const SPEED = 84;
-const DAIS_MEET = { x: DAIS.x, y: DAIS.y + 68 };
+const SPEED = 60;
+const DAIS_MEET = { x: DAIS.x, y: DAIS.y + 48 };
 /// Walk lane below the work row, above the conveyor.
-const AISLE_Y = 380;
+const AISLE_Y = 258;
 
 /// Where each kind drops its finished crate: smiths carry to the scanner at
 /// the conveyor's left end, the inspector drops on the belt start, the
 /// packer ships into the portal.
 const DROP: Record<string, { x: number; y: number }> = {
-  smith: { x: SCANNER.x, y: SCANNER.y - 12 },
-  inspector: { x: SCANNER.x + 20, y: 448 },
-  packer: { x: PORTAL.x - 28, y: 448 },
+  smith: { x: SCANNER.x, y: SCANNER.y - 8 },
+  inspector: { x: SCANNER.x + 14, y: 300 },
+  packer: { x: PORTAL.x - 20, y: 300 },
 };
 
 function routeTo(from: { x: number; y: number }, to: { x: number; y: number }): { x: number; y: number }[] {
@@ -112,7 +112,7 @@ export function updateAliens(agents: Agent[], dt: number, t: number): Map<string
       v.wanderT -= dt;
       if (v.wanderT <= 0 && !v.path.length) {
         const rnd = mulberry32(hashString(a.id + Math.floor(t * 0.5)));
-        v.path = [{ x: home.x + (rnd() - 0.5) * 52, y: home.y + (rnd() - 0.5) * 20 }];
+        v.path = [{ x: home.x + (rnd() - 0.5) * 36, y: home.y + (rnd() - 0.5) * 14 }];
         v.wanderT = 1.5 + rnd() * 2.5;
       }
       step(v, dt);
@@ -138,7 +138,7 @@ export function drawAliens(
     // shadow
     ctx.fillStyle = 'rgba(10,8,16,0.4)';
     ctx.beginPath();
-    ctx.ellipse(v.x, v.y + 2, 12, 4, 0, 0, Math.PI * 2);
+    ctx.ellipse(v.x, v.y + 2, 16, 5, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.drawImage(alienSprite(a.name, a.kind, bob, v.flip), Math.round(v.x) - 18, Math.round(v.y) - 42);
     if (v.carry) ctx.drawImage(crateSprite(), Math.round(v.x) - 14, Math.round(v.y) - 48);
@@ -161,10 +161,10 @@ export function drawOverlord(
   ctx.beginPath();
   ctx.ellipse(DAIS.x, DAIS.y + 4, 72, 20, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.drawImage(overlordSprite(sway, thinking), DAIS.x - 48, DAIS.y - 52);
-  if (overlord?.state === 'error') ctx.drawImage(bubble('!'), DAIS.x + 28, DAIS.y - 60);
-  else if (overlord?.state === 'offline') ctx.drawImage(bubble('z'), DAIS.x + 28, DAIS.y - 60);
-  if (selected === 'overlord') selectionRing(ctx, DAIS.x, DAIS.y, t, 48);
+  ctx.drawImage(overlordSprite(sway, thinking), DAIS.x - 48, DAIS.y - 44);
+  if (overlord?.state === 'error') ctx.drawImage(bubble('!'), DAIS.x + 30, DAIS.y - 48);
+  else if (overlord?.state === 'offline') ctx.drawImage(bubble('z'), DAIS.x + 30, DAIS.y - 48);
+  if (selected === 'overlord') selectionRing(ctx, DAIS.x, DAIS.y, t, 40);
 }
 
 /// Pulsing RTS selection brackets.
@@ -181,4 +181,30 @@ export function selectionRing(ctx: CanvasRenderingContext2D, x: number, y: numbe
     ctx.lineTo(x + sx * rr - sx * c, y + sy * rr);
     ctx.stroke();
   }
+}
+
+/// Emissive-only redraw: called AFTER applyLighting so eyes/tubes glow on
+/// top of the darkness.
+export function drawEmissives(
+  ctx: CanvasRenderingContext2D,
+  agents: Agent[],
+  views: Map<string, AlienView>,
+  t: number,
+): void {
+  for (const a of agents) {
+    if (a.kind === 'overlord') continue;
+    const v = views.get(a.id);
+    if (!v) continue;
+    const moving = v.path.length > 0;
+    const frame = moving ? Math.floor(t * 8) % 2 : 0;
+    const bob = a.state === 'working' && !moving ? Math.floor(t * 6) % 2 : frame;
+    ctx.drawImage(alienEmissive(a.name, a.kind, bob, v.flip), Math.round(v.x) - 18, Math.round(v.y) - 42);
+  }
+}
+
+/// Overlord emissive mask, same position as drawOverlord.
+export function drawOverlordEmissive(ctx: CanvasRenderingContext2D, thinking: boolean, t: number): void {
+  const sway = Math.abs(Math.floor(t * 3)) % 8 * 0.6;
+  void sway;
+  ctx.drawImage(overlordEmissive(t, thinking), DAIS.x - 48, DAIS.y - 44);
 }

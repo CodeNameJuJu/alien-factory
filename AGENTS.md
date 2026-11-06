@@ -212,7 +212,7 @@ pipeline data from the old design on load.
 
 ## Conventions
 
-- **Pixel look**: internal canvas is 960x540, upscaled with
+- **Pixel look**: internal canvas is 640x360, upscaled with
   `image-rendering: pixelated`. All art is procedural and seeded — no image
   assets except the generated `sheet.png`s from `/files/...`, no smoothing,
   no web fonts (`Courier New` only). Sprites are palette-indexed template

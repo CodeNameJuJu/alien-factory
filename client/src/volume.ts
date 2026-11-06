@@ -230,6 +230,56 @@ export function renderVolume(w: number, h: number, prims: Prim[], seed = 1, rim?
   return { data, buf };
 }
 
+/// Emissive-only pass: returns RGBA pixels for emissive materials + halo —
+/// drawn AFTER the darkness layer so glows read on top.
+export function renderEmissive(w: number, h: number, prims: Prim[], seed = 1): Uint8ClampedArray {
+  const { buf } = renderVolume(w, h, prims, seed);
+  const out = new Uint8ClampedArray(w * h * 4);
+  const px = (x: number, y: number, c: RGB, a = 255): void => {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const i = (y * w + x) * 4;
+    out[i] = c[0]; out[i + 1] = c[1]; out[i + 2] = c[2]; out[i + 3] = a;
+  };
+  // collect the emissive cores first — the halo MUST decay from this fixed
+  // set; letting newly written halo pixels count cascades it across the
+  // whole sprite
+  const cores: [number, number][] = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (buf.part[i] < 0) continue;
+    const p = prims[buf.prim[i]];
+    if (EMISSIVE.has(p.mat)) {
+      px(x, y, RAMPS.acid[2]);
+      cores.push([x, y]);
+    }
+  }
+  // halo: distance-decayed alpha from the core set only
+  const best = new Map<number, number>();
+  for (const [ex, ey] of cores) {
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const dist = Math.max(Math.abs(dx), Math.abs(dy));
+      if (dist === 0 || dist > 2) continue;
+      const a = dist === 1 ? 90 : 45;
+      const key = (ey + dy) * w + (ex + dx);
+      if ((best.get(key) ?? 0) < a) best.set(key, a);
+    }
+  }
+  for (const [key, a] of best) {
+    const x = key % w, y = Math.floor(key / w);
+    const i = (y * w + x) * 4;
+    if (out[i + 3] === 0) px(x, y, RAMPS.acid[2], a);
+  }
+  return out;
+}
+
+/// Dev check: an emissive mask must be mostly transparent (≤15% filled),
+/// or the draw ends up a green box over the sprite.
+export function emissiveCoverage(data: Uint8ClampedArray): number {
+  let n = 0;
+  for (let i = 3; i < data.length; i += 4) if (data[i] > 0) n++;
+  return n / (data.length / 4);
+}
+
 // ---- ascii debug ----------------------------------------------------------------
 
 const CHARS = ' .:;+*#%@';

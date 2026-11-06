@@ -6,7 +6,7 @@
 // grids are only used for eyes/teeth-sized features.
 import { Sprite, mulberry32, hashString, type RGB } from './pix';
 import type { AgentKind } from '../../shared/protocol';
-import { renderVolume, renderAscii, type Prim, type Mat, RAMPS } from './volume';
+import { renderVolume, renderAscii, renderEmissive, emissiveCoverage, type Prim, type Mat, RAMPS } from './volume';
 
 type V3 = [number, number, number];
 const ell = (c: V3, r: V3, mat: Mat, part: number, surf?: 'speckle' | 'vein' | 'brain' | 'none'): Prim => ({ kind: 'ell', c, r, mat, part, surf });
@@ -281,6 +281,55 @@ function cached(key: string, build: () => HTMLCanvasElement): HTMLCanvasElement 
   const c = build();
   cache.set(key, c);
   return c;
+}
+
+/// Emissive-only canvas for a worker frame — drawn over the darkness so
+/// the eyes glow. Same cache key space as alienSprite.
+export function alienEmissive(name: string, kind: AgentKind, frame: number, flip = false): HTMLCanvasElement {
+  const key = `em:${name}:${kind}:${frame}`;
+  const base = cached(key, () => {
+    const data = renderEmissive(36, 44, workerPrims(kind, params(name), frame), hashString(name));
+    if (import.meta.env?.DEV && emissiveCoverage(data) > 0.15) {
+      console.warn(`emissive mask too dense: ${name}/${kind} f${frame} ${Math.round(emissiveCoverage(data) * 100)}%`);
+    }
+    const c = document.createElement('canvas');
+    c.width = 36; c.height = 44;
+    const g = c.getContext('2d')!;
+    const img = g.createImageData(36, 44);
+    img.data.set(data);
+    g.putImageData(img, 0, 0);
+    return c;
+  });
+  if (!flip) return base;
+  const fk = key + ':flip';
+  const fhit = cache.get(fk);
+  if (fhit) return fhit;
+  const c = document.createElement('canvas');
+  c.width = 36; c.height = 44;
+  const g = c.getContext('2d')!;
+  g.imageSmoothingEnabled = false;
+  g.translate(36, 0); g.scale(-1, 1);
+  g.drawImage(base, 0, 0);
+  cache.set(fk, c);
+  return c;
+}
+
+/// Overlord emissive mask (eyes, tubes, thinking crown).
+export function overlordEmissive(sway: number, thinking: boolean): HTMLCanvasElement {
+  const f = Math.abs(Math.floor(sway * 3)) % 8;
+  return cached(`olem:${thinking}:${f}`, () => {
+    const data = renderEmissive(96, 96, overlordPrims(f * 0.6, thinking), 7);
+    if (import.meta.env?.DEV && emissiveCoverage(data) > 0.15) {
+      console.warn(`overlord emissive mask too dense: ${Math.round(emissiveCoverage(data) * 100)}%`);
+    }
+    const c = document.createElement('canvas');
+    c.width = 96; c.height = 96;
+    const g = c.getContext('2d')!;
+    const img = g.createImageData(96, 96);
+    img.data.set(data);
+    g.putImageData(img, 0, 0);
+    return c;
+  });
 }
 
 /// ~36x44 worker. frame 0/1 = breathing; 2/3 = work loop; walk uses the

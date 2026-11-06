@@ -2,8 +2,8 @@ import { Net } from './net';
 import { Hud } from './hud';
 import { Drawers, type Selection } from './drawers';
 import { startDemo } from './demo';
-import { drawFloor, hitTest, W, H, type FloorView } from './floor';
-import { updateAliens, drawAliens, drawOverlord } from './aliens';
+import { drawFloor, hitTest, W, H, applyLighting, floorEmissives, lightSources, type FloorView } from './floor';
+import { updateAliens, drawAliens, drawOverlord, drawEmissives, drawOverlordEmissive } from './aliens';
 import type { Agent, ServerMessage, StateMessage } from '../../shared/protocol';
 
 const canvas = document.getElementById('screen') as HTMLCanvasElement;
@@ -117,12 +117,11 @@ function renderLabels(pos: Map<string, { x: number; y: number }>): void {
   const seen = new Set<string>();
   const tiny = sx < 1; // canvas under 1x — only important plates, smaller
   for (const a of state.agents) {
-    const p = a.kind === 'overlord' ? { x: 480, y: 196 } : pos.get(a.id);
+    const p = a.kind === 'overlord' ? { x: 320, y: 120 } : pos.get(a.id);
     if (!p) continue;
-    // at tiny scales only working/selected/offline-status plates show —
-    // idle names would just overlap and spill
+    // only hover or selected agents get a nameplate — the scene stays clean
     const selId = selected && 'id' in selected ? selected.id : null;
-    if (tiny && a.state !== 'working' && selId !== a.id) continue;
+    if (selId !== a.id && hoverId !== a.id) continue;
     seen.add(a.id);
     let div = labelDivs.get(a.id);
     if (!div) {
@@ -236,10 +235,18 @@ function loop(t: number): void {
   hoverId = hit?.id ?? null;
   canvas.style.cursor = hit ? 'pointer' : 'default';
 
+  const drawT0 = performance.now();
   ctx.clearRect(0, 0, W, H);
   drawFloor(ctx, animT, fv);
   drawOverlord(ctx, state.agents.find((a) => a.kind === 'overlord'), animT, selected?.type === 'overlord' ? 'overlord' : null);
   drawAliens(ctx, state.agents, views, animT, selected?.type === 'agent' ? selected.id : null);
+  // dread lighting: darkness with light holes + tinted glow, dim ambient per alien
+  applyLighting(ctx, animT, lightSources(animT, { overlordThinking: state.agents.some((a) => a.kind === 'overlord' && a.state === 'working'), scanning: state.shift === 'running', smithCount: state.config.smiths, workingAgents: new Set(state.agents.filter((a) => a.state === 'working').map((a) => a.id)) }), [...views.values()].map((v) => ({ x: v.x, y: v.y - 20 })));
+  // emissives on top — eyes, vats, scan lines, lamps, portal
+  floorEmissives(ctx, animT, { scanning: state.shift === 'running', smithCount: state.config.smiths, workingAgents: new Set(state.agents.filter((a) => a.state === 'working').map((a) => a.id)) });
+  drawEmissives(ctx, state.agents, views, animT);
+  drawOverlordEmissive(ctx, state.agents.some((a) => a.kind === 'overlord' && a.state === 'working'), animT);
+  (window as unknown as { __drawMs: number }).__drawMs = performance.now() - drawT0;
   drawers.tick(animT);
   hud.tick(animT);
   renderLabels(lastPositions);
