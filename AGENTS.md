@@ -212,10 +212,13 @@ pipeline data from the old design on load.
 
 ## Conventions
 
-- **Pixel look**: internal canvas is 480x270, upscaled with
+- **Pixel look**: internal canvas is 960x540, upscaled with
   `image-rendering: pixelated`. All art is procedural and seeded — no image
   assets except the generated `sheet.png`s from `/files/...`, no smoothing,
-  no web fonts (`Courier New` only).
+  no web fonts (`Courier New` only). Sprites are palette-indexed template
+  grids composed from parts in `sprites.ts`, plus a seeded per-agent
+  mangling pass (`mulberry32(hashString(name))`) — never redraw whole
+  sprites per animation frame; move or swap parts.
 - **Mouse-only RTS**: no player character. Hover highlights + nameplates,
   click selects (pulsing brackets) and opens the drawer, Esc closes.
 - **ACP mode rule**: agents must be able to write — never select the `ask`

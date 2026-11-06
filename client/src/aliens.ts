@@ -21,18 +21,18 @@ interface AlienView {
 }
 
 const views = new Map<string, AlienView>();
-const SPEED = 42;
-const DAIS_MEET = { x: DAIS.x, y: DAIS.y + 34 };
+const SPEED = 84;
+const DAIS_MEET = { x: DAIS.x, y: DAIS.y + 68 };
 /// Walk lane below the work row, above the conveyor.
-const AISLE_Y = 190;
+const AISLE_Y = 380;
 
 /// Where each kind drops its finished crate: smiths carry to the scanner at
 /// the conveyor's left end, the inspector drops on the belt start, the
 /// packer ships into the portal.
 const DROP: Record<string, { x: number; y: number }> = {
-  smith: { x: SCANNER.x, y: SCANNER.y - 6 },
-  inspector: { x: SCANNER.x + 10, y: 224 },
-  packer: { x: PORTAL.x - 14, y: 224 },
+  smith: { x: SCANNER.x, y: SCANNER.y - 12 },
+  inspector: { x: SCANNER.x + 20, y: 448 },
+  packer: { x: PORTAL.x - 28, y: 448 },
 };
 
 function routeTo(from: { x: number; y: number }, to: { x: number; y: number }): { x: number; y: number }[] {
@@ -51,7 +51,7 @@ function step(v: AlienView, dt: number): void {
   const dx = target.x - v.x;
   const dy = target.y - v.y;
   const d = Math.hypot(dx, dy);
-  if (d < 2) {
+  if (d < 4) {
     v.x = target.x;
     v.y = target.y;
     v.path.shift();
@@ -112,7 +112,7 @@ export function updateAliens(agents: Agent[], dt: number, t: number): Map<string
       v.wanderT -= dt;
       if (v.wanderT <= 0 && !v.path.length) {
         const rnd = mulberry32(hashString(a.id + Math.floor(t * 0.5)));
-        v.path = [{ x: home.x + (rnd() - 0.5) * 26, y: home.y + (rnd() - 0.5) * 10 }];
+        v.path = [{ x: home.x + (rnd() - 0.5) * 52, y: home.y + (rnd() - 0.5) * 20 }];
         v.wanderT = 1.5 + rnd() * 2.5;
       }
       step(v, dt);
@@ -138,13 +138,13 @@ export function drawAliens(
     // shadow
     ctx.fillStyle = 'rgba(10,8,16,0.4)';
     ctx.beginPath();
-    ctx.ellipse(v.x, v.y + 1, 6, 2, 0, 0, Math.PI * 2);
+    ctx.ellipse(v.x, v.y + 2, 12, 4, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.drawImage(alienSprite(a.name, a.kind, bob, v.flip), Math.round(v.x) - 6, Math.round(v.y) - 13);
-    if (v.carry) ctx.drawImage(crateSprite(), Math.round(v.x) - 7, Math.round(v.y) - 24);
-    if (a.state === 'error') ctx.drawImage(bubble('!'), Math.round(v.x) + 5, Math.round(v.y) - 22);
-    else if (a.state === 'offline') ctx.drawImage(bubble('z'), Math.round(v.x) + 5, Math.round(v.y) - 22);
-    else if (a.state === 'working') ctx.drawImage(bubble('work'), Math.round(v.x) + 5, Math.round(v.y) - 22);
+    ctx.drawImage(alienSprite(a.name, a.kind, bob, v.flip), Math.round(v.x) - 18, Math.round(v.y) - 42);
+    if (v.carry) ctx.drawImage(crateSprite(), Math.round(v.x) - 14, Math.round(v.y) - 48);
+    if (a.state === 'error') ctx.drawImage(bubble('!'), Math.round(v.x) + 10, Math.round(v.y) - 44);
+    else if (a.state === 'offline') ctx.drawImage(bubble('z'), Math.round(v.x) + 10, Math.round(v.y) - 44);
+    else if (a.state === 'working') ctx.drawImage(bubble('work'), Math.round(v.x) + 10, Math.round(v.y) - 44);
     if (selected === a.id) selectionRing(ctx, v.x, v.y, t);
   }
 }
@@ -159,12 +159,12 @@ export function drawOverlord(
   const sway = t;
   ctx.fillStyle = 'rgba(10,8,16,0.4)';
   ctx.beginPath();
-  ctx.ellipse(DAIS.x, DAIS.y + 2, 18, 5, 0, 0, Math.PI * 2);
+  ctx.ellipse(DAIS.x, DAIS.y + 4, 72, 20, 0, 0, Math.PI * 2);
   ctx.fill();
-  ctx.drawImage(overlordSprite(sway, thinking), DAIS.x - 15, DAIS.y - 26);
-  if (overlord?.state === 'error') ctx.drawImage(bubble('!'), DAIS.x + 14, DAIS.y - 30);
-  else if (overlord?.state === 'offline') ctx.drawImage(bubble('z'), DAIS.x + 14, DAIS.y - 30);
-  if (selected === 'overlord') selectionRing(ctx, DAIS.x, DAIS.y, t, 24);
+  ctx.drawImage(overlordSprite(sway, thinking), DAIS.x - 48, DAIS.y - 52);
+  if (overlord?.state === 'error') ctx.drawImage(bubble('!'), DAIS.x + 28, DAIS.y - 60);
+  else if (overlord?.state === 'offline') ctx.drawImage(bubble('z'), DAIS.x + 28, DAIS.y - 60);
+  if (selected === 'overlord') selectionRing(ctx, DAIS.x, DAIS.y, t, 48);
 }
 
 /// Pulsing RTS selection brackets.

@@ -220,17 +220,17 @@ function serveClient(res: ServerResponse, pathname: string): boolean {
 function etsyCallbackPage(): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Alien Factory — etsy connected</title>
 <style>
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,#0c1622 0%,#05080e 70%,#02040a 100%);font-family:'Courier New',monospace;color:#5cf2c8;padding:16px}
-.box{background:rgba(8,14,22,.92);border:1px solid #2e9c80;padding:34px 38px;position:relative;box-shadow:0 0 30px rgba(92,242,200,.12),inset 0 0 40px rgba(92,242,200,.03);max-width:640px}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,#0a0e14 0%,#05080e 70%,#02040a 100%);font-family:'Courier New',monospace;color:#8dff3a;padding:16px}
+.box{background:rgba(8,14,22,.92);border:1px solid #3fbf1a;padding:34px 38px;position:relative;box-shadow:0 0 30px rgba(141,255,58,.12),inset 0 0 40px rgba(141,255,58,.03);max-width:640px}
 .box::before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(to bottom,rgba(0,0,0,.18) 0 1px,transparent 1px 3px);pointer-events:none}
-h1{font-size:14px;letter-spacing:3px;text-shadow:0 0 6px #5cf2c8;margin:0 0 4px}
+h1{font-size:14px;letter-spacing:3px;text-shadow:0 0 6px #8dff3a;margin:0 0 4px}
 h1::before{content:'> '}
-.sub{font-size:10px;color:#2e9c80;letter-spacing:2px;margin-bottom:18px}
+.sub{font-size:10px;color:#3fbf1a;letter-spacing:2px;margin-bottom:18px}
 p{font-size:12px;line-height:1.6}
-input{font-family:inherit;font-size:11px;background:#0a0f16;color:#5cf2c8;border:1px solid rgba(92,242,200,.45);padding:10px 12px;width:100%;box-sizing:border-box;caret-color:#5cf2c8;outline:none}
-button{font-family:inherit;font-size:12px;letter-spacing:1px;text-transform:uppercase;background:transparent;color:#5cf2c8;border:1px solid rgba(92,242,200,.45);padding:10px 14px;min-height:44px;cursor:pointer;margin-top:12px;text-shadow:0 0 4px currentColor}
-button:hover{background:#5cf2c8;color:#0a0f16;text-shadow:none;box-shadow:0 0 12px rgba(92,242,200,.55)}
-.err{color:#ff5f6e;font-size:11px;margin-top:12px}
+input{font-family:inherit;font-size:11px;background:#07060a;color:#8dff3a;border:1px solid rgba(141,255,58,.45);padding:10px 12px;width:100%;box-sizing:border-box;caret-color:#8dff3a;outline:none}
+button{font-family:inherit;font-size:12px;letter-spacing:1px;text-transform:uppercase;background:transparent;color:#8dff3a;border:1px solid rgba(141,255,58,.45);padding:10px 14px;min-height:44px;cursor:pointer;margin-top:12px;text-shadow:0 0 4px currentColor}
+button:hover{background:#8dff3a;color:#07060a;text-shadow:none;box-shadow:0 0 12px rgba(141,255,58,.55)}
+.err{color:#ff3b4a;font-size:11px;margin-top:12px}
 @keyframes blink{50%{opacity:0}}.cur{animation:blink 1s steps(1) infinite}
 </style></head><body>
 <div class="box">

@@ -117,7 +117,7 @@ function renderLabels(pos: Map<string, { x: number; y: number }>): void {
   const seen = new Set<string>();
   const tiny = sx < 1; // canvas under 1x — only important plates, smaller
   for (const a of state.agents) {
-    const p = a.kind === 'overlord' ? { x: 240, y: 106 } : pos.get(a.id);
+    const p = a.kind === 'overlord' ? { x: 480, y: 196 } : pos.get(a.id);
     if (!p) continue;
     // at tiny scales only working/selected/offline-status plates show —
     // idle names would just overlap and spill
@@ -134,7 +134,7 @@ function renderLabels(pos: Map<string, { x: number; y: number }>): void {
     }
     // clamp inside the canvas so plates never spill past the edges
     const lx = Math.min(Math.max(r.left + p.x * sx, r.left + 34), r.right - 34);
-    const ly = Math.min(Math.max(r.top + (p.y - 18) * sy, r.top + 2), r.bottom - 16);
+    const ly = Math.min(Math.max(r.top + (p.y - 36) * sy, r.top + 2), r.bottom - 16);
     div.style.left = `${lx}px`;
     div.style.top = `${ly}px`;
     (div.querySelector('.np-dot') as HTMLElement).style.background = stateColor(a);
