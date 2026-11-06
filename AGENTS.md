@@ -6,7 +6,10 @@ Context for AI agents working in this repo.
 internal/company material, or anything under `~/.alien-factory` — all
 runtime configuration is via environment variables (`PORT`,
 `NODE_ENV`, `ALIEN_FACTORY_PASSWORD`, `ALIEN_FACTORY_DATA_DIR`,
-`ALIEN_FACTORY_DIR`, `ALIEN_FACTORY_NO_DEVIN`, `ALIEN_FACTORY_AUTOSCAN`).
+`ALIEN_FACTORY_DIR`, `ALIEN_FACTORY_NO_DEVIN`, `ALIEN_FACTORY_AUTOSCAN`,
+plus worker-side storefront secrets `GUMROAD_ACCESS_TOKEN` and
+`ETSY_API_KEY` / `ETSY_SHARED_SECRET` / `ETSY_REDIRECT_URI` — env only,
+never in the repo or the state).
 
 ## What this is
 

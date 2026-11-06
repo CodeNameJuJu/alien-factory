@@ -213,6 +213,47 @@ function serveClient(res: ServerResponse, pathname: string): boolean {
   return sendFile(res, join(root, 'index.html'), STATIC_MIME);
 }
 
+/// CRT-styled Etsy oauth landing page — same phosphor look as loginPage.
+/// It shows the browser's full current url (client-side; the query string
+/// never needs to reach the server) for the user to paste into the
+/// dashboard's ETSY → complete field.
+function etsyCallbackPage(): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Alien Factory — etsy connected</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(ellipse at 50% 30%,#0c1622 0%,#05080e 70%,#02040a 100%);font-family:'Courier New',monospace;color:#5cf2c8;padding:16px}
+.box{background:rgba(8,14,22,.92);border:1px solid #2e9c80;padding:34px 38px;position:relative;box-shadow:0 0 30px rgba(92,242,200,.12),inset 0 0 40px rgba(92,242,200,.03);max-width:640px}
+.box::before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(to bottom,rgba(0,0,0,.18) 0 1px,transparent 1px 3px);pointer-events:none}
+h1{font-size:14px;letter-spacing:3px;text-shadow:0 0 6px #5cf2c8;margin:0 0 4px}
+h1::before{content:'> '}
+.sub{font-size:10px;color:#2e9c80;letter-spacing:2px;margin-bottom:18px}
+p{font-size:12px;line-height:1.6}
+input{font-family:inherit;font-size:11px;background:#0a0f16;color:#5cf2c8;border:1px solid rgba(92,242,200,.45);padding:10px 12px;width:100%;box-sizing:border-box;caret-color:#5cf2c8;outline:none}
+button{font-family:inherit;font-size:12px;letter-spacing:1px;text-transform:uppercase;background:transparent;color:#5cf2c8;border:1px solid rgba(92,242,200,.45);padding:10px 14px;min-height:44px;cursor:pointer;margin-top:12px;text-shadow:0 0 4px currentColor}
+button:hover{background:#5cf2c8;color:#0a0f16;text-shadow:none;box-shadow:0 0 12px rgba(92,242,200,.55)}
+.err{color:#ff5f6e;font-size:11px;margin-top:12px}
+@keyframes blink{50%{opacity:0}}.cur{animation:blink 1s steps(1) infinite}
+</style></head><body>
+<div class="box">
+<h1>ALIEN-FACTORY // ETSY LINK<span class="cur">_</span></h1>
+<div class="sub">OAUTH RETURN · ONE MORE STEP</div>
+<p>Etsy sent you back. Copy this <b>entire url</b> and paste it into <b>ETSY → complete</b> in the dashboard's shop drawer — the code is useless without the verifier the worker is holding.</p>
+<input id="u" readonly onclick="this.select()">
+<button id="c">[ copy url ]</button>
+<div class="err" id="e"></div>
+</div>
+<script>
+var u=document.getElementById('u');u.value=location.href;
+document.getElementById('c').addEventListener('click',function(){
+  u.select();
+  var done=function(){document.getElementById('c').textContent='[ copied ]';};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(u.value).then(done,function(){document.execCommand('copy');done();});}
+  else{document.execCommand('copy');done();}
+});
+if(!location.search){document.getElementById('e').textContent='no ?code=… in this url — did etsy actually redirect here?';}
+</script>
+</body></html>`;
+}
+
 const REVEAL_DIRS = new Set(['assets', 'examples', 'reports', 'factory']);
 
 /// POST /api/reveal { sku?: string, dir?: 'assets'|'examples'|'reports'|'factory' }
@@ -318,6 +359,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return json(res, { ok: true });
   }
 
+  // Etsy oauth landing page (behind the auth gate). The code alone is
+  // useless — the PKCE verifier lives on the worker — so this just shows
+  // the full redirected url to paste into ETSY → complete on the dashboard.
+  if (path === '/etsy/callback') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(etsyCallbackPage());
+    return;
+  }
   if (path === '/api/state') return json(res, stateMsg());
   if (path === '/api/reveal' && req.method === 'POST') return reveal(req, res);
   if (path.startsWith('/files/')) return serveFile(res, path.slice('/files/'.length));

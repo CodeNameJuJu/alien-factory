@@ -87,6 +87,41 @@ the synced kit files and posts them to `POST /v2/products/:id/covers`
 (`ALIEN_FACTORY_RELAY_URL` + `ALIEN_FACTORY_WORKER_KEY`); without a relay
 the step is skipped with a note and the draft stays a draft.
 
+## Selling on Etsy (channel foundation — connect only, off by default)
+
+The second real storefront, also running only on the Mac worker. Step 1
+wires up the OAuth connection, the API client, a spend ledger and the
+listing-publish primitive — nothing is published automatically.
+
+**Setup (once):**
+
+1. Register an app at [etsy.com/developers](https://www.etsy.com/developers)
+   → "create a new app". You get a **keystring** (client id) and a
+   **shared secret**.
+2. In the app's settings set the redirect URI to your relay's HTTPS
+   callback — `https://<your-relay-host>/etsy/callback` — it must be
+   `https` and match exactly.
+3. Put the three values in `~/.alien-factory/worker.env` on the Mac
+   (gitignored, never leaves the worker):
+
+   ```
+   ETSY_API_KEY=<keystring>
+   ETSY_SHARED_SECRET=<shared secret>
+   ETSY_REDIRECT_URI=https://<your-relay-host>/etsy/callback
+   ```
+4. Restart the worker (`npm run start:worker`).
+5. In the dashboard's `[ shop ]` drawer → **ETSY**: `[ connect ]`, open
+   the "approve on etsy.com" link, approve the scopes
+   (`listings_r/w`, `shops_r/w`, `transactions_r` — never `listings_d`),
+   and Etsy redirects to `/etsy/callback`. Copy the full redirected URL
+   from that page and paste it into the **complete** field.
+6. `[ refresh ]` re-checks the connection; `[ disconnect ]` deletes only
+   the local token file (`~/.alien-factory/etsy-tokens.json`, mode 0600).
+
+The spend line tracks real money: each listing activation costs $0.20 and
+is recorded in `~/.alien-factory/etsy-ledger.jsonl`; `monthlySpendCapUsd`
+and `maxListingsPerDay` in `config.etsy` gate activations.
+
 ## Run
 
 ```bash
@@ -230,3 +265,6 @@ your own server.
 | `ALIEN_FACTORY_AUTOSCAN` | — | `1` → itch scan at boot + every `itchScanMinutes` |
 | `ALIEN_FACTORY_WORKER_KEY` | — | relay: bearer key for `/worker`; worker: sent upstream |
 | `ALIEN_FACTORY_RELAY_URL` | — | worker: `wss://<host>/worker` to stream to (unset = standalone) |
+| `ETSY_API_KEY` | — | etsy app keystring (worker.env only, never the repo) |
+| `ETSY_SHARED_SECRET` | — | etsy app shared secret (sent as `x-api-key: key:secret`) |
+| `ETSY_REDIRECT_URI` | — | https oauth redirect — `<relay>/etsy/callback`, must match the app registration |

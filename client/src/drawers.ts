@@ -147,6 +147,8 @@ export class Drawers {
         return JSON.stringify([
           s.config.gumroad,
           s.channels?.gumroad,
+          s.config.etsy,
+          s.channels?.etsy,
           s.assets.map((a) => a.channels?.gumroad),
         ]);
       case 'gallery':
@@ -172,6 +174,8 @@ export class Drawers {
     const directive = this.el.querySelector<HTMLTextAreaElement>('#directive');
     const directiveVal = directive?.value ?? null;
     const directiveFocused = document.activeElement === directive;
+    const etsyCb = this.el.querySelector<HTMLInputElement>('#etsy-callback');
+    const etsyCbVal = etsyCb?.value ?? null;
     const log = this.el.querySelector('.log');
     const logAtBottom = log ? log.scrollHeight - log.scrollTop - log.clientHeight < 20 : false;
 
@@ -214,6 +218,8 @@ export class Drawers {
       ta.value = directiveVal;
       if (directiveFocused) ta.focus();
     }
+    const ecb = this.el.querySelector<HTMLInputElement>('#etsy-callback');
+    if (ecb && etsyCbVal !== null) ecb.value = etsyCbVal;
     const newLog = this.el.querySelector('.log');
     if (newLog && logAtBottom) newLog.scrollTop = newLog.scrollHeight;
   }
@@ -1313,6 +1319,106 @@ export class Drawers {
         b.appendChild(row);
       }
     }
+
+    this.renderEtsySection(b, s);
+  }
+
+  /// ETSY section inside the shop drawer — oauth connect, refresh,
+  /// disconnect and the local spend-ledger totals. No publish buttons yet.
+  private renderEtsySection(b: HTMLElement, s: StateMessage): void {
+    const e = s.channels?.etsy;
+    const cfg = s.config.etsy;
+    const h = document.createElement('div');
+    h.className = 'sec';
+    h.textContent = 'etsy';
+    b.appendChild(h);
+
+    const card = document.createElement('div');
+    card.className = 'acard v';
+
+    const st = document.createElement('div');
+    st.className = 'note';
+    if (!e?.configured) {
+      st.textContent = 'not configured — set ETSY_API_KEY, ETSY_SHARED_SECRET and ETSY_REDIRECT_URI in ~/.alien-factory/worker.env and restart the worker';
+      st.style.color = 'var(--amber)';
+    } else if (!e.connected) {
+      st.textContent = 'not connected — start the oauth handshake below';
+    } else {
+      st.textContent = `✓ connected to ${e.shopName ?? 'your shop'}${e.shopId ? ` (shop ${e.shopId})` : ''}`;
+    }
+    card.appendChild(st);
+
+    const row = document.createElement('div');
+    row.className = 'btnrow';
+    const connect = document.createElement('button');
+    connect.className = 'btn';
+    connect.textContent = '[ connect ]';
+    connect.disabled = !e?.configured;
+    connect.title = 'start the etsy oauth handshake (pkce)';
+    connect.addEventListener('click', () => this.net.send({ type: 'etsyAuthStart' }));
+    row.appendChild(connect);
+    const refresh = document.createElement('button');
+    refresh.className = 'btn';
+    refresh.textContent = '[ refresh ]';
+    refresh.disabled = !e?.connected;
+    refresh.title = 're-check me/shop + spend totals';
+    refresh.addEventListener('click', () => this.net.send({ type: 'refreshEtsy' }));
+    row.appendChild(refresh);
+    const disc = document.createElement('button');
+    disc.className = 'btn';
+    disc.textContent = '[ disconnect ]';
+    disc.disabled = !e?.connected;
+    disc.title = 'delete the local token file only — nothing changes on etsy';
+    disc.addEventListener('click', () => {
+      if (confirm('disconnect etsy? this only deletes the local tokens — reconnect any time')) {
+        this.net.send({ type: 'etsyDisconnect' });
+      }
+    });
+    row.appendChild(disc);
+    card.appendChild(row);
+
+    // pending handshake: auth link + the paste-back field
+    if (e?.authUrl) {
+      const l = document.createElement('a');
+      l.href = e.authUrl;
+      l.target = '_blank';
+      l.rel = 'noopener';
+      l.textContent = '→ approve on etsy.com';
+      const links = document.createElement('div');
+      links.className = 'shopline';
+      links.appendChild(l);
+      card.appendChild(links);
+      const inp = document.createElement('input');
+      inp.id = 'etsy-callback';
+      inp.placeholder = 'paste the full redirected url here…';
+      inp.style.width = '100%';
+      inp.style.boxSizing = 'border-box';
+      inp.style.margin = '6px 0';
+      card.appendChild(inp);
+      const done = document.createElement('button');
+      done.className = 'btn go';
+      done.textContent = '[ complete ]';
+      done.title = 'finish the handshake with the url etsy redirected to';
+      done.addEventListener('click', () => {
+        const v = inp.value.trim();
+        if (v) this.net.send({ type: 'etsyAuthComplete', callbackUrl: v });
+      });
+      card.appendChild(done);
+    }
+
+    if (e?.error) {
+      const er = document.createElement('div');
+      er.className = 'note';
+      er.style.color = 'var(--amber)';
+      er.textContent = `⚠ ${e.error}`;
+      card.appendChild(er);
+    }
+
+    const spend = document.createElement('div');
+    spend.className = 'note';
+    spend.textContent = `$${(e?.monthSpendUsd ?? 0).toFixed(2)} / $${cfg.monthlySpendCapUsd.toFixed(2)} this month · ${e?.listingsToday ?? 0}/${cfg.maxListingsPerDay} today`;
+    card.appendChild(spend);
+    b.appendChild(card);
   }
 
   // ---- gallery --------------------------------------------------------------------

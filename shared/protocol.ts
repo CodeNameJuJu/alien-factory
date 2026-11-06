@@ -170,6 +170,45 @@ export interface GumroadConfig {
   autoPublish: boolean;
 }
 
+// ---- sales channels (Etsy) ---------------------------------------------------
+//
+// Second real storefront (see server/src/channels/etsy.ts): OAuth2 + PKCE
+// connect, gated digital-listing publishing, and a local spend ledger.
+// The api key/secret and oauth tokens live in worker.env + the token file
+// on the worker — the state only ever carries booleans, ids and totals.
+
+export type EtsyShipStatus =
+  | 'none' // validated/dry-run only — nothing on Etsy
+  | 'uploading' // draft + uploads in flight
+  | 'draft' // draft listing exists on Etsy
+  | 'active' // PATCH state=active accepted (fee charged)
+  | 'inactive' // deactivated on Etsy
+  | 'error'; // failed before a draft existed
+
+export interface EtsyShip {
+  status: EtsyShipStatus;
+  listingId?: number;
+  url?: string;
+  priceUsd?: number;
+  at?: number;
+  /// last error (NEVER contains tokens or keys)
+  error?: string;
+  /// dry-run request plan (endpoints + non-secret params)
+  plan?: unknown;
+}
+
+export interface EtsyConfig {
+  /// monthly cap on real listing fees (local calendar month, from the ledger)
+  monthlySpendCapUsd: number;
+  /// listing activations per local day
+  maxListingsPerDay: number;
+  /// should_auto_renew on new listings ($0.20 per renewal)
+  autoRenew: boolean;
+  /// price bounds enforced at validate time
+  minPriceUsd: number;
+  maxPriceUsd: number;
+}
+
 export interface AssetSales {
   views: number;
   units: number;
@@ -197,8 +236,8 @@ export interface Asset {
   checks?: AssetChecks;
   inspection?: AssetInspection;
   listing?: AssetListing;
-  /// off-mock-market shipping state (Gumroad draft/publish)
-  channels?: { gumroad?: GumroadShip };
+  /// off-mock-market shipping state (Gumroad draft/publish, Etsy listings)
+  channels?: { gumroad?: GumroadShip; etsy?: EtsyShip };
   sales: AssetSales;
   assignedTo?: string;
   createdAt: number;
@@ -431,6 +470,8 @@ export interface FactoryConfig {
   marketSource: 'itch' | 'mock';
   /// Gumroad channel gates (token itself is env-only, never here)
   gumroad: GumroadConfig;
+  /// Etsy channel gates (api key/secret + oauth tokens are env/file-only)
+  etsy: EtsyConfig;
   /// failed/scrapped assets are moved to archive/ automatically
   autoArchiveFailed: boolean;
   itchScanMinutes: number;
@@ -473,6 +514,18 @@ export interface StateMessage {
       bulkRunning?: boolean;
       /// live store totals — null until the first successful refresh
       stats?: GumroadStats | null;
+    };
+    /// no tokens, ever — connection booleans + ids + spend totals only
+    etsy: {
+      configured: boolean;
+      connected: boolean;
+      shopId?: number;
+      shopName?: string;
+      /// only while an oauth handshake is pending
+      authUrl?: string;
+      monthSpendUsd: number;
+      listingsToday: number;
+      error?: string;
     };
   };
 }
@@ -543,4 +596,13 @@ export type ClientMessage =
   | { type: 'archiveAsset'; sku: string }
   /// archive every failed/scrapped/permanently-unshippable asset
   | { type: 'archiveUnshippable' }
-  | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> };
+  | { type: 'setGumroadConfig'; config: Partial<GumroadConfig> }
+  /// Etsy channel — start the oauth handshake, returns authUrl in state
+  | { type: 'etsyAuthStart' }
+  /// finish it from the full redirected url the user pastes
+  | { type: 'etsyAuthComplete'; callbackUrl: string }
+  /// delete the local token file only — never touches Etsy
+  | { type: 'etsyDisconnect' }
+  /// re-check getMe/getShop + ledger totals
+  | { type: 'refreshEtsy' }
+  | { type: 'setEtsyConfig'; config: Partial<EtsyConfig> };

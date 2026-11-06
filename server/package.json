@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx src/main.ts",
     "dev:watch": "tsx watch src/main.ts",
-    "test": "tsx --test src/parse.test.ts",
+    "test": "tsx --test src/parse.test.ts src/etsy.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

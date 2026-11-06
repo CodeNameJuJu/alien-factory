@@ -25,6 +25,8 @@ export const FORWARDABLE = new Set<ClientMessage['type']>([
   'shipGumroad', 'publishGumroad', 'setGumroadConfig', 'attachGumroadImages',
   'clearGumroad', 'refreshGumroad', 'archiveAsset', 'archiveUnshippable',
   'shipAllGumroad', 'publishAllGumroad',
+  'etsyAuthStart', 'etsyAuthComplete', 'etsyDisconnect', 'refreshEtsy',
+  'setEtsyConfig',
 ]);
 
 // ---- signed public kit image URLs ------------------------------------------
@@ -132,7 +134,10 @@ export function mergeRelayState(
     worker: status,
     usage: worker.usage,
     tokenCapHit: worker.tokenCapHit,
-    channels: worker.channels ?? { gumroad: { configured: false } },
+    channels: worker.channels ?? {
+      gumroad: { configured: false },
+      etsy: { configured: false, connected: false, monthSpendUsd: 0, listingsToday: 0 },
+    },
   };
 }
 

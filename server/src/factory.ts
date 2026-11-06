@@ -30,6 +30,14 @@ import {
 } from './parse.js';
 import { forgePrompt, inspectPrompt, overlordPrompt, packPrompt, scoutPrompt, scoutPromptItch } from './prompts.js';
 import { applyGumroadProduct, attachGumroadImages as gumroadAttach, fetchGumroadStore, loadMeta as loadShipMeta, publishGumroad as gumroadPublish, shipGumroad as gumroadShip } from './channels/gumroad.js';
+import {
+  completeEtsyAuth,
+  deleteEtsyTokens,
+  EtsyClient,
+  EtsyLedger,
+  etsyConfigured,
+  startEtsyAuth,
+} from './channels/etsy.js';
 import { canClearGumroad, shipEligibility, unshippableReasons } from '../../shared/shop.js';
 import {
   analyseSnapshot,
@@ -1159,6 +1167,15 @@ export class FactoryManager extends EventEmitter {
           bulkRunning: this.gumroadBulkRunning,
           stats: this.gumroadStats,
         },
+        // booleans/ids/totals only — tokens and keys never leave the worker
+        etsy: {
+          configured: etsyConfigured(),
+          ...EtsyClient.info(),
+          ...(this.etsyAuthUrl ? { authUrl: this.etsyAuthUrl } : {}),
+          monthSpendUsd: this.etsyLedger.monthSpendUsd(),
+          listingsToday: this.etsyLedger.listingsToday(),
+          ...(this.etsyError ? { error: this.etsyError } : {}),
+        },
       },
     };
   }
@@ -1245,7 +1262,98 @@ export class FactoryManager extends EventEmitter {
       case 'setGumroadConfig':
         this.setGumroadConfig(msg.config);
         return;
+      case 'etsyAuthStart':
+        this.etsyAuthStart();
+        return;
+      case 'etsyAuthComplete':
+        await this.etsyAuthComplete(msg.callbackUrl);
+        return;
+      case 'etsyDisconnect':
+        this.etsyDisconnect();
+        return;
+      case 'refreshEtsy':
+        await this.refreshEtsy();
+        return;
+      case 'setEtsyConfig':
+        this.setEtsyConfig(msg.config);
+        return;
     }
+  }
+
+  // ---- etsy channel --------------------------------------------------------
+
+  /// live while an oauth handshake is pending — surfaced as
+  /// channels.etsy.authUrl so the client can link out
+  private etsyAuthUrl: string | null = null;
+  /// last connect/refresh problem (redacted) — shown in the ETSY section
+  private etsyError: string | null = null;
+  private etsyLedger = new EtsyLedger();
+
+  private etsyAuthStart(): void {
+    try {
+      this.etsyAuthUrl = startEtsyAuth().url;
+      this.etsyError = null;
+      this.event('etsy connect started — open the auth url, approve, then paste the redirected url');
+    } catch (err) {
+      this.etsyError = (err as Error).message.slice(0, 200);
+      this.event(`etsy connect failed: ${this.etsyError}`);
+    }
+    this.changed();
+  }
+
+  private async etsyAuthComplete(callbackUrl: string): Promise<void> {
+    try {
+      const r = await completeEtsyAuth(callbackUrl);
+      this.etsyAuthUrl = null;
+      this.etsyError = null;
+      this.event(`etsy connected${r.shopName ? ` — ${r.shopName}` : ''}${r.shopId ? ` (shop ${r.shopId})` : ''}`);
+    } catch (err) {
+      this.etsyError = (err as Error).message.slice(0, 200);
+      this.event(`etsy connect failed: ${this.etsyError}`);
+    }
+    this.changed();
+  }
+
+  /// Delete the local token file only — never calls Etsy, never revokes.
+  private etsyDisconnect(): void {
+    deleteEtsyTokens();
+    this.etsyAuthUrl = null;
+    this.event('etsy disconnected — local tokens deleted (nothing changed on etsy)');
+    this.changed();
+  }
+
+  /// getMe → getShop (+ token refresh if needed) → ledger totals. The
+  /// rotated refresh token and shop info persist inside the token file.
+  private async refreshEtsy(): Promise<void> {
+    try {
+      const client = new EtsyClient();
+      await client.syncShopInfo();
+      this.etsyError = null;
+      const info = EtsyClient.info();
+      this.event(
+        `etsy refreshed${info.shopName ? ` — ${info.shopName}` : ''} · $${this.etsyLedger.monthSpendUsd().toFixed(2)} this month · ${this.etsyLedger.listingsToday()} today`,
+      );
+    } catch (err) {
+      this.etsyError = (err as Error).message.slice(0, 200);
+      this.event(`etsy refresh failed: ${this.etsyError}`);
+    }
+    this.changed();
+  }
+
+  private setEtsyConfig(raw: Record<string, unknown>): void {
+    const e = { ...this.config.etsy };
+    if (typeof raw.monthlySpendCapUsd === 'number') e.monthlySpendCapUsd = Math.min(50, Math.max(0, raw.monthlySpendCapUsd));
+    if (typeof raw.maxListingsPerDay === 'number') e.maxListingsPerDay = Math.min(20, Math.max(0, Math.round(raw.maxListingsPerDay)));
+    if (typeof raw.autoRenew === 'boolean') e.autoRenew = raw.autoRenew;
+    if (typeof raw.minPriceUsd === 'number' && raw.minPriceUsd > 0) e.minPriceUsd = raw.minPriceUsd;
+    if (typeof raw.maxPriceUsd === 'number' && raw.maxPriceUsd > 0) e.maxPriceUsd = raw.maxPriceUsd;
+    if (e.minPriceUsd > e.maxPriceUsd) e.maxPriceUsd = e.minPriceUsd;
+    this.config.etsy = e;
+    saveConfig(this.config);
+    this.event(
+      `etsy config updated (≤$${e.monthlySpendCapUsd}/month, ${e.maxListingsPerDay}/day${e.autoRenew ? ', auto-renew' : ''}, $${e.minPriceUsd}–$${e.maxPriceUsd})`,
+    );
+    this.changed();
   }
 
   // ---- gumroad channel --------------------------------------------------------

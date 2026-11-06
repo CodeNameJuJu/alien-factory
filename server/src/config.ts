@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG: FactoryConfig = {
   mode: 'research',
   marketSource: 'itch',
   gumroad: { minScore: 7, packsOnly: true, maxDraftsPerDay: 3, autoPublish: false },
+  etsy: { monthlySpendCapUsd: 5, maxListingsPerDay: 3, autoRenew: false, minPriceUsd: 1.5, maxPriceUsd: 60 },
   autoArchiveFailed: true,
   itchScanMinutes: 60,
   itchFeeds: [
@@ -70,6 +71,7 @@ export function migrateConfig(raw: Record<string, unknown>): FactoryConfig {
   merged.prices = { ...((rest.prices as FactoryConfig['prices']) ?? {}) };
   merged.dailyTokenCaps = (rest.dailyTokenCaps as FactoryConfig['dailyTokenCaps']) ?? null;
   merged.gumroad = { ...DEFAULT_CONFIG.gumroad, ...(rest.gumroad as Partial<FactoryConfig['gumroad']> | undefined) };
+  merged.etsy = { ...DEFAULT_CONFIG.etsy, ...(rest.etsy as Partial<FactoryConfig['etsy']> | undefined) };
   return merged;
 }
 
