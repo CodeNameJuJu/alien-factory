@@ -5,7 +5,7 @@
 // nudge, then outlines the silhouette and parts.
 import { mulberry32, type RGB } from './pix';
 
-export type Mat = 'bruise' | 'sick' | 'pale' | 'steel' | 'acid' | 'blood' | 'bone' | 'brass' | 'socket' | 'milk' | 'dark';
+export type Mat = 'bruise' | 'sick' | 'pale' | 'steel' | 'acid' | 'blood' | 'bone' | 'brass' | 'socket' | 'milk' | 'dark' | 'spec' | 'teal' | 'bog' | 'magenta' | 'eel';
 
 export interface Ellipsoid {
   kind: 'ell';
@@ -40,8 +40,16 @@ export const RAMPS: Record<Mat, RGB[]> = {
   socket: [[12, 7, 14]],
   milk: [[178, 188, 196]],
   dark: [[7, 6, 10]],
+  /// hue-shifted flesh ramps: shadows run to plum, lights to yellow-green/teal
+  teal: [[40, 25, 45], [57, 44, 79], [34, 83, 83], [64, 144, 124], [168, 240, 192]],
+  bog: [[40, 23, 38], [68, 44, 54], [63, 96, 43], [110, 158, 62], [216, 240, 128]],
+  magenta: [[31, 18, 35], [68, 35, 68], [122, 50, 97], [172, 92, 130], [240, 160, 192]],
+  eel: [[23, 23, 41], [38, 49, 82], [46, 95, 123], [75, 156, 172], [176, 240, 240]],
+  spec: [[240, 240, 224]],
 };
-const OUT: RGB = [7, 6, 10];
+const OUT: RGB = [20, 10, 20]; // dark plum, not pure black
+/// each flesh gets a partner ramp — ~20% of the surface renders in it
+const SECONDARY: Partial<Record<Mat, Mat>> = { teal: 'magenta', bog: 'magenta', magenta: 'teal', eel: 'magenta' };
 const EMISSIVE = new Set<Mat>(['acid']);
 const BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
@@ -85,12 +93,32 @@ function cover(buf: Buf, w: number, h: number, prims: Prim[]): void {
           const gl = Math.sqrt(gx * gx + gy * gy + gz * gz) || 1;
           let nxx = gx / gl, nyy = gy / gl, nzz = gz / gl;
           if (p.surf === 'brain') {
-            // folded ridge field — reveals gyri in the shading
-            const ridge = Math.abs(Math.sin(x * 0.55 + 2.2 * Math.sin(y * 0.28)) * Math.cos(y * 0.42));
-            nxx = Math.max(-1, Math.min(1, nxx + ridge * 0.55));
-            nyy = Math.max(-1, Math.min(1, nyy + (ridge - 0.5) * 0.4));
+            // meandering gyri: creases at zero-crossings of 2-octave value
+            // noise; normals bend toward the crease gradient → winding folds
+            const gnoise = (xx: number, yy: number) =>
+              Math.abs(Math.sin(xx * 127.1 + yy * 311.7) * 43758.5453) % 1;
+            const f2 = (xx: number, yy: number, per: number, o: number) => {
+              const gx = xx / per, gy = yy / per;
+              const ix = Math.floor(gx), iy = Math.floor(gy);
+              const fx = gx - ix, fy = gy - iy;
+              const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+              const h2 = (a2: number, b2: number) => {
+                const hh = Math.imul(a2 * 374761393 + b2 * 668265263 + o * 1442695041, 0x9e3779b1) ^ 0x85ebca6b;
+                return ((hh ^ (hh >>> 13)) >>> 0) / 4294967296;
+              };
+              const n00 = h2(ix, iy), n10 = h2(ix + 1, iy), n01 = h2(ix, iy + 1), n11 = h2(ix + 1, iy + 1);
+              return n00 + (n10 - n00) * sx + (n01 - n00) * sy + (n00 - n10 - n01 + n11) * sx * sy;
+            };
+            const fld = (xx: number, yy: number) => f2(xx, yy, 10, 5) * 0.6 + f2(xx, yy, 5, 6) * 0.4 - 0.5;
+            const nval = fld(x, y);
+            const gxv = fld(x + 1, y) - nval, gyv = fld(x, y + 1) - nval;
+            const crease = Math.abs(nval) < 0.04 ? 1 : Math.abs(nval) < 0.10 ? 0.4 : 0;
+            nxx = Math.max(-1, Math.min(1, nxx + gxv * 6 + crease * 0.3));
+            nyy = Math.max(-1, Math.min(1, nyy + gyv * 6 + crease * 0.2));
+            nzz = Math.max(-0.5, nzz - crease * 0.45); // creases recess into shadow
             const rl = Math.sqrt(nxx * nxx + nyy * nyy + nzz * nzz) || 1;
             nxx /= rl; nyy /= rl; nzz /= rl;
+            void gnoise;
           }
           buf.nx[i] = nxx; buf.ny[i] = nyy; buf.nz[i] = nzz;
         }
@@ -131,12 +159,13 @@ function cover(buf: Buf, w: number, h: number, prims: Prim[]): void {
 const LX = -0.55, LY = -0.7, LZ = 0.45;
 const Ln = Math.sqrt(LX * LX + LY * LY + LZ * LZ);
 const L: [number, number, number] = [LX / Ln, LY / Ln, LZ / Ln];
-const Hv: [number, number, number] = [LX / (Ln + LZ), LY / (Ln + LZ), (LZ + 1) / (Ln + LZ)]; // approx half vector
-const TONES = [0.30, 0.52, 0.74, 0.90];
+const HX = L[0], HY = L[1], HZ = L[2] + 1;
+const Hn = Math.sqrt(HX * HX + HY * HY + HZ * HZ);
+const Hv: [number, number, number] = [HX / Hn, HY / Hn, HZ / Hn];
 
 /// Render primitives into a fresh RGBA buffer (w×h). `seed` drives speckle
 /// + vein detail deterministically.
-export function renderVolume(w: number, h: number, prims: Prim[], seed = 1, rim?: RGB): { data: Uint8ClampedArray; buf: Buf } {
+export function renderVolume(w: number, h: number, prims: Prim[], seed = 1, rim?: RGB, hist?: number[]): { data: Uint8ClampedArray; buf: Buf } {
   const buf: Buf = {
     depth: new Float32Array(w * h),
     part: new Int16Array(w * h).fill(-1),
@@ -147,6 +176,21 @@ export function renderVolume(w: number, h: number, prims: Prim[], seed = 1, rim?
   };
   cover(buf, w, h, prims);
   const rnd = mulberry32(seed * 2654435761);
+  /// seeded value noise, bilinear, period `per` px — for mottling + hue patches
+  const latt = (ix: number, iy: number, o: number) => {
+    const h2 = Math.imul(ix * 374761393 + iy * 668265263 + o * 1442695041, 0x9e3779b1) ^ 0x85ebca6b;
+    return ((h2 ^ (h2 >>> 13)) >>> 0) / 4294967296;
+  };
+  const vnoise = (x: number, y: number, per: number, o: number) => {
+    const gx = x / per, gy = y / per;
+    const ix = Math.floor(gx), iy = Math.floor(gy);
+    const fx = gx - ix, fy = gy - iy;
+    const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+    const a = latt(ix, iy, o), b = latt(ix + 1, iy, o), c2 = latt(ix, iy + 1, o), d2 = latt(ix + 1, iy + 1, o);
+    return a + (b - a) * sx + (c2 - a) * sy + (a - b - c2 + d2) * sx * sy;
+  };
+  const mottle = (x: number, y: number) => vnoise(x, y, 4.5, 1) * 0.65 + vnoise(x, y, 8, 2) * 0.35;
+  const huef = (x: number, y: number) => vnoise(x, y, 4, 3) * 0.65 + vnoise(x, y, 8, 4) * 0.35;
   const data = new Uint8ClampedArray(w * h * 4);
   const px = (x: number, y: number, c: RGB, a = 255): void => {
     if (x < 0 || y < 0 || x >= w || y >= h) return;
@@ -165,21 +209,45 @@ export function renderVolume(w: number, h: number, prims: Prim[], seed = 1, rim?
       continue;
     }
     const nl = buf.nx[i] * L[0] + buf.ny[i] * L[1] + buf.nz[i] * L[2];
-    let v = 0.15 + 0.85 * Math.max(0, nl);
-    // Bayer nudge so band edges dither
-    v += ((BAYER[y & 3][x & 3] / 16) - 0.5) * 0.08;
-    // specular on steel/glow-ish materials
+    // ambient occlusion: darker toward the bottom and where covered
+    const bottomness = Math.pow(y / h, 1.5);
+    let occl = 0;
+    for (const [dx, dy] of [[2,0],[-2,0],[0,2],[0,-2],[2,2],[-2,2],[2,-2],[-2,-2]]) {
+      const j = (y + dy) * w + x + dx;
+      if (x + dx < 0 || y + dy < 0 || x + dx >= w || y + dy >= h || buf.part[j] < 0) continue;
+      if (buf.depth[j] > buf.depth[i] + 0.5 || buf.part[j] !== buf.part[i]) occl++;
+    }
+    const ao = Math.max(0, 1 - 0.10 * bottomness - 0.18 * (occl / 8));
+    let v = Math.max(0, nl) * ao;
+    v += ((BAYER[y & 3][x & 3] / 16) - 0.5) * 0.06;
     const nh = buf.nx[i] * Hv[0] + buf.ny[i] * Hv[1] + buf.nz[i] * Hv[2];
-    let tone = 0;
-    for (const t of TONES) if (v > t) tone++;
-    tone = Math.min(ramp.length - 1, tone);
-    if (nh > 0.96 && (p.mat === 'steel' || p.mat === 'brass')) tone = ramp.length - 1;
-    let c = ramp[Math.max(0, tone)];
+    const isFlesh = ['bruise','sick','pale','teal','bog','magenta','eel','blood'].includes(p.mat);
+    // 5-tone map: light only on top-left; tone4 is SPECULAR ONLY
+    let tone = v < 0.10 ? 0 : v < 0.24 ? 1 : v < 0.50 ? 2 : v < 0.62 ? 3 : 3;
+    // crevice: outline-adjacent pixels on the shadow side → tone0
+    if (nl < 0.3 && at(x + 1, y) < 0 && at(x, y + 1) < 0) tone = 0;
+    if (nh > 0.96) tone = ramp.length - 1;           // wet gloss
+    else if (nh > 0.96 && (p.mat === 'steel' || p.mat === 'brass')) tone = ramp.length - 1;
+    if (isFlesh && p.surf === 'speckle' && nh > 0.88) {
+      const sd = Math.abs(Math.sin((x * 39.3 + y * 61.7 + seed * 11.1)) * 24634.63) % 1;
+      if (sd < 0.022) tone = ramp.length - 1;
+    }
+    // mottling: subtle grime — -1 tone within the same ramp on ~12%
+    if (isFlesh && tone > 0 && tone < ramp.length - 1 && mottle(x, y) < 0.12) tone--;
+    // light-driven hue shift: shadow tones read plum/magenta, mids/highs
+    // stay the body ramp; ≤6% small blotches use the partner ramp midtones
+    let ramp2 = ramp;
+    if (isFlesh && SECONDARY[p.mat]) {
+      if (tone <= 1) ramp2 = RAMPS[SECONDARY[p.mat]!];
+      else if (huef(x, y) > 0.94) ramp2 = RAMPS[SECONDARY[p.mat]!];
+    }
+    let c = ramp2[Math.min(ramp2.length - 1, Math.max(0, tone))];
+    if (hist && isFlesh) hist[Math.min(4, Math.max(0, tone))]++;
     // organic detail: seeded speckle ±1 tone, vein walk
     if (p.surf === 'speckle' || p.surf === 'vein' || p.surf === 'brain') {
       const s = Math.abs(Math.sin((x * 127.1 + y * 311.7 + seed * 17.3)) * 43758.5) % 1;
-      if (s < 0.02) c = ramp[Math.min(ramp.length - 1, Math.max(0, tone + (s < 0.01 ? 1 : -1)))];
-      if ((p.surf === 'vein' || p.surf === 'brain') && s > 0.97) c = ramp[1];
+      if (s < 0.02) c = ramp2[Math.min(ramp2.length - 1, Math.max(0, tone + (s < 0.01 ? 1 : -1)))];
+      if ((p.surf === 'vein' || p.surf === 'brain') && s > 0.97) c = ramp2[1];
     }
     px(x, y, c);
   }

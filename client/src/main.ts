@@ -2,7 +2,7 @@ import { Net } from './net';
 import { Hud } from './hud';
 import { Drawers, type Selection } from './drawers';
 import { startDemo } from './demo';
-import { drawFloor, hitTest, W, H, applyLighting, floorEmissives, lightSources, type FloorView } from './floor';
+import { drawFloor, hitTest, W, H, applyLighting, floorEmissives, lightSources, wearDecals, type FloorView } from './floor';
 import { updateAliens, drawAliens, drawOverlord, drawEmissives, drawOverlordEmissive } from './aliens';
 import type { Agent, ServerMessage, StateMessage } from '../../shared/protocol';
 
@@ -240,6 +240,7 @@ function loop(t: number): void {
   drawFloor(ctx, animT, fv);
   drawOverlord(ctx, state.agents.find((a) => a.kind === 'overlord'), animT, selected?.type === 'overlord' ? 'overlord' : null);
   drawAliens(ctx, state.agents, views, animT, selected?.type === 'agent' ? selected.id : null);
+  wearDecals(ctx, state.assets.filter((a) => a.status === 'listed' || a.status === 'scrapped').length, animT);
   // dread lighting: darkness with light holes + tinted glow, dim ambient per alien
   applyLighting(ctx, animT, lightSources(animT, { overlordThinking: state.agents.some((a) => a.kind === 'overlord' && a.state === 'working'), scanning: state.shift === 'running', smithCount: state.config.smiths, workingAgents: new Set(state.agents.filter((a) => a.state === 'working').map((a) => a.id)) }), [...views.values()].map((v) => ({ x: v.x, y: v.y - 20 })));
   // emissives on top — eyes, vats, scan lines, lamps, portal

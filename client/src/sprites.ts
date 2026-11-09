@@ -14,8 +14,10 @@ const cap = (a: V3, b: V3, ra: number, rb: number, mat: Mat, part: number): Prim
 
 // ---- seeded mangling ---------------------------------------------------------------
 
+const FLESH: Mat[] = ['teal', 'bog', 'magenta', 'eel'];
 interface Params {
   skin: Mat;
+  arch: number;
   thickL: number; thickR: number;
   hunch: number;
   tumor: [number, number, number] | null;
@@ -25,9 +27,9 @@ interface Params {
 }
 function params(name: string): Params {
   const r = mulberry32(hashString(name));
-  const skins: Mat[] = ['bruise', 'sick', 'pale'];
   return {
-    skin: skins[Math.floor(r() * skins.length)],
+    skin: FLESH[Math.floor(r() * FLESH.length)],
+    arch: Math.floor(r() * 3),
     thickL: 0.8 + r() * 0.45,
     thickR: 0.8 + r() * 0.45,
     hunch: r() * 3,
@@ -38,226 +40,435 @@ function params(name: string): Params {
   };
 }
 
-// ---- worker anatomy: ~36x44, chunky brute -----------------------------------------
-// part ids: 1 head, 2 torso, 3 armL, 4 armR, 5 legL, 6 legR, 7 accessory, 8+ gear
+// ---- creature archetypes (round 8: exact anatomy, wet gloss, bloody hands) -------
+// 46x44 box, ground at y≈43. Eyes: socket + iris (skin tone3 or acid) +
+// dark pupil + ONE spec pixel top-left — that spec pixel sells the life.
 
-interface Geo {
-  headW: number; headY: number;   // head radius + height
-  torsoW: number; torsoY: number; // torso mass
-  armT: number;                   // arm thickness
-  legY: number;                   // hip height
-  tall: number;                   // vertical stretch (scout)
-  wide: number;                   // horizontal stretch (merch)
-}
-const GEO: Record<string, Geo> = {
-  smith:        { headW: 7.5, headY: 9,  torsoW: 10, torsoY: 24, armT: 2.4, legY: 34, tall: 0, wide: 0 },
-  scout:        { headW: 6,   headY: 10, torsoW: 7,  torsoY: 26, armT: 1.7, legY: 34, tall: -4, wide: 0 },
-  inspector:    { headW: 7,   headY: 9,  torsoW: 9,  torsoY: 24, armT: 1.9, legY: 34, tall: 0, wide: 0 },
-  packer:       { headW: 7,   headY: 9,  torsoW: 10, torsoY: 24, armT: 3.0, legY: 34, tall: 0, wide: 0 },
-  merchandiser: { headW: 8.5, headY: 10, torsoW: 12, torsoY: 25, armT: 2.4, legY: 35, tall: 0, wide: 3 },
+interface AP { skin: Mat; arch: number }
+const eye = (P: Prim[], x: number, y: number, r2: number, iris: Mat, part = 1): void => {
+  P.push(ell([x, y, 9], [r2 + 0.8, r2 + 0.6, 1.2], 'socket', part)); // lid/socket
+  P.push(ell([x, y, 9.8], [r2, r2 * 0.9, 1], iris, part));           // iris
+  P.push(ell([x, y + 0.4, 10.6], [Math.max(0.5, r2 * 0.35), r2 * 0.55, 0.9], 'dark', part)); // pupil
+  P.push(ell([x - r2 * 0.35, y - r2 * 0.35, 10.8], [0.45, 0.45, 0.5], 'spec', part));        // spec glint
+};
+/// bloody knuckled hand: dark blood smear + bone tips + forearm streaks
+const fist = (P: Prim[], x: number, y: number, part: number, big = 1, skin: Mat = 'teal'): void => {
+  P.push(ell([x, y, 8], [1.9 * big, 1.6 * big, 1.4], skin, part));         // skin hand
+  P.push(ell([x - 0.6, y - 0.4, 9], [0.7, 0.6, 0.5], 'blood', part));      // knuckle smear 1
+  P.push(ell([x + 0.6, y - 0.3, 9], [0.7, 0.5, 0.5], 'blood', part));      // knuckle smear 2
+  P.push(ell([x + 0.5, y + 1, 8.5], [1, 0.7, 0.8], 'bone', part));         // worn bone tip
+};
+const streak = (P: Prim[], x: number, y0: number, y1: number, part: number): void => {
+  for (let y = y0; y < y1; y += 2) P.push(ell([x + (y % 3), y, 7], [0.8, 1, 0.8], 'blood', part));
+};
+const drip = (x: number, y: number, len: number, skin: Mat, part = 9): Prim =>
+  cap([x, y, 7], [x + 0.5, y + len, 7], 0.9, 0.35, skin, part);
+/// dark mouth interior with bone teeth hanging down (and up where specified)
+const maw = (P: Prim[], mx: number, my: number, w: number, part = 1, fangs = 0): void => {
+  P.push(ell([mx, my, 8.5], [w / 2, 2.4, 1.6], 'socket', part));
+  const n = Math.floor(w / 2.4);
+  for (let i = 0; i < n; i++) P.push(ell([mx - w / 2 + 1.5 + i * 2.4, my - 0.6, 9.5], [0.7, 1.3, 0.7], 'bone', part));
+  if (fangs) for (let i = 0; i < fangs; i++) P.push(cap([mx - 2 + i * 4, my + 2, 9.5], [mx - 2 + i * 4, my - 1, 9.5], 0.8, 0.2, 'bone', part));
 };
 
-/// Prominent face: socket + 3x2 emissive eye + brow, plus a gash mouth with
-/// teeth or stitches. Called inside workerPrims for the head mass.
-function face(prims: Prim[], hx: number, hy: number, hw: number, kind: AgentKind, p: Params, frame: number): void {
-  // eye sockets + glowing cores — asymmetric heights read as mangled
-  const spots = p.eyes === 1 ? [[hx, 0]] : p.eyes === 2 ? [[hx - 3, 0], [hx + 3, -0.7]] : [[hx - 4, 0], [hx, -1], [hx + 4, 0.5]];
-  for (const [ex, dy] of spots) {
-    prims.push(ell([ex, hy - 1 + dy, 8.5], [2.3, 1.9, 1.4], 'socket', 1));
-    prims.push(ell([ex, hy - 1 + dy, 9.5], [1.5, 1.2, 1.1], 'acid', 1));
-  }
-  // mouth: a dark gash, then teeth or stitches
-  prims.push(ell([hx, hy + 5.5, 7.5], [hw - 2, 1.6, 1.2], 'socket', 1));
-  if (kind === 'packer' || p.jaw === 'stitch') {
-    for (let i = 0; i < 5; i++) prims.push(ell([hx - 4 + i * 2, hy + 5.5, 9], [0.45, 1.4, 0.7], 'dark', 1));
-  } else {
-    for (let i = 0; i < 4; i++) prims.push(ell([hx - 4.5 + i * 3, hy + 5.5, 8.5], [0.9, 1.1, 0.8], kind === 'merchandiser' && i % 2 ? 'brass' : 'bone', 1));
-  }
-}
-
 function workerPrims(kind: AgentKind, p: Params, frame: number): Prim[] {
-  const g = GEO[kind] ?? GEO.smith;
-  const bob = frame % 2;
-  const walk = frame % 4;
-  const sw = walk === 1 ? 2 : walk === 3 ? -2 : 0;
-  const work = frame >= 2 ? 1 : 0;
-  const h = p.hunch;
   const skin = p.skin;
-  const cx = 18;
-  const prims: Prim[] = [];
-  // legs: thigh + shin + foot, opposite swing
-  prims.push(
-    cap([cx - 5 + sw, g.legY, 2], [cx - 4 + sw * 1.5, 41, 2], 2.6, 2.0, skin, 5),
-    cap([cx + 4 - sw, g.legY, 2], [cx + 3 - sw * 1.5, 41, 2], 2.6, 2.0, skin, 6),
-    ell([cx - 4 + sw * 1.5, 42, 3], [3.4, 1.6, 2], 'steel', 5),
-    ell([cx + 3 - sw * 1.5, 42, 3], [3.4, 1.6, 2], 'steel', 6),
-  );
-  // torso barrel + abdomen + shoulders (3/4 hunch: head pushed forward)
-  prims.push(
-    ell([cx + h * 0.5, g.torsoY + bob * 0.5, 4], [g.torsoW + g.wide * 0.5, 8, 6], skin, 2, 'speckle'),
-    ell([cx + h * 0.4, g.torsoY + 6 + bob * 0.5, 3], [g.torsoW - 1 + g.wide, 6, 4.5], skin, 2, 'speckle'),
-    ell([cx - g.torsoW - 1 + h * 0.6, g.torsoY - 1 + bob, 3.5], [3.6, 4.2, 3.4], skin, 2, 'speckle'),
-    ell([cx + g.torsoW + 1 + h * 0.6, g.torsoY - 1 + bob, 3.5], [3.6, 4.2, 3.4], skin, 2, 'speckle'),
-  );
-  // elbows-bent arms hanging past the hips (packer holds a crate instead)
-  const asw = frame % 2 ? 1.2 : -1.2;
-  const elbL: V3 = [cx - g.torsoW - 4 - asw * 0.3, g.torsoY + 7 + bob, 4];
-  const elbR: V3 = [cx + g.torsoW + 4 + asw * 0.3, g.torsoY + 7 + bob, 4];
-  prims.push(
-    cap([cx - g.torsoW - 1 + h * 0.5, g.torsoY - 1 + bob, 4], elbL, g.armT, g.armT * 0.85, skin, 3),
-    cap(elbL, [elbL[0] + 2 - asw, g.torsoY + 14 + bob, 4], g.armT * 0.85, g.armT * 0.65, skin, 3),
-    ell([elbL[0] + 2.5 - asw, g.torsoY + 15.5 + bob, 4], [2 * p.thickL, 1.8, 1.8], 'bone', 3),
-    cap([cx + g.torsoW + 1 + h * 0.5, g.torsoY - 1 + bob, 4], elbR, g.armT * (kind === 'smith' ? 2 : 1), g.armT * 0.85 * (kind === 'smith' ? 1.6 : 1), skin, 4),
-    cap(elbR, [elbR[0] - 2 + asw, g.torsoY + 14 + bob, 4], g.armT * 0.85 * (kind === 'smith' ? 1.5 : 1), g.armT * 0.65, skin, 4),
-    ell([elbR[0] - 2.5 + asw, g.torsoY + 15.5 + bob, 4], [2 * p.thickR, 1.8, 1.8], 'bone', 4),
-  );
-  // head — bigger, tilted forward
-  const hx = cx + 2 + h * 0.8, hy = g.headY + h * 0.4 + bob * 0.5;
-  prims.push(
-    ell([hx, hy, 6], [g.headW, g.headW * 0.75, 5], skin, 1, 'speckle'),
-    ell([hx + 1, hy - 2.5, 7.5], [g.headW + 0.5, 2.6, 4.5], skin, 1, 'speckle'), // brow
-    ell([hx + 1, hy + 4, 5.5], [g.headW - 1.5, 3.2, 4], skin, 1, 'speckle'),   // jaw
-  );
-  face(prims, hx, hy, g.headW, kind, p, frame);
-  if (p.hornL) prims.push(cap([hx - g.headW + 1, hy - 4, 6], [hx - g.headW - 3, hy - 9, 6], 1.6, 0.6, 'bone', 1));
-  if (p.hornR) prims.push(cap([hx + g.headW - 1, hy - 4, 6], [hx + g.headW + 3, hy - 9, 6], 1.6, 0.6, 'bone', 1));
-  if (p.tumor) prims.push(ell([p.tumor[0], p.tumor[1], 7], [p.tumor[2], p.tumor[2], p.tumor[2]], skin, 1, 'vein'));
+  const work = frame >= 2;
+  const bob = frame % 2;
+  const sw = frame % 4 === 1 ? 2 : frame % 4 === 3 ? -2 : 0;
+  const P: Prim[] = [];
+  const cx = 23;
+  const raise = work ? 9 : 0;
 
-  // ---- role silhouettes -----------------------------------------------------------
+  // ---------- SMITH ----------
   if (kind === 'smith') {
-    // the hammer: a huge riveted head on the right arm — raised on work frames
-    const raise = work ? -9 : 0;
-    const hx2 = elbR[0] - 2 + asw, hy2 = g.torsoY + 14 + bob + raise;
-    prims.push(
-      cap([hx2, hy2, 5], [hx2 + 1, hy2 - 6, 7], 2.6, 2.2, 'steel', 7),
-      ell([hx2 + 1.5, hy2 - 8, 7], [4.2, 3, 3], 'steel', 7),
-      ell([hx2 + 1.5, hy2 - 8, 8.5], [1, 1, 0.8], 'brass', 7),
-      ell([hx2 - 1, hy2 - 8, 8.5], [1, 1, 0.8], 'brass', 7),
-      ell([hx2 + 4, hy2 - 8, 8.5], [1, 1, 0.8], 'brass', 7),
-      cap([hx + 5, hy - 6, 5], [hx + 10, hy - 12, 5], 1.8, 1.3, 'steel', 7), // exhaust stack
-      ell([hx + 10.5, hy - 13, 5], [1.3, 1.1, 1], 'acid', 7),
-    );
-  } else if (kind === 'scout') {
-    // eye stalks rising 10+ px, one bandaged; skull dish
-    const stalkXs = [hx - 3, hx, hx + 3];
-    stalkXs.forEach((sx, i) => {
-      const tip: V3 = [sx + (i - 1) * 2.5 + (frame % 2), hy - 12 - i, 5];
-      prims.push(cap([sx, hy - 4, 6], tip, 1, 0.6, skin, 1));
-      prims.push(ell(tip, [1.6, 1.4, 1.2], i === 1 ? 'bone' : 'socket', 1));
-      if (i !== 1) prims.push(ell([tip[0], tip[1], tip[2] + 1], [0.9, 0.8, 0.8], work && i === 2 ? 'blood' : 'acid', 1));
-    });
-    prims.push(
-      cap([hx + g.headW, hy - 2, 5], [hx + g.headW + 6, hy - 8, 4], 1.6, 1, 'steel', 7),
-      ell([hx + g.headW + 7, hy - 9, 4], [3.6, 2, 2.5], 'steel', 7),
-      ell([hx + g.headW + 7.5, hy - 9, 5.5], [1, 0.8, 0.8], 'acid', 7),
-    );
-  } else if (kind === 'inspector') {
-    // split head: dark seam + small eye cluster in the gap + big lens
-    prims.push(cap([hx, hy - 6, 9.5], [hx, hy + 4, 9.5], 0.7, 0.7, 'socket', 1));
-    for (let i = 0; i < 5; i++) {
-      prims.push(ell([hx - 1.5 + (i % 3), hy - 4 + Math.floor(i / 3) * 2.5, 10], [0.7, 0.7, 0.6], 'acid', 1));
-    }
-    prims.push(ell([hx + 4, hy, 10], [2.4, 2.4, 1.6], 'steel', 1));
-    prims.push(ell([hx + 4, hy, 11.5], [1.3, 1.3, 1], work ? 'blood' : 'acid', 1));
-    // long probing fingers held up on the left
-    for (let i = 0; i < 3; i++) {
-      prims.push(cap([elbL[0] + 1 - asw + i, g.torsoY + 13 + bob, 5], [elbL[0] - 3 - asw + i * 2, g.torsoY + 9 + bob - (work ? i : 0), 5], 0.9, 0.45, skin, 3));
-    }
-  } else if (kind === 'packer') {
-    // crate held in front by both big arms; vestigial stubs behind
-    const crateY = g.torsoY + 10 + bob - (work ? 2 : 0);
-    prims.push(
-      ell([cx + h * 0.5, crateY, 9], [7, 5, 3.5], 'brass', 7),
-      ell([cx + h * 0.5, crateY - 2, 10], [5.5, 1.5, 1], 'steel', 7),
-      ell([5, g.torsoY + 4 + bob, 2], [2, 1.6, 1.8], skin, 3),
-      ell([cx + g.torsoW + 5, g.torsoY + 4 + bob, 2], [2, 1.6, 1.8], skin, 4),
-    );
-  } else if (kind === 'merchandiser') {
-    // bloated belly already via wide; ear tag + forehead coin + coins in hand
-    prims.push(
-      cap([hx + g.headW, hy + 2, 5], [hx + g.headW + 4, hy + 8, 5], 1, 0.8, 'blood', 1),
-      ell([hx + g.headW + 4.5, hy + 9.5, 5], [1.8, 2, 1.2], 'brass', 7),
-      ell([hx + g.headW + 4.5, hy + 9.5, 6.5], [0.6, 0.8, 0.5], 'socket', 7),
-      ell([hx, hy - 5, 9.5], [2, 2, 1.3], 'brass', 1),
-      ell([hx, hy - 5, 10.5], [0.8, 0.8, 0.6], 'acid', 1),
-    );
-    if (work) {
-      prims.push(ell([elbR[0] - 3 + asw, g.torsoY + 12 + bob, 7], [1.8, 1.8, 1.8], 'brass', 4));
-      prims.push(ell([elbR[0] - 1 + asw, g.torsoY + 14 + bob, 7], [1.4, 1.4, 1.4], 'brass', 4));
+    const a = p.arch % 3;
+    if (a === 0) { // brute: head low between massive shoulders, wide stance
+      P.push(
+        // legs: thick thighs+shins, wide stance, clawed feet (no foot blood)
+        cap([cx - 8 + sw, 32, 2], [cx - 10 + sw, 40, 2], 6, 5, skin, 5),
+        cap([cx + 8 - sw, 32, 2], [cx + 10 - sw, 40, 2], 6, 5, skin, 6),
+        ell([cx - 11 + sw, 42, 3], [4.5, 2, 2.4], skin, 5),
+        ell([cx + 11 - sw, 42, 3], [4.5, 2, 2.4], skin, 6),
+        ell([cx - 12 + sw, 42.5, 4], [1.2, 0.8, 0.8], 'bone', 5),
+        ell([cx - 9 + sw, 42.5, 4], [1.2, 0.8, 0.8], 'bone', 5),
+        ell([cx + 9 - sw, 42.5, 4], [1.2, 0.8, 0.8], 'bone', 6),
+        ell([cx + 12 - sw, 42.5, 4], [1.2, 0.8, 0.8], 'bone', 6),
+        // torso 20x16 + magenta armour plate on the chest
+        ell([cx, 24 + bob, 4], [10, 8, 6], skin, 2, 'speckle'),
+        ell([cx, 25 + bob, 8], [7, 5.5, 3], 'magenta', 2, 'speckle'),
+        // massive shoulders: the widest point (~36px)
+        ell([cx - 13, 15 + bob, 3.5], [5.5, 4.5, 4], skin, 2, 'speckle'),
+        ell([cx + 13, 15 + bob, 3.5], [5.5, 4.5, 4], skin, 2, 'speckle'),
+        // head LOW between the shoulders (top ≈ y6), heavy brow
+        ell([cx + 1, 11 + bob, 7], [7, 6, 5], skin, 1, 'speckle'),
+        ell([cx + 1, 8 + bob, 8], [7.5, 2.6, 4.5], skin, 1),
+      );
+      eye(P, cx - 2.5, 10.5 + bob, 1.5, 'acid');
+      eye(P, cx + 4.5, 10 + bob, 1.5, 'acid');
+      // mouth 8px + 2 bone fangs pointing up
+      P.push(ell([cx + 1, 15 + bob, 8.5], [4, 1.8, 1.4], 'socket', 1));
+      for (let i = 0; i < 3; i++) P.push(ell([cx - 2 + i * 2.5, 14.4 + bob, 9.5], [0.7, 1, 0.7], 'bone', 1));
+      for (const fx of [cx - 2, cx + 3]) P.push(cap([fx, 16.5 + bob, 9.5], [fx, 13.5 + bob, 9.5], 0.9, 0.2, 'bone', 1));
+      // horns curving up-out from the head sides
+      P.push(cap([cx - 6, 9 + bob, 6], [cx - 11, 4 + bob, 6], 1.7, 0.5, 'bone', 1));
+      P.push(cap([cx + 8, 9 + bob, 6], [cx + 13, 4 + bob, 6], 1.7, 0.5, 'bone', 1));
+      // arms: upper r5, forearm r6, fist hanging at y≈32
+      P.push(cap([cx - 13, 16 + bob, 4], [cx - 16, 25 + bob, 4], 5, 4, skin, 3));
+      P.push(cap([cx - 16, 25 + bob, 4], [cx - 15, 31 + bob, 4], 6, 4.5, skin, 3));
+      fist(P, cx - 15, 33 + bob, 3, 1.5, skin);
+      streak(P, cx - 15, 27 + bob, 31 + bob, 3);
+      // hammer arm — work frame raises it overhead
+      P.push(cap([cx + 13, 16 + bob, 4], [cx + 16, 24 + bob - raise, 4], 5, 4, skin, 4));
+      P.push(cap([cx + 16, 24 + bob - raise, 4], [cx + 16, 31 + bob - raise, 4], 6, 4.5, skin, 4));
+      fist(P, cx + 16, 32 + bob - raise, 4, 1.6, skin);
+      streak(P, cx + 16, 26 + bob - raise, 30 + bob - raise, 4);
+      // hammer: brass haft + steel head
+      P.push(cap([cx + 16, 30 + bob - raise, 8], [cx + 17, 22 + bob - raise, 9], 1.1, 1.1, 'brass', 7));
+      P.push(ell([cx + 17, 19.5 + bob - raise, 9], [4.5, 3, 3], 'steel', 7));
+      P.push(ell([cx + 17, 19.5 + bob - raise, 10.5], [1, 1, 0.9], 'brass', 7));
+    } else if (a === 1) { // swamp-thing: tall, hunched, dripping, tongs
+      P.push(
+        cap([cx - 5 + sw, 34, 2], [cx - 6 + sw, 41, 2], 4, 3.4, skin, 5),
+        cap([cx + 6 - sw, 34, 2], [cx + 7 - sw, 41, 2], 4, 3.4, skin, 6),
+        ell([cx - 6 + sw, 42, 3], [4, 1.8, 2.2], skin, 5),
+        ell([cx + 7 - sw, 42, 3], [4, 1.8, 2.2], skin, 6),
+        // tall hunched mass, head forward + low
+        ell([cx + 1, 24 + bob, 4], [11, 11, 7], skin, 2, 'vein'),
+        ell([cx + 3, 30 + bob, 3], [11, 7, 5], skin, 2, 'speckle'),
+        ell([cx + 5, 12 + bob, 6], [6.5, 5, 4.5], skin, 1, 'speckle'),
+      );
+      // two small glowing eyes deep in a dark face
+      eye(P, cx + 3.5, 11 + bob, 1.2, 'acid');
+      eye(P, cx + 7.5, 11.5 + bob, 1.1, 'acid');
+      maw(P, cx + 5, 15.5 + bob, 7);
+      // weeds + slime drips off the head, shoulders, arms
+      P.push(drip(cx - 6, 26, 5, skin), drip(cx + 10, 28, 6, skin), drip(cx, 34, 5, skin), drip(cx + 2, 15 + bob, 4, skin), drip(cx - 4, 17 + bob, 3, skin));
+      // long dangling arms, tongs in the right
+      P.push(cap([cx - 11, 20 + bob, 4], [cx - 14, 33 + bob, 4], 2.6, 2.2, skin, 3));
+      fist(P, cx - 14, 35 + bob, 3, 1.2, skin);
+      streak(P, cx - 14, 28 + bob, 33 + bob, 3);
+      P.push(cap([cx + 12, 20 + bob, 4], [cx + 15 + (work ? 2 : 0), 32 + bob - (work ? 6 : 0), 4], 2.6, 2.2, skin, 4));
+      const hx = cx + 15 + (work ? 2 : 0), hy = 34 + bob - (work ? 6 : 0);
+      fist(P, hx, hy, 4, 1.2, skin);
+      // plasma tongs: two steel jaws + acid tip
+      P.push(cap([hx, hy - 2, 8], [hx + 3, hy - 8, 9], 1, 0.7, 'steel', 7));
+      P.push(cap([hx + 2, hy - 1, 8], [hx + 6, hy - 7, 9], 1, 0.7, 'steel', 7));
+      P.push(ell([hx + 5, hy - 9, 9.5], [1.1, 1, 0.9], 'acid', 7));
+      // bandaged wrap on the left forearm
+      P.push(ell([cx - 13, 29 + bob, 5], [2.4, 1.7, 1.7], 'bone', 3), ell([cx - 13, 29.5 + bob, 6], [1.6, 0.8, 0.8], 'blood', 3));
+    } else { // lizard: side-leaning, long open jaw, spine ridge, digitigrade
+      P.push(
+        cap([cx - 6 + sw, 34, 2], [cx - 9 + sw, 39, 2], 3.5, 3, skin, 5),      // digitigrade
+        cap([cx - 9 + sw, 39, 2], [cx - 7 + sw, 42, 2], 3, 2.4, skin, 5),
+        cap([cx + 6 - sw, 34, 2], [cx + 9 - sw, 39, 2], 3.5, 3, skin, 6),
+        cap([cx + 9 - sw, 39, 2], [cx + 7 - sw, 42, 2], 3, 2.4, skin, 6),
+        ell([cx - 7 + sw, 42.5, 3], [4, 1.5, 2], skin, 5),
+        ell([cx + 7 - sw, 42.5, 3], [4, 1.5, 2], skin, 6),
+        // side-leaning torso + tail chain
+        ell([cx - 1, 25 + bob, 4], [10, 8, 6], skin, 2, 'speckle'),
+        cap([cx - 9, 30, 2], [cx - 16, 36 + Math.sin(frame) * 2, 2], 3, 1.2, skin, 2),
+        cap([cx - 16, 36 + Math.sin(frame) * 2, 2], [cx - 21, 38 + Math.sin(frame) * 2.5, 2], 1.6, 0.5, skin, 2),
+        // head thrust forward + long open jaw ~12px
+        ell([cx + 6, 14 + bob, 6], [5.5, 4.5, 4], skin, 1, 'speckle'),
+        cap([cx + 8, 13 + bob, 7], [cx + 17, 15 + bob, 7], 2.2, 1.6, skin, 1),
+        cap([cx + 8, 17 + bob, 6], [cx + 16, 19 + bob, 6], 1.8, 1.2, skin, 1),
+      );
+      // teeth rows top + bottom on the open jaw
+      for (let i = 0; i < 5; i++) {
+        P.push(ell([cx + 11 + i * 1.6, 14.8 + bob, 8], [0.6, 1, 0.6], 'bone', 1));
+        P.push(ell([cx + 11 + i * 1.6, 17.2 + bob, 7], [0.6, 1, 0.6], 'bone', 1));
+      }
+      eye(P, cx + 6, 11 + bob, 1.8, 'acid'); // one big eye
+      // spine ridge cones along back + head
+      for (let i = 0; i < 7; i++) P.push(cap([cx - 8 + i * 2.5, 20 + bob - Math.abs(i - 3), 4], [cx - 8.5 + i * 2.5, 16.5 + bob - Math.abs(i - 3), 4], 1.2, 0.4, 'bone', 2));
+      P.push(cap([cx - 9, 24 + bob, 4], [cx - 12, 33 + bob, 4], 2.2, 1.8, skin, 3));
+      fist(P, cx - 12, 35 + bob, 3, 1.1, skin);
+      P.push(cap([cx + 7, 24 + bob, 4], [cx + 10 + (work ? 3 : 0), 33 + bob - (work ? 6 : 0), 4], 2.2, 1.8, skin, 4));
+      const hx = cx + 10 + (work ? 3 : 0), hy = 35 + bob - (work ? 6 : 0);
+      fist(P, hx, hy, 4, 1.1, skin);
+      // hammer same kit
+      P.push(cap([hx, hy - 2, 8], [hx + 2, hy - 9, 9], 1, 1, 'brass', 7));
+      P.push(ell([hx + 2.5, hy - 11, 9], [4, 2.6, 2.6], 'steel', 7));
+      P.push(drip(cx + 14, 18 + bob, 4, skin));
     }
   }
-  // brass joint bolts
-  prims.push(
-    ell([cx - g.torsoW - 1 + h * 0.5, g.torsoY - 1 + bob, 6.5], [1.1, 1.1, 0.9], 'brass', 3),
-    ell([cx + g.torsoW + 1 + h * 0.5, g.torsoY - 1 + bob, 6.5], [1.1, 1.1, 0.9], 'brass', 4),
-    ell([cx - 5 + sw, g.legY + 1, 5], [1, 1, 0.9], 'brass', 5),
-    ell([cx + 4 - sw, g.legY + 1, 5], [1, 1, 0.9], 'brass', 6),
-  );
-  return prims;
+  // ---------- SCOUT: eye-stalk slug ----------
+  else if (kind === 'scout') {
+    P.push(
+      // low slug body on the ground, lighter belly
+      ell([cx, 33 + bob, 4], [15, 9, 6], skin, 2, 'speckle'),
+      ell([cx + 1, 38 + bob, 5], [12, 4.5, 4], p.arch === 1 ? 'magenta' : skin, 2),
+      ell([cx - 4, 24 + bob, 5], [7, 5, 4.5], skin, 1, 'speckle'),
+      // tail curl at the back
+      cap([cx + 13, 36, 2], [cx + 19, 33 + Math.sin(frame) * 2, 2], 3, 1.6, skin, 2),
+      cap([cx + 19, 33 + Math.sin(frame) * 2, 2], [cx + 21, 28 + Math.sin(frame) * 2.5, 2], 1.6, 0.5, skin, 2),
+      drip(cx - 8, 39, 4, skin), drip(cx + 6, 40, 3, skin), drip(cx + 12, 38, 4, skin),
+    );
+    // small mouth slit at the front
+    P.push(ell([cx - 10, 31 + bob, 9], [3, 1.2, 1], 'socket', 1));
+    // 3 stalks curving up 12-16px, 4x4 eyeballs
+    const stalkN = p.arch === 2 ? 2 : 3;
+    for (let i = 0; i < stalkN; i++) {
+      const bx = cx - 6 + i * 5;
+      const sway = Math.sin(frame * 1.5 + i * 1.3) * (work ? 4 : 2);
+      const tipX = bx + sway + (i - 1) * 3, tipY = 10 - i * 2;
+      P.push(cap([bx, 22 + bob, 6], [tipX, tipY + 3, 6], 1, 0.55, skin, 1));
+      eye(P, tipX, tipY, 2, i === 1 && work ? 'blood' : 'acid');
+    }
+    // grafted dish low on the back
+    P.push(cap([cx + 8, 26, 4], [cx + 14, 20, 4], 1.4, 1, 'steel', 7), ell([cx + 15, 19, 4], [3, 1.6, 2], 'steel', 7), ell([cx + 15.5, 19, 5], [0.8, 0.6, 0.7], 'acid', 7));
+  }
+  // ---------- INSPECTOR ----------
+  else if (kind === 'inspector') {
+    const a = p.arch % 2;
+    P.push(
+      cap([cx - 4 + sw, 38, 2], [cx - 4 + sw, 42, 2], 2.5, 2, skin, 5),
+      cap([cx + 4 - sw, 38, 2], [cx + 4 - sw, 42, 2], 2.5, 2, skin, 6),
+      ell([cx - 4 + sw, 42.5, 3], [3, 1.4, 2], skin, 5),
+      ell([cx + 4 - sw, 42.5, 3], [3, 1.4, 2], skin, 6),
+    );
+    if (a === 0) { // anglerfish: head IS the body
+      P.push(
+        ell([cx, 24 + bob, 4], [13, 11, 7], skin, 1, 'speckle'),
+        ell([cx + 1, 27 + bob, 8], [8, 4.5, 3], 'socket', 1), // gaping mouth 16px
+      );
+      // 8-10 needle teeth top + bottom
+      for (let i = 0; i < 5; i++) {
+        P.push(cap([cx - 6 + i * 3, 24 + bob, 9.5], [cx - 6 + i * 3, 27.5 + bob, 9.5], 0.7, 0.15, 'bone', 1));
+        P.push(cap([cx - 4.5 + i * 3, 30 + bob, 9.5], [cx - 4.5 + i * 3, 27.5 + bob, 9.5], 0.7, 0.15, 'bone', 1));
+      }
+      eye(P, cx - 4, 16 + bob, 3, 'acid');   // one big 6x6 eye
+      eye(P, cx + 6, 18 + bob, 1.7, 'acid'); // smaller second
+      // lure stalk arching forward, emissive bulb flickers on work frames
+      const flick = work && frame % 2 ? 0.6 : 0;
+      P.push(cap([cx + 2, 14 + bob, 6], [cx + 10, 8 + bob, 6], 0.8, 0.5, skin, 1));
+      P.push(ell([cx + 10.5, 7.5 + bob, 6.5], [1.7 + flick, 1.5 + flick, 1.2], 'acid', 1));
+      // fin below
+      P.push(cap([cx - 2, 34, 3], [cx - 6, 38, 3], 2.4, 0.6, skin, 2));
+      // stubby arms
+      P.push(cap([cx - 11, 26 + bob, 4], [cx - 13, 33 + bob, 4], 2, 1.6, skin, 3));
+      fist(P, cx - 13, 35 + bob, 3, 1, skin);
+      P.push(cap([cx + 11, 26 + bob, 4], [cx + 13 + (work ? 2 : 0), 33 + bob, 4], 2, 1.6, skin, 4));
+      fist(P, cx + 13 + (work ? 2 : 0), 35 + bob, 4, 1, skin);
+      P.push(drip(cx - 5, 31 + bob, 3, skin));
+    } else { // fin-head: domed head + big side fin, squat body
+      P.push(
+        ell([cx, 28 + bob, 4], [9, 8, 5.5], skin, 2, 'speckle'), // squat body
+        ell([cx + 1, 16 + bob, 6], [6.5, 6, 5], skin, 1, 'speckle'), // domed head
+        cap([cx - 3, 12 + bob, 4], [cx - 10, 6 + bob, 4], 3.5, 0.8, skin, 1), // big side fin
+      );
+      eye(P, cx - 1, 14.5 + bob, 1.7, 'acid');
+      eye(P, cx + 4, 15 + bob, 1.3, 'acid');
+      maw(P, cx + 1, 20 + bob, 9);
+      // long probing fingers held up on work
+      for (let i = 0; i < 3; i++) {
+        P.push(cap([cx - 9 + i, 27 + bob, 5], [cx - 13 + i * 2, 21 + bob - (work ? i : 0), 5], 0.9, 0.4, skin, 3));
+      }
+      P.push(cap([cx + 9, 27 + bob, 4], [cx + 11 + (work ? 2 : 0), 35 + bob, 4], 2.2, 1.8, skin, 4));
+      fist(P, cx + 12 + (work ? 2 : 0), 37 + bob, 4, 1, skin);
+      P.push(drip(cx - 6, 31 + bob, 4, skin));
+    }
+  }
+  // ---------- PACKER ----------
+  else if (kind === 'packer') {
+    const a = p.arch % 2;
+    if (a === 0) { // long-armed hunchback: horizontal torso, knuckle-walk
+      P.push(
+        cap([cx - 5 + sw, 36, 2], [cx - 5 + sw, 41, 2], 3, 2.5, skin, 5),
+        cap([cx + 5 - sw, 36, 2], [cx + 5 - sw, 41, 2], 3, 2.5, skin, 6),
+        ell([cx - 5 + sw, 42.5, 3], [3.4, 1.4, 2], skin, 5),
+        ell([cx + 5 - sw, 42.5, 3], [3.4, 1.4, 2], skin, 6),
+        // horizontal hunched torso + hump
+        ell([cx - 2, 24 + bob, 4], [12, 7, 6], skin, 2, 'speckle'),
+        ell([cx - 4, 18 + bob, 5], [7, 5, 5], skin, 2, 'speckle'),
+        // head forward + low
+        ell([cx + 9, 20 + bob, 6], [5.5, 4.5, 4], skin, 1, 'speckle'),
+      );
+      eye(P, cx + 9, 18.5 + bob, 1.8, 'acid');
+      eye(P, cx + 11.5, 21 + bob, 1.1, 'acid');
+      // stitched mouth
+      P.push(ell([cx + 9, 23 + bob, 8], [3.5, 1.3, 1.1], 'socket', 1));
+      for (let i = 0; i < 4; i++) P.push(ell([cx + 6.5 + i * 1.7, 23 + bob, 9], [0.4, 1.2, 0.5], 'dark', 1));
+      // 2 long knuckle-walking arms reaching the ground — bandaged bloody hands
+      P.push(cap([cx - 12, 22 + bob, 4], [cx - 17, 32 + bob, 4], 2.8, 2.3, skin, 3));
+      P.push(cap([cx - 17, 32 + bob, 4], [cx - 18, 39 + bob, 4], 2.3, 1.9, skin, 3));
+      fist(P, cx - 18, 40.5 + bob, 3, 1.4, skin);
+      P.push(ell([cx - 18, 37 + bob, 5], [2.4, 1.6, 1.6], 'bone', 3), ell([cx - 18, 37.4 + bob, 6], [1.6, 0.8, 0.7], 'blood', 3));
+      P.push(cap([cx + 12, 22 + bob, 4], [cx + 16 + (work ? 2 : 0), 32 + bob, 4], 2.8, 2.3, skin, 4));
+      P.push(cap([cx + 16 + (work ? 2 : 0), 32 + bob, 4], [cx + 17 + (work ? 2 : 0), 39 + bob, 4], 2.3, 1.9, skin, 4));
+      fist(P, cx + 17 + (work ? 2 : 0), 40.5 + bob, 4, 1.4, skin);
+      streak(P, cx + 17 + (work ? 2 : 0), 33 + bob, 38 + bob, 4);
+      // 2 smaller arms hugging a crate to the chest when working
+      if (work) {
+        P.push(ell([cx + 5, 28 + bob, 9], [5.5, 4, 3], 'brass', 7));
+        P.push(ell([cx + 5, 26.5 + bob, 10.5], [4, 1.2, 0.9], 'steel', 7));
+        P.push(cap([cx + 2, 24 + bob, 7], [cx + 5, 29 + bob, 8], 1.4, 1.1, skin, 7));
+      }
+      P.push(drip(cx - 4, 28 + bob, 4, skin));
+    } else { // mushroom-cap: cap on top, face tentacles, crab arms
+      P.push(
+        cap([cx - 4 + sw, 36, 2], [cx - 5 + sw, 41, 2], 2.8, 2.3, skin, 5),
+        cap([cx + 4 - sw, 36, 2], [cx + 5 - sw, 41, 2], 2.8, 2.3, skin, 6),
+        ell([cx - 5 + sw, 42.5, 3], [3.2, 1.4, 2], skin, 5),
+        ell([cx + 5 - sw, 42.5, 3], [3.2, 1.4, 2], skin, 6),
+        ell([cx, 30 + bob, 4], [9, 7, 5.5], skin, 2, 'speckle'),  // stubby body
+        ell([cx, 19 + bob, 5], [5, 5.5, 4.5], skin, 1),          // stalk neck
+        // big cap 30x12 with spots
+        ell([cx, 9 + bob, 6], [15, 6, 5.5], p.arch === 1 ? 'magenta' : skin, 1, 'speckle'),
+        ell([cx - 6, 6.5 + bob, 6.5], [1.5, 1.4, 1.2], 'bone', 1),
+        ell([cx + 3, 8 + bob, 7], [1.2, 1.1, 1], 'bone', 1),
+        ell([cx + 9, 10 + bob, 6.5], [1, 1, 0.9], 'bone', 1),
+      );
+      // face tentacles hanging under the cap
+      for (let i = 0; i < 3; i++) P.push(cap([cx - 3 + i * 3, 14 + bob, 6], [cx - 4 + i * 3.5 + Math.sin(frame + i), 19 + bob, 6], 1.1, 0.5, skin, 1));
+      eye(P, cx - 2, 17.5 + bob, 1.3, 'acid');
+      eye(P, cx + 3, 17 + bob, 1.1, 'acid');
+      P.push(ell([cx, 21 + bob, 8], [3, 1.2, 1], 'socket', 1));
+      for (let i = 0; i < 4; i++) P.push(ell([cx - 2.5 + i * 1.6, 21 + bob, 9], [0.4, 1.1, 0.5], 'dark', 1));
+      // crab-like arms
+      P.push(cap([cx - 9, 29 + bob, 4], [cx - 14, 33 + bob, 4], 2.2, 1.8, skin, 3), cap([cx - 14, 33 + bob, 4], [cx - 12, 37 + bob, 4], 1.6, 1.2, skin, 3));
+      fist(P, cx - 12, 39 + bob, 3, 1.2, skin);
+      P.push(cap([cx + 9, 29 + bob, 4], [cx + 14 + (work ? 2 : 0), 33 + bob, 4], 2.2, 1.8, skin, 4), cap([cx + 14 + (work ? 2 : 0), 33 + bob, 4], [cx + 12 + (work ? 2 : 0), 37 + bob, 4], 1.6, 1.2, skin, 4));
+      fist(P, cx + 12 + (work ? 2 : 0), 39 + bob, 4, 1.2, skin);
+      P.push(drip(cx + 5, 31 + bob, 3, skin));
+    }
+  }
+  // ---------- MERCHANDISER ----------
+  else if (kind === 'merchandiser') {
+    const a = p.arch % 2;
+    if (a === 0) { // bloated toad: squat 32x26, huge grin, bulging eyes
+      P.push(
+        // folded hind legs on the sides
+        ell([cx - 13, 34 + bob, 3], [6, 7, 4], skin, 5, 'speckle'),
+        ell([cx + 13, 34 + bob, 3], [6, 7, 4], skin, 6, 'speckle'),
+        ell([cx - 14 + sw, 42, 3], [5, 1.8, 2.4], skin, 5),
+        ell([cx + 14 - sw, 42, 3], [5, 1.8, 2.4], skin, 6),
+        // squat body 32x26, head merged into top-front, lighter belly
+        ell([cx, 25 + bob, 4], [16, 12, 8], skin, 2, 'speckle'),
+        ell([cx + 2, 33 + bob, 6], [11, 6, 4], p.arch === 1 ? 'magenta' : skin, 2),
+        ell([cx + 2, 33.5 + bob, 7], [7, 1.4, 1], 'socket', 2), // belly fold
+        ell([cx + 2, 30.5 + bob, 7], [7, 1.2, 1], 'socket', 2),
+        ell([cx + 3, 14 + bob, 6], [9, 6.5, 5.5], skin, 1, 'speckle'),
+        ell([cx + 1, 22 + bob, 7.5], [8, 5, 3.5], skin, 2, 'speckle'), // front muzzle catches light
+      );
+      // bulging eyes on top: 5x5 with pupil + spec
+      eye(P, cx - 1, 10 + bob, 2.5, 'acid');
+      eye(P, cx + 7, 10.5 + bob, 2.3, 'acid');
+      // HUGE 20px mouth: lower-lip bulge + upper jaw, brass teeth + 2 fangs
+      P.push(ell([cx + 3, 20.5 + bob, 8.5], [10, 2.8, 1.8], 'socket', 1));
+      P.push(ell([cx + 3, 23 + bob, 8], [9, 2.2, 1.6], skin, 1)); // lower lip bulge
+      for (let i = 0; i < 8; i++) P.push(ell([cx - 5 + i * 2.4, 19.8 + bob, 9.5], [0.8, 1.2, 0.8], i % 2 ? 'brass' : 'bone', 1));
+      for (const fx of [cx - 4, cx + 8]) P.push(cap([fx, 23 + bob, 9.5], [fx, 19.5 + bob, 9.5], 1, 0.2, 'bone', 1));
+      // cheek tag + slime drool + coin in hand
+      P.push(cap([cx + 10, 17 + bob, 5], [cx + 14, 21 + bob, 5], 1, 0.7, 'blood', 1), ell([cx + 14.5, 22.5 + bob, 5], [1.9, 2.2, 1.3], 'brass', 7));
+      P.push(drip(cx - 1, 22 + bob, 5, skin), drip(cx + 7, 22 + bob, 4, skin));
+      // short thick front arms resting on the belly
+      P.push(cap([cx - 12, 26 + bob, 5], [cx - 10, 33 + bob, 6], 2.6, 2.2, skin, 3));
+      fist(P, cx - 10, 35 + bob, 3, 1.2, skin);
+      P.push(cap([cx + 13, 26 + bob, 5], [cx + 11 + (work ? 3 : 0), 33 + bob, 6], 2.6, 2.2, skin, 4));
+      fist(P, cx + 11 + (work ? 3 : 0), 35 + bob, 4, 1.2, skin);
+      if (work) P.push(ell([cx + 13, 32 + bob, 8], [1.9, 1.9, 1.7], 'brass', 4), ell([cx + 14, 34 + bob, 8], [1.5, 1.5, 1.3], 'brass', 4));
+    } else { // shark-frog: head fin, frog body, long tail, toothy smile
+      P.push(
+        ell([cx - 10, 34 + bob, 3], [5, 6, 4], skin, 5), // folded hind legs
+        ell([cx + 10, 34 + bob, 3], [5, 6, 4], skin, 6),
+        ell([cx - 11 + sw, 42, 3], [4.5, 1.8, 2.2], skin, 5),
+        ell([cx + 11 - sw, 42, 3], [4.5, 1.8, 2.2], skin, 6),
+        ell([cx, 26 + bob, 4], [12, 10, 7], skin, 2, 'speckle'), // frog body
+        ell([cx + 3, 14 + bob, 6], [7, 5.5, 5], skin, 1, 'speckle'),
+        cap([cx, 10 + bob, 5], [cx - 5, 2 + bob, 5], 3, 0.7, skin, 1), // head fin
+        cap([cx - 10, 30, 2], [cx - 17, 36 + Math.sin(frame) * 2, 2], 3, 1.2, skin, 2), // long tail
+        cap([cx - 17, 36 + Math.sin(frame) * 2, 2], [cx - 21, 38 + Math.sin(frame) * 2.5, 2], 1.5, 0.4, skin, 2),
+      );
+      eye(P, cx + 1, 11.5 + bob, 2, 'acid');
+      eye(P, cx + 6, 12 + bob, 1.6, 'acid');
+      // wide toothy smile
+      P.push(ell([cx + 4, 17.5 + bob, 8.5], [6.5, 2.4, 1.6], 'socket', 1));
+      for (let i = 0; i < 6; i++) P.push(ell([cx - 1 + i * 2.2, 16.8 + bob, 9.5], [0.7, 1.1, 0.7], i % 2 ? 'brass' : 'bone', 1));
+      // gill slits
+      for (let i = 0; i < 3; i++) P.push(cap([cx - 8 + i * 2, 21 + bob, 5], [cx - 10 + i * 2, 25 + bob, 5], 0.8, 0.4, 'blood', 2));
+      P.push(cap([cx - 10, 25 + bob, 4], [cx - 12, 33 + bob, 4], 2.3, 1.9, skin, 3));
+      fist(P, cx - 13, 35 + bob, 3, 1, skin);
+      P.push(cap([cx + 11, 25 + bob, 4], [cx + 13 + (work ? 2 : 0), 33 + bob - (work ? 4 : 0), 4], 2.3, 1.9, skin, 4));
+      fist(P, cx + 14 + (work ? 2 : 0), 35 + bob - (work ? 4 : 0), 4, 1, skin);
+      P.push(drip(cx + 5, 31 + bob, 4, skin));
+    }
+  }
+  if (work && frame === 2) P.push(ell([cx - 2, 38, 6], [0.8, 1.2, 0.8], 'blood', 9)); // falling drip
+  return P;
 }
 
-// ---- overlord: 96x96 — brain wider than the body --------------------------------
+// ---- overlord: 96x96 cthulhoid god ----------------------------------------------
 
 function overlordPrims(sway: number, thinking: boolean): Prim[] {
-  const prims: Prim[] = [];
-  const skin: Mat = 'bruise';
-  // tentacles: thick capsule chains draping over the dais rim
-  for (let i = 0; i < 6; i++) {
-    const bx = 20 + i * 11;
-    const ph = i * 1.15;
-    let ax = bx, ay = 70, az = 2;
-    for (let s2 = 0; s2 < 4; s2++) {
-      const nx2 = ax + Math.sin(sway * 2 + ph + s2 * 0.7) * 4;
-      const ny2 = ay + 5;
-      prims.push(cap([ax, ay, az], [nx2, ny2, az], 4 - s2 * 0.7, 3.2 - s2 * 0.7, skin, 8 + i));
+  const P: Prim[] = [];
+  // tentacles: 10 flesh chains hanging over the throne — NO emissive lines
+  for (let i = 0; i < 10; i++) {
+    const bx = 28 + i * 4.4;
+    let ax = bx, ay = 60, az = 3;
+    for (let s2 = 0; s2 < 5; s2++) {
+      const nx2 = ax + Math.sin(sway * 2 + i * 1.1 + s2 * 0.5) * 4;
+      const ny2 = ay + 6;
+      P.push(cap([ax, ay, az], [nx2, ny2, az], 3 - s2 * 0.45, 2.4 - s2 * 0.45, 'magenta', 8 + i));
+      P.push(ell([nx2, ny2 + 1, az + 1.5], [0.7, 0.7, 0.6], 'eel', 8 + i)); // sucker dots
       ax = nx2; ay = ny2;
     }
-    prims.push(ell([ax, ay + 1, az + 1], [1.4, 1.1, 1], 'blood', 8 + i));
+    // at most 2 carry a faint acid tip
+    if (i === 2 || i === 7) P.push(ell([ax, ay + 1, az + 1], [1, 0.9, 0.8], 'acid', 8 + i));
   }
-  // sagging body
-  prims.push(
-    ell([48, 58, 4], [28, 13, 9], skin, 9, 'speckle'),
-    ell([32, 65, 3], [13, 10, 6], skin, 9, 'speckle'),
-    ell([64, 65, 3], [13, 10, 6], skin, 9, 'speckle'),
-    ell([48, 72, 2], [20, 10, 5], skin, 9, 'speckle'),
+  // fleshy magenta body mass (NO saucer)
+  P.push(
+    ell([48, 52, 3], [26, 11, 8], 'magenta', 9, 'speckle'),
+    ell([30, 58, 2], [11, 9, 5], 'magenta', 9, 'vein'),
+    ell([66, 58, 2], [11, 9, 5], 'magenta', 9, 'vein'),
+    ell([48, 64, 2], [18, 8, 5], 'magenta', 9, 'speckle'),
   );
-  // fleshy neck folds connecting brain to body
-  prims.push(
-    ell([48, 46, 5], [18, 9, 7], skin, 9, 'speckle'),
-    ell([48, 42, 6], [14, 7, 6], skin, 9, 'speckle'),
-  );
-  // cracked cranial rim: a ring of bone shards under the brain
-  for (let i = 0; i < 9; i++) {
-    const a = Math.PI * (0.15 + (i / 9) * 0.7);
-    prims.push(cap([48 + Math.cos(a) * 30, 40 + Math.sin(a) * 4, 8], [48 + Math.cos(a) * 27, 44 + Math.sin(a) * 5, 8], 1.7, 0.9, 'bone', 10));
+  // lamprey ring glimpsed between tentacles
+  P.push(ell([48, 70, 8.5], [5.5, 4, 2], 'blood', 9));
+  P.push(ell([48, 70, 9.5], [3.5, 2.2, 1.8], 'socket', 9));
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    P.push(ell([48 + Math.cos(a) * 4, 70 + Math.sin(a) * 2.6, 10], [0.7, 0.6, 0.6], 'bone', 9));
   }
-  // five asymmetric eyes, one milky — 3x3 emissive
-  const eyes: [number, number, Mat][] = [[32, 55, 'acid'], [43, 52, 'acid'], [55, 52, 'acid'], [67, 57, 'acid'], [38, 61, 'milk']];
-  for (const [ex, ey, m] of eyes) {
-    prims.push(ell([ex, ey, 10], [3, 2.6, 1.8], 'socket', 9));
-    prims.push(ell([ex, ey, 11.5], [1.7, 1.5, 1.2], m, 9));
+  // THE central eye in FRONT of the face — z well above the cranium fold
+  P.push(ell([48, 46, 14], [9.5, 7.5, 4], 'socket', 9));
+  P.push(ell([48, 46, 15.5], [7.5, 6, 3.5], 'bone', 9));           // pale sclera
+  P.push(ell([48, 46, 17], [4.2, 4, 2.5], 'acid', 9));             // emissive iris ~8px
+  P.push(ell([48, 46, 18.5], [1.3, 3.6, 1.4], 'dark', 9));         // slit pupil
+  P.push(ell([45.5, 43.5, 19], [1.1, 1.1, 1], 'spec', 9));         // spec glint
+  // 4 smaller eyes around it, one milky — all with spec, all in front
+  const smallEyes: [number, number, Mat][] = [[30, 48, 'acid'], [37, 40, 'acid'], [60, 40, 'acid'], [67, 48, 'milk']];
+  for (const [ex, ey, m] of smallEyes) {
+    P.push(ell([ex, ey, 13], [2.8, 2.3, 1.6], 'socket', 9));
+    P.push(ell([ex, ey, 14.5], [1.6, 1.4, 1], m, 9));
+    P.push(ell([ex, ey + 0.3, 15.5], [0.7, 0.9, 0.7], 'dark', 9));
+    P.push(ell([ex - 0.6, ey - 0.6, 15.8], [0.45, 0.45, 0.5], 'spec', 9));
   }
-  // lamprey mouth ~14px: blood ring → dark ring → black core, 10 teeth inward
-  prims.push(ell([48, 72, 10], [7.5, 5.5, 3], 'blood', 9));
-  prims.push(ell([48, 72, 11], [5.5, 3.8, 2.5], 'socket', 9));
-  prims.push(ell([48, 72, 12], [3, 2, 2], 'dark', 9));
-  for (let i = 0; i < 10; i++) {
-    const a = (i / 10) * Math.PI * 2;
-    prims.push(cap([48 + Math.cos(a) * 5.5, 72 + Math.sin(a) * 4, 11], [48 + Math.cos(a) * 3, 72 + Math.sin(a) * 2, 11.5], 0.9, 0.3, 'bone', 9));
-  }
-  // THE BRAIN — bigger than the body, gyri field, veins
-  prims.push(ell([48, 22, 6], [37, 23, 12], thinking ? 'sick' : skin, 10, 'brain'));
-  prims.push(ell([28, 18, 8], [10, 8, 8], skin, 10, 'brain'));
-  prims.push(ell([68, 16, 8], [9, 7, 7], skin, 10, 'brain'));
-  // three emissive acid tubes arcing down to the dais
+  // cranium merged INTO the face mass — overlapping, no gap, no teeth ring
+  P.push(ell([48, 30, 6], [38, 24, 12], 'eel', 10, 'brain'));
+  P.push(ell([26, 26, 8], [10, 9, 7], 'magenta', 10, 'brain'));
+  P.push(ell([70, 24, 8], [9, 8.5, 7], 'magenta', 10, 'brain'));
+  P.push(ell([48, 40, 6], [24, 12, 9], 'magenta', 10, 'speckle')); // overlap fold
+  // steel fluid tubes running SIDEWAYS to the throne; a thin acid line
+  // pulses along ~30% of each, on alternating sway frames
   for (let i = 0; i < 3; i++) {
-    const tx = 26 + i * 22;
-    const midx = tx + Math.sin(sway + i * 2) * 5;
-    prims.push(cap([tx, 70, 4], [midx, 82, 4], 2.2, 1.8, 'acid', 9));
-    prims.push(cap([midx, 82, 4], [tx + 4, 92, 4], 1.8, 1.4, 'acid', 9));
+    const tx = 20 + i * 28;
+    const side = i === 1 ? 1 : -1;
+    P.push(cap([tx, 62, 3], [tx + side * 14, 74, 3], 2.2, 1.9, 'steel', 9));
+    P.push(cap([tx + side * 14, 74, 3], [tx + side * 18, 88, 3], 1.9, 1.5, 'steel', 9));
+    if ((i + Math.floor(sway)) % 3 !== 0) {
+      P.push(cap([tx + side * 2, 64, 5], [tx + side * 7, 69, 5], 0.8, 0.7, 'acid', 9));
+    }
   }
-  if (thinking) prims.push(ell([48, 6, 13], [15, 4.5, 4], 'acid', 10));
-  return prims;
+  if (thinking) {
+    // only the cranium veins flare: thin emissive lines along the gyri
+    P.push(cap([34, 14, 12], [40, 12, 12], 0.6, 0.5, 'acid', 10));
+    P.push(cap([46, 10, 12], [54, 9, 12], 0.6, 0.5, 'acid', 10));
+    P.push(cap([58, 14, 12], [64, 12, 12], 0.6, 0.5, 'acid', 10));
+    P.push(ell([48, 42, 13], [4.8, 4.5, 2], 'acid', 9)); // iris flare
+  }
+  return P;
 }
 
 // ---- sprite plumbing --------------------------------------------------------------
@@ -288,14 +499,14 @@ function cached(key: string, build: () => HTMLCanvasElement): HTMLCanvasElement 
 export function alienEmissive(name: string, kind: AgentKind, frame: number, flip = false): HTMLCanvasElement {
   const key = `em:${name}:${kind}:${frame}`;
   const base = cached(key, () => {
-    const data = renderEmissive(36, 44, workerPrims(kind, params(name), frame), hashString(name));
+    const data = renderEmissive(46, 44, workerPrims(kind, params(name), frame), hashString(name));
     if (import.meta.env?.DEV && emissiveCoverage(data) > 0.15) {
       console.warn(`emissive mask too dense: ${name}/${kind} f${frame} ${Math.round(emissiveCoverage(data) * 100)}%`);
     }
     const c = document.createElement('canvas');
-    c.width = 36; c.height = 44;
+    c.width = 46; c.height = 44;
     const g = c.getContext('2d')!;
-    const img = g.createImageData(36, 44);
+    const img = g.createImageData(46, 44);
     img.data.set(data);
     g.putImageData(img, 0, 0);
     return c;
@@ -305,10 +516,10 @@ export function alienEmissive(name: string, kind: AgentKind, frame: number, flip
   const fhit = cache.get(fk);
   if (fhit) return fhit;
   const c = document.createElement('canvas');
-  c.width = 36; c.height = 44;
+  c.width = 46; c.height = 44;
   const g = c.getContext('2d')!;
   g.imageSmoothingEnabled = false;
-  g.translate(36, 0); g.scale(-1, 1);
+  g.translate(46, 0); g.scale(-1, 1);
   g.drawImage(base, 0, 0);
   cache.set(fk, c);
   return c;
@@ -336,15 +547,15 @@ export function overlordEmissive(sway: number, thinking: boolean): HTMLCanvasEle
 /// same phase for a leg swing. flip: face left.
 export function alienSprite(name: string, kind: AgentKind, frame: number, flip = false): HTMLCanvasElement {
   const key = `${name}:${kind}:${frame}`;
-  const RIM: Record<Mat, RGB> = { sick: RAMPS.sick[3], bruise: RAMPS.bruise[3], pale: RAMPS.pale[3], steel: RAMPS.steel[4], acid: RAMPS.acid[2], blood: RAMPS.blood[3], bone: RAMPS.bone[2], brass: RAMPS.brass[2], socket: RAMPS.bruise[3], milk: RAMPS.milk[0], dark: RAMPS.dark[0] };
+  const RIM: Record<Mat, RGB> = { sick: RAMPS.sick[3], bruise: RAMPS.bruise[3], pale: RAMPS.pale[3], steel: RAMPS.steel[4], acid: RAMPS.acid[2], blood: RAMPS.blood[3], bone: RAMPS.bone[2], brass: RAMPS.brass[2], socket: RAMPS.bruise[3], milk: RAMPS.milk[0], dark: RAMPS.dark[0], teal: RAMPS.teal[3], bog: RAMPS.bog[3], magenta: RAMPS.magenta[3], eel: RAMPS.eel[3], spec: RAMPS.spec[0] };
   const rim = RIM[params(name).skin];
-  const base = cached(key, () => toCanvas(36, 44, workerPrims(kind, params(name), frame), hashString(name), rim));
+  const base = cached(key, () => toCanvas(46, 44, workerPrims(kind, params(name), frame), hashString(name), rim));
   if (!flip) return base;
   const fk = key + ':flip';
   const fhit = cache.get(fk);
   if (fhit) return fhit;
   const c = document.createElement('canvas');
-  c.width = 36; c.height = 44;
+  c.width = 46; c.height = 44;
   const ctx = c.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
   ctx.translate(36, 0); ctx.scale(-1, 1);
@@ -404,4 +615,42 @@ export function grids(): string {
   out.push('=== overlord ===');
   out.push(renderAscii(96, 96, overlordPrims(0, false), 7));
   return out.join('\n');
+}
+
+/// Dev-only: force a specific archetype+ramp for the contact sheet.
+export function archSprite(kind: AgentKind, arch: number, skin: Mat, frame: number): HTMLCanvasElement {
+  const p = { ...params('x'), skin, arch };
+  return cached(`arch:${kind}:${arch}:${skin}:${frame}`, () => toCanvas(46, 44, workerPrims(kind, p, frame), 7, RAMPS[skin][3]));
+}
+
+/// Dev: flesh-tone histogram per archetype — tone4 <=10%, t2+t3 >=50%, t0+t1 >=20%.
+export function hists(): string {
+  const out: string[] = [];
+  const arches: Record<string, number[]> = { smith: [0, 1, 2], scout: [0], inspector: [0, 1], packer: [0, 1], merchandiser: [0, 1] };
+  const skins: Mat[] = ['teal', 'bog', 'magenta', 'eel'];
+  for (const [kind, aa] of Object.entries(arches)) {
+    for (const a of aa) for (const sk of skins) {
+      const p = { ...params('x'), skin: sk, arch: a };
+      const hist = [0, 0, 0, 0, 0];
+      renderVolume(46, 44, workerPrims(kind as AgentKind, p, 0), 7, undefined, hist);
+      const t = hist.reduce((x, y) => x + y, 0) || 1;
+      const pct = hist.map((h) => Math.round((h / t) * 100));
+      const ok = pct[4] <= 10 && pct[2] + pct[3] >= 50 && pct[0] + pct[1] >= 20;
+      out.push(`${kind} a${a} ${sk}: t0-4=${pct.join('/')} ${ok ? 'PASS' : 'FAIL'}`);
+    }
+  }
+  { const hist = [0,0,0,0,0]; renderVolume(96, 96, overlordPrims(0, false), 7, undefined, hist);
+    const t = hist.reduce((x,y)=>x+y,0)||1; const pct = hist.map(h=>Math.round(h/t*100));
+    out.push(`overlord: t0-4=${pct.join('/')} ${pct[4]<=10&&pct[2]+pct[3]>=50&&pct[0]+pct[1]>=20?'PASS':'FAIL'}`); }
+  return out.join(String.fromCharCode(10));
+}
+
+/// Dev assert: the overlord's central emissive iris must render >20 px.
+export function overlordEyeCheck(): string {
+  const data = renderEmissive(96, 96, overlordPrims(0, false), 7);
+  let iris = 0;
+  for (let y = 38; y < 54; y++) for (let x = 40; x < 56; x++) {
+    if (data[(y * 96 + x) * 4 + 3] > 0) iris++;
+  }
+  return `overlord eye iris px: ${iris} ${iris > 20 ? 'PASS' : 'FAIL'}`;
 }

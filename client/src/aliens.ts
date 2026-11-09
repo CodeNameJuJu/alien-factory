@@ -140,7 +140,7 @@ export function drawAliens(
     ctx.beginPath();
     ctx.ellipse(v.x, v.y + 2, 16, 5, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.drawImage(alienSprite(a.name, a.kind, bob, v.flip), Math.round(v.x) - 18, Math.round(v.y) - 42);
+    ctx.drawImage(alienSprite(a.name, a.kind, bob, v.flip), Math.round(v.x) - 23, Math.round(v.y) - 42);
     if (v.carry) ctx.drawImage(crateSprite(), Math.round(v.x) - 14, Math.round(v.y) - 48);
     if (a.state === 'error') ctx.drawImage(bubble('!'), Math.round(v.x) + 10, Math.round(v.y) - 44);
     else if (a.state === 'offline') ctx.drawImage(bubble('z'), Math.round(v.x) + 10, Math.round(v.y) - 44);
@@ -198,7 +198,7 @@ export function drawEmissives(
     const moving = v.path.length > 0;
     const frame = moving ? Math.floor(t * 8) % 2 : 0;
     const bob = a.state === 'working' && !moving ? Math.floor(t * 6) % 2 : frame;
-    ctx.drawImage(alienEmissive(a.name, a.kind, bob, v.flip), Math.round(v.x) - 18, Math.round(v.y) - 42);
+    ctx.drawImage(alienEmissive(a.name, a.kind, bob, v.flip), Math.round(v.x) - 23, Math.round(v.y) - 42);
   }
 }
 

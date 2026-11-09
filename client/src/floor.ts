@@ -173,6 +173,41 @@ function prerenderFloor(g: CanvasRenderingContext2D): void {
   g.fillStyle = 'rgba(42,49,61,0.5)';
   g.fillRect(0, 246, W, 1);
   g.fillRect(0, 271, W, 1);
+  // blood: seeded splatter decals around forge row, press and arch — dark
+  // red dithered irregular splats (never discs), footprint trail on the
+  // walkway, smears on conveyor slats
+  const splat = (sx: number, sy: number, sz: number) => {
+    for (let i = 0; i < sz * 9; i++) {
+      const a = r() * Math.PI * 2, dd = r() * sz;
+      const x2 = sx + Math.cos(a) * dd, y2 = sy + Math.sin(a) * dd * 0.5;
+      const c2 = r();
+      g.fillStyle = c2 < 0.55 ? '#3a0508' : c2 < 0.85 ? '#7a0d14' : '#c4182a';
+      g.fillRect(x2, y2, r() < 0.3 ? 2 : 1, 1);
+    }
+    // a few spatter outliers
+    for (let i = 0; i < sz; i++) {
+      g.fillStyle = '#3a0508';
+      g.fillRect(sx + (r() - 0.5) * sz * 3, sy + (r() - 0.5) * sz * 1.6, 1, 1);
+    }
+  };
+  for (let i = 1; i <= 3; i++) splat(120 + i * 100 - 20, 138 + r() * 10, 6); // forges
+  splat(SCANNER.x, SCANNER.y + 24, 6);   // inspection arch
+  splat(PACKER.x, PACKER.y + 26, 6);     // press
+  splat(DAIS.x - 30, DAIS.y + 40, 5);
+  // bloody footprints trailing along the walkway
+  for (let i = 0; i < 9; i++) {
+    const fx = 90 + i * 52 + r() * 10;
+    const fy = 252 + (i % 2) * 10;
+    g.fillStyle = i % 3 ? '#3a0508' : '#7a0d14';
+    g.fillRect(fx, fy, 4, 2);
+    g.fillRect(fx + 1, fy + 2, 3, 1);
+  }
+  // smears on the conveyor edge
+  for (let i = 0; i < 5; i++) {
+    const mx = 150 + r() * 420;
+    g.fillStyle = '#3a0508';
+    for (let k = 0; k < 6; k++) g.fillRect(mx + k * 3, BELT_Y - 4 - r() * 3, 3, 1);
+  }
   // hazard stripes ONLY at conveyor edge, throne rim and portal mouth
   const stripe = (x0: number, y0: number, w: number) => {
     for (let d = 0; d < w; d += 10) {
@@ -680,6 +715,23 @@ export function lightSources(t: number, v: { overlordThinking: boolean; scanning
   return out;
 }
 
+/// Wear layer: fresh splats appear near finished-job stations, density
+/// grows with jobs done this shift, capped ~60 then the oldest fade.
+export function wearDecals(ctx: CanvasRenderingContext2D, jobsDone: number, t: number): void {
+  const r = mulberrySeed(777);
+  const n = Math.min(60, jobsDone);
+  for (let i = 0; i < n; i++) {
+    const station = [140, 240, 340, SCANNER.x, PACKER.x, DAIS.x][i % 6];
+    const sx = station + (r() - 0.5) * 40;
+    const sy = 130 + r() * 170;
+    const age = jobsDone - i; // older splats fade
+    const a = Math.min(0.8, Math.max(0.15, 1 - age / 60));
+    ctx.fillStyle = age < 8 ? `rgba(196,24,42,${a})` : `rgba(122,13,20,${a})`;
+    for (let k = 0; k < 4; k++) ctx.fillRect(sx + k * 2, sy + ((r() * 4) | 0), 2, 1);
+    void t;
+  }
+}
+
 let darkLayer: HTMLCanvasElement | null = null;
 /// Darkness + tinted light + emissive pass. Called AFTER the world is drawn.
 export function applyLighting(ctx: CanvasRenderingContext2D, t: number, lights: Light[], dim?: { x: number; y: number }[]): void {
@@ -701,7 +753,7 @@ export function applyLighting(ctx: CanvasRenderingContext2D, t: number, lights: 
     d.drawImage(lightDisc(Math.round(r), '#fff'), l.x - r, l.y - r, r * 2, r * 2);
   }
   // per-alien ambient: NEUTRAL, dim cut ~35%, r22
-  d.globalAlpha = 0.55;
+  d.globalAlpha = 0.4;
   for (const a of dim ?? []) d.drawImage(lightDisc(22, '#fff'), a.x - 22, a.y - 22, 44, 44);
   d.globalAlpha = 1;
   ctx.drawImage(darkLayer, 0, 0);
